@@ -16608,6 +16608,7 @@ struct GuideDialogState {
   std::vector<size_t> visibleTopics;
   size_t position = 0;
   bool initialWelcome = false;
+  bool whatsNewOnly = false;
   bool externallyDismissed = false;
   bool stateChanged = false;
   bool launchQuickTour = false;
@@ -16771,7 +16772,10 @@ static void PopulateGuideTopicList(HWND dialog, GuideDialogState &state) {
   for (const size_t topicIndex : state.visibleTopics) {
     if (topicIndex >= catalog.size())
       continue;
-    std::wstring label = catalog[topicIndex].title;
+    const wchar_t *labelText = state.whatsNewOnly
+                                   ? catalog[topicIndex].announcementTitle
+                                   : catalog[topicIndex].title;
+    std::wstring label = labelText;
     if (catalog[topicIndex].announce &&
         guided_walkthrough::IsUnread(g_guideState, topicIndex)) {
       label += L" (New)";
@@ -16828,10 +16832,14 @@ static void RefreshGuidePage(HWND dialog, GuideDialogState &state) {
   if (topicIndex >= catalog.size())
     return;
   const auto &topic = catalog[topicIndex];
-  SetDlgItemTextW(dialog, IDC_GUIDE_TITLE, topic.title);
+  const wchar_t *title =
+      state.whatsNewOnly ? topic.announcementTitle : topic.title;
+  const wchar_t *bodyText =
+      state.whatsNewOnly ? topic.announcementBody : topic.body;
+  SetDlgItemTextW(dialog, IDC_GUIDE_TITLE, title);
   const std::wstring location = L"Find it: " + std::wstring(topic.location);
   SetDlgItemTextW(dialog, IDC_GUIDE_LOCATION, location.c_str());
-  SetDlgItemTextW(dialog, IDC_GUIDE_BODY, topic.body);
+  SetDlgItemTextW(dialog, IDC_GUIDE_BODY, bodyText);
   HWND body = GetDlgItem(dialog, IDC_GUIDE_BODY);
   SendMessageW(body, EM_SETSEL, 0, 0);
   SendMessageW(body, WM_VSCROLL, SB_TOP, 0);
@@ -16875,7 +16883,9 @@ static INT_PTR CALLBACK GuideDlgProc(HWND dialog, UINT message, WPARAM wParam,
     g_hGuideDialog = dialog;
     SetWindowTextW(dialog, state->initialWelcome
                                ? L"Welcome to ctSpaces"
-                               : L"ctSpaces Guided Walkthrough");
+                               : state->whatsNewOnly
+                                     ? L"ctSpaces - What's New"
+                                     : L"ctSpaces Guided Walkthrough");
     HICON icon = LoadIconW(g_hInst, MAKEINTRESOURCEW(IDI_CTSPACES));
     if (icon) {
       SendMessageW(dialog, WM_SETICON, ICON_SMALL,
@@ -17123,6 +17133,7 @@ static void ShowGuidedWalkthrough(bool whatsNewOnly, bool initialWelcome) {
 
   GuideDialogState state;
   state.initialWelcome = initialWelcome;
+  state.whatsNewOnly = whatsNewOnly;
   state.visibleTopics = whatsNewOnly
                             ? guided_walkthrough::UnreadAnnouncementIndices(
                                   g_guideState)

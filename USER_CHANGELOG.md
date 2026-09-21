@@ -1,12 +1,18 @@
 # ctSpaces 6.0 - What's New
 
-The initial ctSpaces 6.0.0.0 milestone consolidated features previously shipped across 5.2 and 5.3. The current 6.0.2.0 release expands optional visual help without changing client or browser data behavior. Existing client spaces, sign-ins, bookmarks, icons, browser history, and saved sessions remain intact during the update.
+The initial ctSpaces 6.0.0.0 milestone consolidated features previously shipped across 5.2 and 5.3. The current 6.0.3.0 release refines upgrade-oriented visual help without changing client or browser data behavior. Existing client spaces, sign-ins, bookmarks, icons, browser history, and saved sessions remain intact during the update.
 
-## Current 6.0.2.0 Milestone
+## Current 6.0.3.0 Milestone
 
-- **Expanded 20-step Quick tour:** The read-only tour now demonstrates existing open/show, browser-slot separation, pin menu, copied-link, shortcut, pin/session reordering, rename, archive/restore, client-first titles, Default save/discard, inactive cleanup, and bulk deletion workflows. Twelve highlighted workflow illustrations remain inert and explanatory only.
+- **Corrected upgrade guidance:** The 20-step Quick tour and its 12 inert illustrations are unchanged. This release separates the change-only What's-new copy from the full guide, removes the Default/starter-profile New marker, and assigns the eight baseline-relative topic titles listed below.
 - **Same safety boundary:** The tour never reads the clipboard, creates clients, launches browsers, reorders pins or sessions, runs cleanup/deletion, or changes preferences. It preserves the existing app-only ZIP contract: the runtime archive contains exactly `ctSpaces.exe`.
-- **Baseline-relative New topics:** For colleagues whose last shipped build was 5.2.0.14, the eight announced topics are Browsers and Restore tabs, Open browser windows, Favorites/links/shortcuts, Temporary and starter profiles, Icons and window titles, Rename and archive clients, Cache and permanent deletion, and New since 5.2.0.14. These are existing post-5.2 capabilities, not new behavior in the tour release.
+- **Baseline-relative New topics:** For colleagues whose supplied last-shipped ZIP was 5.2.0.14, the eight announced topics are **Firefox & browser slots**, **Reorder open tabs**, **Links, shortcuts & ordering**, **Client-first window titles**, **Rename & archive clients**, **Two bulk-delete tools**, **Improved themed popups**, and **Guides & visual tour**. These are accumulated post-baseline guidance markers, not claims that every capability first appeared in 6.0.3.0.
+
+## Historical 6.0.2.0 Milestone
+
+The prior release expanded the read-only Quick tour to 20 steps and 12 inert
+illustrations. Its release notes remain historical; the current 6.0.3.0
+guidance corrects the baseline-relative New-topic labels above.
 
 ## Historical 6.0.1.0 Milestone
 

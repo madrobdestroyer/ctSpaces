@@ -1,4 +1,4 @@
-ctSpaces 6.0.2.0 - Internal colleague release
+ctSpaces 6.0.3.0 - Internal colleague release
 Reviewed September 21, 2026
 
 The runtime ZIP contains exactly one file: ctSpaces.exe. This readme, the user
@@ -16,12 +16,14 @@ The manually started 20-step Quick tour highlights real launcher controls and
 illustrates existing menu, drag, cleanup, deletion, rename, archive/restore,
 title, Default, and browser-slot workflows without
 clicking them or changing client data, selections, browser preferences, pins,
-sessions, or Restore tabs. What's new explains this optional visual help and
-the expanded guidance for existing folder, icon, pin, shortcut, and
-session-menu actions. Its illustration panels are inert; the tour does not read
+sessions, or Restore tabs. What's new has separate, change-focused pages for
+additions since the supplied colleague baseline and clearly identified
+improvements. Its illustration panels are inert; the tour does not read
 the clipboard or run cleanup/deletion.
 
-Current runtime verification covers Microsoft Edge and Google Chrome.
+Earlier runtime verification covered Microsoft Edge and Google Chrome. This
+guide-marker correction does not claim a new browser compatibility matrix or a
+full runtime comparison against the supplied baseline executable.
 Firefox and Brave are supported in the app but were not available for this
 review's browser tests. Pilot those workflows before relying on them.
 
@@ -31,7 +33,7 @@ Cleanup permanently deletes live client data after confirmation. Archived
 clients can be included. Exported backups and prior restore recovery copies
 are retained. See the quick-start guide before deleting clients.
 
-Repository review evidence and test boundaries: docs/RELEASE_VALIDATION_6.0.2.0.md
+Repository review evidence and test boundaries: docs/RELEASE_VALIDATION_6.0.3.0.md
 Historical 6.0.0.0 evidence: docs/RELEASE_VALIDATION_6.0.0.0.md
 Repository application license: LICENSE
 Repository bundled 7-Zip license notices: 3p/7zip/DOC/

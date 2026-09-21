@@ -16,6 +16,8 @@ struct Topic {
   const wchar_t *body;
   unsigned targetCommand;
   bool announce;
+  const wchar_t *announcementTitle = nullptr;
+  const wchar_t *announcementBody = nullptr;
 };
 
 struct State {

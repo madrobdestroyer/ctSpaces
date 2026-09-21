@@ -1,6 +1,6 @@
 # Guided walkthrough and feature updates
 
-Applies to ctSpaces 6.0.2.0.
+Applies to ctSpaces 6.0.3.0.
 
 The built-in guide explains ctSpaces without performing any client operations.
 Reading a page does not create a client, launch a browser, change a profile,
@@ -72,7 +72,7 @@ Each topic gives the relevant control/menu location and explains important
 consequences. Management actions still require their normal selection,
 confirmation and safety checks outside the guide.
 
-## New-feature indicators
+## Guides and feature updates
 
 **What's new** lists announced guidance that you have not acknowledged yet.
 A small indicator is accompanied by **New** text so it does not depend on color
@@ -82,43 +82,49 @@ Opening a menu, selecting a topic, or closing the guide does not silently mark
 everything read. **Next/Done** acknowledges the page currently displayed and
 clears only that page's related New indicator. Skipping leaves other announced
 topics available for later. For the current colleague migration, New is
-relative to the last shipped 5.2.0.14 feature set, not merely to the 6.0.2.0
+relative to the supplied last-shipped 5.2.0.14 ZIP, not merely to the 6.0.3.0
 patch. Guidance is tracked per feature and content revision, independently of
 the application's patch version.
 
-For colleagues coming from 5.2.0.14, this release announces eight post-baseline
-topics: Browsers and Restore tabs, Open browser windows, Favorites, links, and
-shortcuts, Temporary and starter profiles, Icons and window titles, Rename and
-archive clients, Cache and permanent deletion, and New since 5.2.0.14.
+For colleagues coming from the supplied 5.2.0.14 ZIP, What's new announces
+eight change-only topics with dedicated titles: **Firefox & browser slots**,
+**Reorder open tabs**, **Links, shortcuts & ordering**, **Client-first window
+titles**, **Rename & archive clients**, **Two bulk-delete tools**, **Improved
+themed popups**, and **Guides & visual tour**. Temporary and starter profiles
+are still explained in the full guide, but are not marked New in this release.
 Existing actions are explained in the full walkthrough without being falsely
-presented as newly added functionality in 6.0.2.0.
+presented as newly added functionality in 6.0.3.0.
 
-The 6.0.2.0 update expands the optional Quick tour to 20 steps, including 12
-inert illustrations, and revises the full guide to
-document existing folder, icon, pin, shortcut, and session-menu actions more
-completely. Reopen the full guide from **Options > Guided walkthrough** or
-press **F1** to review every topic; the newly documented actions are not
-presented as new product features. The 6.0.1.0 nine-step tour remains a
-historical release reference.
+The 6.0.3.0 update leaves the 20-step, 12-illustration Quick tour unchanged.
+It separates the dedicated change-only What's-new copy from the full guide and
+removes the Default/starter-profile New marker. Reopen the full guide from
+**Options > Guided walkthrough** or press **F1** to review every topic; the
+newly labelled guidance is not a claim that the underlying actions first
+appeared in 6.0.3.0. The 6.0.1.0 nine-step tour remains a historical release
+reference.
 
-## Coverage since the colleagues' 5.2.0.14 baseline
+## Coverage since the supplied 5.2.0.14 baseline
 
-The repository does not contain the colleagues' exact 5.2.0.14 source or tag,
-so this is a documentation-based coverage map from the post-5.2 release notes
-and changelog, not an exact source diff. Familiar 5.2 basics—browser selection,
-pinning, Restore tabs, backup/restore, and themes—remain explained but are not
+The supplied ZIP contains one `ctSpaces.exe` entry (ZIP SHA-256
+`C84556D416873E0256D6F93CC19E7586706A6759F58C6B515DAE5CF71DC38500`); its
+extracted executable is SHA-256
+`4FB86BCF08E23FBCC7C57EE58D82C9EE26455FEDC443A4F89F98CB3798956DBF` and
+reports internal file/product version `5.2.0.2`. The supplied bytes are the
+baseline authority. This is still a documentation/static-evidence map, not a
+runtime comparison: the baseline executable was not executed. Familiar 5.2 basics—browser selection,
+pinning, session restoration, backup/restore, and themes—remain explained but are not
 pretended to be newly introduced by this release.
 
 | Post-5.2 capability | Evidence | Full guide | Quick tour / New |
 |---|---|---|---|
-| Independent browser slots and browser-specific Restore tabs | `USER_CHANGELOG.md:70-72` (Previously Shipped In 5.3) | Browsers and Restore tabs | Browser-slot illustration; New |
-| Existing open-session tabs/overflow plus new clean labels and reordering | `USER_CHANGELOG.md:61-63` | Open browser windows | Session illustration; New |
-| Pinned links, copied URLs, managed shortcuts, and Desktop drag | `USER_CHANGELOG.md:61-64` | Favorites, links, and shortcuts | Pin/menu/shortcut illustrations; New |
-| Existing temporary/Default profiles plus post-5.2 starter-privacy hardening | `USER_CHANGELOG.md:69,72,76` | Temporary and starter profiles | Default save/discard illustration; New |
-| Existing custom icons plus new client-first window titles/live title updates | `USER_CHANGELOG.md:67,82` (custom icons are a 5.2 basic) | Icons and window titles | Title illustration; New |
-| Rename and archive/restore | `USER_CHANGELOG.md:65-66` | Rename and archive clients | Dedicated illustrations; New |
-| Three-month cleanup and immediate bulk deletion | `USER_CHANGELOG.md:52-56` | Cache and permanent deletion | Cleanup/deletion illustrations; New |
-| Read-only walkthrough, revisioned What's new, theme/DPI/keyboard help | `USER_CHANGELOG.md`, 5.3.0.10 section | New since 5.2.0.14; Themes and keyboard | Tour navigation; New |
+| Independent Firefox/browser slots | [USER_CHANGELOG.md, Previously Shipped In 5.3](../USER_CHANGELOG.md) | Browsers and Restore tabs | Browser-slot illustration; **Firefox & browser slots — New** |
+| Existing open tabs/overflow plus later clean labels and reordering | [USER_CHANGELOG.md, Previously Shipped In 5.3](../USER_CHANGELOG.md) | Open browser windows | Session illustration; **Reorder open tabs — New** |
+| Pinned links, copied URLs, managed shortcuts, and ordering | [USER_CHANGELOG.md, Previously Shipped In 5.3](../USER_CHANGELOG.md) | Favorites, links, and shortcuts | Pin/menu/shortcut illustrations; **Links, shortcuts & ordering — New** |
+| Existing custom icons plus later client-first titles/live updates | [USER_CHANGELOG.md, Previously Shipped In 5.3](../USER_CHANGELOG.md) | Icons and window titles | Title illustration; **Client-first window titles — New** |
+| Rename and archive/restore | [USER_CHANGELOG.md, Previously Shipped In 5.3](../USER_CHANGELOG.md) | Rename and archive clients | Dedicated illustrations; **Rename & archive clients — New** |
+| Three-month cleanup and immediate bulk deletion | [USER_CHANGELOG.md, Previously Shipped In 5.3.0.8](../USER_CHANGELOG.md) | Cache and permanent deletion | Cleanup/deletion illustrations; **Two bulk-delete tools — New** |
+| Themed cleanup/popup improvements and text menus | [USER_CHANGELOG.md, Previously Shipped In 5.3.0.8](../USER_CHANGELOG.md) | Appearance plus written reference | **Improved themed popups — New** |
+| Read-only walkthrough, revisioned What's new, theme/DPI/keyboard help | [USER_CHANGELOG.md, Previously Shipped In 5.3.0.10](../USER_CHANGELOG.md) | Guides and feature updates; Appearance and keyboard | **Guides & visual tour — New** |
 
 Additional safety and maintenance details—legacy profile binding in place,
 client-only shortcut names and taskbar handoff, edit-field right-click menus,

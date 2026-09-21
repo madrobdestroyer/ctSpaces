@@ -13,7 +13,6 @@ namespace {
 // Command IDs intentionally mirror the stable Options-menu IDs without
 // including the launcher's private implementation header.
 constexpr unsigned kGuidedWalkthroughCommand = 41017;
-constexpr unsigned kEditDefaultCommand = 41005;
 constexpr unsigned kRenameClientCommand = 41012;
 constexpr unsigned kCreateShortcutCommand = 41015;
 constexpr unsigned kClientTitleFirstCommand = 41016;
@@ -47,7 +46,7 @@ const std::vector<Topic> kTopics = {
      L"button. Do not edit or delete profile files while a client browser is "
      L"open.",
      0, false},
-    {L"browsers_restore", 2, L"Browsers and Restore tabs",
+    {L"browsers_restore", 3, L"Browsers and Restore tabs",
      L"Lower-left browser selector and Restore tabs switch",
      L"The browser selector chooses Edge, Chrome, Brave, or Firefox for the "
      L"current client. Browsers not found on this computer are disabled. A "
@@ -63,8 +62,16 @@ const std::vector<Topic> kTopics = {
      L"browser you previously used. Firefox selected first receives a clean separate slot "
      L"without binding or moving the existing Chromium data. Later browser "
      L"slots also start clean.",
-     kFirefoxCommand, true},
-    {L"sessions", 3, L"Open browser windows",
+     kFirefoxCommand, true, L"Firefox & browser slots",
+     L"Browser selection already existed in 5.2. Newer releases add Firefox "
+     L"and an independent profile slot for every supported browser, so one "
+     L"client can use Edge, Chrome, Brave, and Firefox simultaneously without "
+     L"sharing sign-ins, cookies, history, extensions, or sessions. Restore "
+     L"tabs is now saved separately for each client and browser. When first "
+     L"opening a legacy client in Chromium, choose the Chromium browser that "
+     L"was previously used; that first open binds the existing data in place. "
+     L"Firefox and additional browser slots start separately."},
+    {L"sessions", 4, L"Open browser windows",
      L"Tabs across the top, Show, close x, and tab overflow",
      L"Open client windows appear as session tabs. The same client open in two "
      L"browsers can produce tabs with the same client name; ctSpaces tracks the "
@@ -76,8 +83,15 @@ const std::vector<Topic> kTopics = {
      L"overflow menu. Its first section lists client labels; choose one to show "
      L"that window. Below the divider, choose Close followed by a client label "
      L"to ask that session to close.",
-     0, true},
-    {L"pins_shortcuts", 3, L"Favorites, links, and shortcuts",
+     0, true, L"Reorder open tabs",
+     L"Drag open-client tabs left or right to arrange them for the current "
+     L"ctSpaces run. This order is intentionally temporary and is not restored "
+     L"the next time the launcher starts. Open-session tabs now use clean, "
+     L"client-only labels rather than adding a browser suffix. Those are "
+     L"organization and presentation improvements, not a replacement for the "
+     L"existing session workflow: selecting a tab, using Show, closing a "
+     L"session, and using the overflow menu were already available."},
+    {L"pins_shortcuts", 4, L"Favorites, links, and shortcuts",
      L"Pushpin, pinned-client right-click menu, and Options",
      L"Pin an existing client for quick access; click the pushpin again to "
      L"unpin it. Unpinning removes only the favorite, not client data. You can "
@@ -98,7 +112,16 @@ const std::vector<Topic> kTopics = {
      L"ctSpaces updates only its verified managed shortcut. A shortcut request "
      L"hands off to an already-running ctSpaces instead of starting a second "
      L"launcher. Launcher and client/browser taskbar identities remain separate.",
-     kCreateShortcutCommand, true},
+     kCreateShortcutCommand, true, L"Links, shortcuts & ordering",
+     L"Pinning itself is not new. Copy a complete http(s) URL, choose a browser, "
+     L"then right-click a pinned client and choose Open copied link. Other "
+     L"clipboard text is ignored. If that isolated Firefox session is already "
+     L"open, it cannot accept another command-line URL, so ctSpaces only brings "
+     L"it forward.\r\n\r\n"
+     L"Choose Create desktop shortcut from the pin's right-click menu, or drag "
+     L"the pin to the Windows Desktop. The resulting <client name>.lnk records "
+     L"the browser selected when it is created. Visible pins can also be dragged "
+     L"left or right, and their new order is saved."},
     {L"temporary_default", 2, L"Temporary and starter profiles",
      L"Temporary button and Options > Edit Default profile",
      L"Temporary opens a disposable profile. Only one temporary profile exists "
@@ -112,8 +135,8 @@ const std::vector<Topic> kTopics = {
      L"private cookies, logins, history, and sessions. No/Discard leaves the "
      L"previous saved Default unchanged. Saved changes affect new profiles only. "
      L"Never sign a real client into Default.",
-     kEditDefaultCommand, true},
-    {L"identity", 3, L"Icons and window titles",
+     0, false},
+    {L"identity", 4, L"Icons and window titles",
      L"Options > client icon and window-title commands",
      L"A custom client icon is shared by that client's browser slots and is "
      L"reflected in ctSpaces, supported live windows, and managed shortcuts. "
@@ -125,16 +148,29 @@ const std::vector<Topic> kTopics = {
      L"removing browser data.\r\n\r\n"
      L"Client name first in window titles prefixes supported browser and "
      L"Alt+Tab titles, making many open client windows easier to distinguish.",
-     kClientTitleFirstCommand, true},
-    {L"organize", 2, L"Rename and archive clients", L"Options menu",
+     kClientTitleFirstCommand, true, L"Client-first window titles",
+     L"Turn on Client name first in window titles to prefix supported browser "
+     L"captions with the client name. The same client-first caption appears in "
+     L"supported Alt+Tab entries, making many simultaneous client windows "
+     L"easier to identify. Supported windows that are already open are updated "
+     L"when the setting changes. Client icons were already available; this adds "
+     L"the title option."},
+    {L"organize", 3, L"Rename and archive clients", L"Options menu",
      L"Rename Client changes the client's name while preserving its browser "
      L"slots, ctSpaces preferences, icon, and verified managed shortcut. Every "
      L"slot for that client must be closed first.\r\n\r\n"
      L"Archive Client hides a closed client from the normal picker without "
      L"deleting its browser data. Use Options > Archived Clients to restore it "
      L"to the normal list. Archiving is organization, not backup or deletion.",
-     kRenameClientCommand, true},
-    {L"cleanup", 2, L"Cache and permanent deletion", L"Options menu",
+     kRenameClientCommand, true, L"Rename & archive clients",
+     L"Rename a closed client while preserving its browser data, browser "
+     L"slots, preferences, custom icon, pinned position, Restore tabs choices, "
+     L"and verified managed shortcut. Archive Client hides a closed client from "
+     L"the normal picker without deleting its browser data. Options > Archived "
+     L"Clients restores it to the normal list. Every browser slot for the client "
+     L"must be closed before either operation. Archiving is an organization "
+     L"tool, not a backup or deletion."},
+    {L"cleanup", 3, L"Cache and permanent deletion", L"Options menu",
      L"Vacuum clears supported browser caches while preserving the client's "
      L"stored profile, including logins and history. Clean Up Inactive Clients "
      L"previews clients not opened for three calendar months; an imported or "
@@ -150,7 +186,17 @@ const std::vector<Topic> kTopics = {
      L"keeps the identifiers and activity date needed to retry. If the selection "
      L"window cannot open, nothing is deleted. If the results window fails, the "
      L"summary is shown through fallback messages.",
-     kCleanupInactiveCommand, true},
+     kCleanupInactiveCommand, true, L"Two bulk-delete tools",
+     L"Clean Up Inactive Clients previews clients not opened for three calendar "
+     L"months; clients without reliable history begin a fresh tracking period. "
+     L"Delete Multiple Clients provides the same explicit multi-selection "
+     L"workflow without an inactivity wait.\r\n\r\n"
+     L"Both tools include archived "
+     L"clients, require acknowledgement, and recheck that each selection is "
+     L"closed and safe. Confirmed deletion permanently removes every browser "
+     L"slot for the selected clients and cannot be undone; back up first. "
+     L"Existing backup files are retained. Single-client Delete and Vacuum "
+     L"already existed and are not the announced additions."},
     {L"backup_restore", 1, L"Back up and restore",
      L"Options > Back Up All Client Data or Restore Client Data",
      L"Close all client browsers before backup or restore, including matching "
@@ -163,7 +209,7 @@ const std::vector<Topic> kTopics = {
      L"Sites_PreRestore recovery folder when possible. Browser- or Windows-"
      L"protected sign-ins may not work after moving data to another computer.",
      0, false},
-    {L"appearance", 2, L"Themes and keyboard",
+    {L"appearance", 3, L"Themes and keyboard",
      L"Options > Themes, and standard keyboard navigation",
      L"The Themes dialog previews a selection immediately. Apply saves it; "
      L"Cancel restores the theme that was active when the dialog opened.\r\n\r\n"
@@ -172,32 +218,37 @@ const std::vector<Topic> kTopics = {
      L"open this walkthrough at any time. Right-click editable fields for Undo, "
      L"Cut, Copy, Paste, Delete, and Select All. Read-only result fields offer "
      L"Copy and Select All; normal shortcuts and international input still work.",
-     0, false},
-    {L"updates", 3, L"New since 5.2.0.14",
+     0, true, L"Improved themed popups",
+     L"Existing themes now apply more consistently to About, cleanup selection "
+     L"and results, secondary dialogs, and context and overflow menus. Empty "
+     L"cleanup results stay compact while detailed results remain readable and "
+     L"scrollable. Editable fields now provide a standard right-click menu with "
+     L"Undo, Cut, Copy, Paste, Delete, and Select All; read-only result fields "
+     L"offer Copy and Select All. These are usability improvements to existing "
+     L"themes and workflows, not a claim that themes themselves are new."},
+    {L"updates", 4, L"Guides and feature updates",
      L"Options > Quick tour, Guided walkthrough, or What's new",
      L"Guided walkthrough always opens the full topic list, so you can replay "
-     L"the guide or jump directly to a subject. What's new shows only announced "
-     L"topics whose current revision you have not read.\r\n\r\n"
-     L"A dot and the text (New) identify unseen revised guidance. Next or Done "
-     L"marks only the page currently shown as read. Skip, Close, Escape, and the "
-     L"window X leave unseen topics unread. The guide never performs the client "
-     L"or browser operations it describes.\r\n\r\n"
-     L"New optional Quick tour: start it from Options or the full guide to "
-     L"highlight real launcher controls with short Back, Next, Skip, and Done "
-     L"callouts. It never clicks controls, changes selections or preferences, "
-     L"creates clients, or launches browsers.\r\n\r\n"
-     L"Expanded 20-step Quick tour: twelve illustration-only steps now cover "
-     L"browser slots, the pinned right-click menu, Open copied link, Desktop "
-     L"shortcuts by right-click or drag, pinned-client and session-tab "
-     L"reordering, Default changes, rename, archive and restore, client-first "
-     L"titles, inactive cleanup, and immediate multi-client deletion. These "
-     L"steps explain existing workflows without performing their actions.\r\n\r\n"
-     L"Updated guide: this revision documents existing folder, icon, pin, "
-     L"shortcut, and session-menu actions more completely; reopen the full guide "
-     L"from Options > Guided walkthrough or press F1 to review every topic. "
-     L"The New dots identify workflows added since the colleague 5.2.0.14 "
-     L"baseline; they do not mean every item was first implemented in 6.0.2.",
-     kGuidedWalkthroughCommand, true},
+     L"the guide or jump directly to a subject. What's new uses shorter, "
+     L"change-focused summaries instead of presenting an entire guide chapter "
+     L"as new.\r\n\r\n"
+     L"A dot and (New) identify unread additions or improvements. Next or Done "
+     L"marks only the current page as read; Skip, Close, Escape, and the window "
+     L"X leave it unread. Reopen the guide from Options or with F1.\r\n\r\n"
+     L"The optional 20-step Quick tour highlights real controls and includes "
+     L"twelve inert illustrations. Back, Next, Skip, Done, Escape, and close "
+     L"only navigate or exit the tour. Neither help experience performs the "
+     L"client or browser actions it describes.",
+     kGuidedWalkthroughCommand, true, L"Guides & visual tour",
+     L"Press F1 or choose Guided walkthrough to open optional, read-only help "
+     L"that can be skipped and reopened at any time. The 20-step Quick tour "
+     L"highlights real launcher controls and contains twelve inert illustrations; "
+     L"it never clicks controls, creates clients, launches browsers, reads the "
+     L"clipboard, deletes data, or changes preferences. What's new presents "
+     L"short summaries of unread additions and improvements. Next or Done marks "
+     L"only the current topic as read, while Skip, Close, Escape, and the window "
+     L"X leave it unread. New dots do not mean that every older feature described "
+     L"elsewhere in the full guide is new."},
 };
 
 bool IsMissingPathError(DWORD error) {
