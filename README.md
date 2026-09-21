@@ -19,8 +19,9 @@ original project.
 
 Download `ctSpaces5.3.0.10.zip` from the
 [latest GitHub release](https://github.com/madrobdestroyer/ctSpaces/releases/latest),
-extract it to a folder, and run `ctSpaces.exe`. The archive includes the user
-documentation and applicable license notices.
+extract it to a folder, and run `ctSpaces.exe`. The runtime ZIP contains only
+`ctSpaces.exe`; documentation, release history, source, and license notices
+remain available in this GitHub repository.
 
 ## What It Is Used For
 

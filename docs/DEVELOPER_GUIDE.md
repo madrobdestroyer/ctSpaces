@@ -337,16 +337,13 @@ pwsh -NoProfile -ExecutionPolicy Bypass -File .\tools\New-ReleasePackages.ps1
 ```
 
 The packager derives the version from `version.h`, requires a matching release
-executable and versioned documentation, and writes `ctSpaces<version>.zip`
-beside `dist\x64\Release\ctSpaces.exe`. It refuses to overwrite any versioned
-archive or metadata file, stages each ZIP, and verifies every entry against its
-mapped source before exposing it. Checksums and package metadata use versioned
-filenames so releases can safely share this one folder.
-
-When a matching source archive is needed for release metadata, add
-`-IncludeSource`. The source ZIP is written to the same folder, is allowlisted,
-checks project dependencies, and excludes generated builds, private profile
-data and QA evidence.
+executable, and writes `ctSpaces<version>.zip` beside
+`dist\x64\Release\ctSpaces.exe`. It refuses to overwrite the versioned ZIP,
+stages it, and verifies that its one root entry is `ctSpaces.exe` with the same
+SHA-256 as the validated executable before exposing it. The executable and ZIP
+hashes are printed to the console; the packager creates no checksum, metadata,
+documentation, license, changelog, or source-package files. Documentation,
+release history, source, and license notices remain in the GitHub repository.
 
 ## Adversarial regression checks
 

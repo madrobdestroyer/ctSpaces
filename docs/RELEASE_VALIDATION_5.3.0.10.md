@@ -131,18 +131,19 @@ rather than relabelled; the broad matrix was not rerun after that guide-only fix
 ## Distribution
 
 The distribution archive is `dist/x64/Release/ctSpaces5.3.0.10.zip`, beside the
-validated executable and the earlier versioned ZIPs. Optional source packaging
-creates `ctSpaces5.3.0.10-source.zip` in that same folder. Versioned checksum and
-package-metadata files identify the executable and the archives created by each
-packaging run without colliding with another release.
+validated executable and the earlier versioned ZIPs. The runtime ZIP contains
+exactly one root entry, `ctSpaces.exe`; documentation, release history, source,
+and license notices remain in the GitHub repository and are not packaged with
+the application.
 
-The release packager refuses to overwrite any versioned output, checks version
-consistency, and verifies every ZIP entry against its mapped source before
-exposing it. Optional source packaging also checks required project dependencies;
-its selection excludes private profiles, backups, failed QA fixtures and generated
-builds. The distribution archive includes this report, the user guides and license
-notices. Validation did not install over the real app or send any colleague
-messages. Repository synchronization and GitHub release publication are separate
+The release packager refuses to overwrite the versioned ZIP, checks version
+consistency, stages the archive, and verifies both the exact one-entry shape and
+the executable entry's SHA-256 before exposing it. It reports executable and ZIP
+hashes to the console without creating checksum or package-metadata files. The
+validated executable remains SHA-256
+`D92F1BD5075FCE0F86CB9099D6EDE164E458E0E79F9F017A592769552A0D1173`.
+Validation did not install over the real app or send any colleague messages.
+Repository synchronization and GitHub release publication are separate
 distribution steps, not additional runtime certification.
 
 ## Boundaries
