@@ -1,6 +1,6 @@
 # Guided walkthrough and feature updates
 
-Applies to ctSpaces 6.0.
+Applies to ctSpaces 6.0.2.0.
 
 The built-in guide explains ctSpaces without performing any client operations.
 Reading a page does not create a client, launch a browser, change a profile,
@@ -20,16 +20,23 @@ Use the topic list to jump directly to the subject you need. **Back** and
 ## Quick tour of the real controls
 
 Open **Options (gear) > Quick tour**, or choose **Quick tour** from the full
-guide or fresh-user welcome, for a short visual tour. It outlines the actual
+guide or fresh-user welcome, for a 20-step visual tour with 12 inert workflow
+illustrations. It outlines the actual
 CLIENT field, browser selector, primary Create/Open/Show button, pushpin or
 pinned row, session tabs, client-folder icon, Restore tabs control, Temporary,
-and Options. If there are no pins or open clients, it points to the real
+and Options, then illustrates existing copied-link, shortcut, reordering,
+rename, archive/restore, client-title, Default save/discard, browser-slot,
+inactive-cleanup, and bulk-deletion workflows. If there are no pins or open clients, it points to the real
 pushpin or New tab and explains the empty state without creating fake data.
+If the client-folder icon is hidden because no existing client is selected,
+that step highlights the CLIENT field and explains what to select first.
 
 Use **Back**, **Next**, **Skip**, and **Done**; Escape and the callout's close
 button also exit. The launcher controls cannot be clicked while the tour is
 open. The tour does not change the selected client or browser, toggle a pin or
-Restore tabs, create or open a profile, or mark walkthrough topics as read. It
+Restore tabs, create or open a profile, read the clipboard, run cleanup/deletion,
+reorder pins or sessions, or mark walkthrough topics as read. Inert illustration
+panels perform no actions. It
 is manually replayable and is never started automatically.
 
 Launching a client through its shortcut must not be interrupted by automatic
@@ -72,21 +79,51 @@ A small indicator is accompanied by **New** text so it does not depend on color
 alone. A future feature can have its own indicator and explanation.
 
 Opening a menu, selecting a topic, or closing the guide does not silently mark
-everything read. **Next/Done** acknowledges the page currently displayed.
-Skipping leaves other announcements available for later. Guidance is tracked
-per feature and content revision, independently of the application's patch
-version: an update can flag only the changed feature instead of resetting the
-whole walkthrough.
+everything read. **Next/Done** acknowledges the page currently displayed and
+clears only that page's related New indicator. Skipping leaves other announced
+topics available for later. For the current colleague migration, New is
+relative to the last shipped 5.2.0.14 feature set, not merely to the 6.0.2.0
+patch. Guidance is tracked per feature and content revision, independently of
+the application's patch version.
 
-This release announces the updated Help topic, including the new optional Quick
-tour. Existing actions are explained in the full walkthrough without being
-falsely presented as newly added functionality.
+For colleagues coming from 5.2.0.14, this release announces eight post-baseline
+topics: Browsers and Restore tabs, Open browser windows, Favorites, links, and
+shortcuts, Temporary and starter profiles, Icons and window titles, Rename and
+archive clients, Cache and permanent deletion, and New since 5.2.0.14.
+Existing actions are explained in the full walkthrough without being falsely
+presented as newly added functionality in 6.0.2.0.
 
-The 6.0.1.0 update adds the optional Quick tour and revises the full guide to
+The 6.0.2.0 update expands the optional Quick tour to 20 steps, including 12
+inert illustrations, and revises the full guide to
 document existing folder, icon, pin, shortcut, and session-menu actions more
 completely. Reopen the full guide from **Options > Guided walkthrough** or
 press **F1** to review every topic; the newly documented actions are not
-presented as new product features.
+presented as new product features. The 6.0.1.0 nine-step tour remains a
+historical release reference.
+
+## Coverage since the colleagues' 5.2.0.14 baseline
+
+The repository does not contain the colleagues' exact 5.2.0.14 source or tag,
+so this is a documentation-based coverage map from the post-5.2 release notes
+and changelog, not an exact source diff. Familiar 5.2 basics—browser selection,
+pinning, Restore tabs, backup/restore, and themes—remain explained but are not
+pretended to be newly introduced by this release.
+
+| Post-5.2 capability | Evidence | Full guide | Quick tour / New |
+|---|---|---|---|
+| Independent browser slots and browser-specific Restore tabs | `USER_CHANGELOG.md:70-72` (Previously Shipped In 5.3) | Browsers and Restore tabs | Browser-slot illustration; New |
+| Existing open-session tabs/overflow plus new clean labels and reordering | `USER_CHANGELOG.md:61-63` | Open browser windows | Session illustration; New |
+| Pinned links, copied URLs, managed shortcuts, and Desktop drag | `USER_CHANGELOG.md:61-64` | Favorites, links, and shortcuts | Pin/menu/shortcut illustrations; New |
+| Existing temporary/Default profiles plus post-5.2 starter-privacy hardening | `USER_CHANGELOG.md:69,72,76` | Temporary and starter profiles | Default save/discard illustration; New |
+| Existing custom icons plus new client-first window titles/live title updates | `USER_CHANGELOG.md:67,82` (custom icons are a 5.2 basic) | Icons and window titles | Title illustration; New |
+| Rename and archive/restore | `USER_CHANGELOG.md:65-66` | Rename and archive clients | Dedicated illustrations; New |
+| Three-month cleanup and immediate bulk deletion | `USER_CHANGELOG.md:52-56` | Cache and permanent deletion | Cleanup/deletion illustrations; New |
+| Read-only walkthrough, revisioned What's new, theme/DPI/keyboard help | `USER_CHANGELOG.md`, 5.3.0.10 section | New since 5.2.0.14; Themes and keyboard | Tour navigation; New |
+
+Additional safety and maintenance details—legacy profile binding in place,
+client-only shortcut names and taskbar handoff, edit-field right-click menus,
+and retry-preserving cleanup failures—are covered in the full written guide,
+User Guide, and Feature Reference rather than made into separate tour steps.
 
 ## Appearance and saved preferences
 

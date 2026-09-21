@@ -1,6 +1,6 @@
 # Contributing To ctSpaces
 
-ctSpaces is a native Windows C++20 application. Read the [Developer Guide](docs/DEVELOPER_GUIDE.md) and the current [release validation report](docs/RELEASE_VALIDATION_6.0.1.0.md) before changing profile, browser-launch, icon, installer, or update behavior. The [6.0.0.0 report](docs/RELEASE_VALIDATION_6.0.0.0.md) is retained as historical evidence.
+ctSpaces is a native Windows C++20 application. Read the [Developer Guide](docs/DEVELOPER_GUIDE.md) and the current [release validation report](docs/RELEASE_VALIDATION_6.0.2.0.md) before changing profile, browser-launch, icon, installer, or update behavior. The [6.0.1.0 report](docs/RELEASE_VALIDATION_6.0.1.0.md) and [6.0.0.0 report](docs/RELEASE_VALIDATION_6.0.0.0.md) are retained as historical evidence.
 
 ## Prerequisites
 

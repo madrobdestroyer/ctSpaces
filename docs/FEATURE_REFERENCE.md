@@ -1,6 +1,6 @@
 # ctSpaces Feature Reference
 
-Applies to ctSpaces 6.0.
+Applies to ctSpaces 6.0.2.0.
 
 ## Core Purpose
 
@@ -52,14 +52,22 @@ Each new client root carries the v2 client marker and can hold separate `edge`, 
 | Settings icon | Opens the full configuration and profile-tools menu. |
 | Browser selector | Displays and directly changes the default browser for the next launch. Choosing another browser selects that client's independent slot. |
 
-`Options > Quick tour` opens a manually replayable nine-step overlay that
-highlights these real controls without operating them. Its owned themed callout
+`Options > Quick tour` opens a manually replayable 20-step overlay with 12
+inert workflow illustrations that
+highlights these real controls and illustrates existing workflows without operating them. Its owned themed callout
 supports Back, Next, Skip, Done, Escape, and close while the launcher is
 disabled. It preserves the current client and browser selections, pins,
 sessions, Restore tabs preferences, and client data. Empty pin and session
 states point to the actual pushpin or New tab without creating fake data. The
+folder step uses the visible CLIENT field when the folder icon is hidden, and
+explains that an existing client must be selected first. The
 same tour can be started from the full guide or fresh-user welcome, but it is
-never started automatically and does not mark guide topics as read.
+never started automatically and does not mark guide topics as read. Its inert
+illustrations cover browser-slot choice, pinned-menu actions, copied links, both
+shortcut paths, pin/session reordering, rename, archive/restore, client-first
+titles, Default save/discard, inactive cleanup, and manual bulk deletion; the tour
+does not read the clipboard, create clients, launch browsers, reorder state, or
+run cleanup or deletion.
 
 Pinned client names and their order are stored in `config.ini`, survive launcher restarts, and are pruned automatically only after the client's container is conclusively absent. Up to eight may be saved; four are shown directly in a slim row to keep the launcher compact. Per-client/browser tab-restore exceptions are stored separately under `[restore_tabs]` using browser-qualified keys and use the same conclusive-existence rule. An unreadable or indeterminate configuration/profile state aborts pruning instead of being treated as empty. Closing the browser window directly releases the selected profile process so a later ctSpaces launch can restore its saved tabs.
 
@@ -238,7 +246,7 @@ ctSpaces includes:
 
 - Per-user install under `%LOCALAPPDATA%`; administrator rights are not required for the normal path.
 - Optional Start Menu, Desktop, and current-user startup entries.
-- A short user-facing release label such as `6.0`, backed by the current four-part Windows version `6.0.1.0`.
+- A short user-facing release label such as `6.0`, backed by the current four-part Windows version `6.0.2.0`.
 - Newer, same-version, and older external copies have distinct prompts.
 - Updates stage the new executable beside the installed copy and retry replacement.
 - Relaunch waits for the updater process to exit before acquiring the single-instance mutex.

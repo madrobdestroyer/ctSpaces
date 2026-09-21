@@ -68,6 +68,7 @@
 #include <regex>
 #include <sstream>
 #include <stdexcept>
+#include <string_view>
 #include <string>
 #include <system_error>
 #include <thread>
@@ -17175,21 +17176,40 @@ enum class QuickTourTarget {
   Options,
 };
 
+enum class QuickTourDemo {
+  None,
+  IndependentBrowsers,
+  PinnedMenu,
+  CopiedLink,
+  DesktopShortcut,
+  ReorderPins,
+  ReorderSessions,
+  InactiveCleanup,
+  ManualDelete,
+  DefaultSaveDiscard,
+  RenameClient,
+  ArchiveRestore,
+  ClientFirstTitles,
+};
+
 struct QuickTourStep {
   const wchar_t *title;
   const wchar_t *body;
   QuickTourTarget target;
+  QuickTourDemo demo = QuickTourDemo::None;
 };
 
-static constexpr std::array<QuickTourStep, 9> kQuickTourSteps{{
+static constexpr std::array<QuickTourStep, 20> kQuickTourSteps{{
     {L"Choose or name a client",
      L"Use the CLIENT field to choose an existing client or type a new name. "
      L"The tour only points to controls; it never changes this field.",
      QuickTourTarget::ClientField},
     {L"Choose a browser",
      L"The browser selector chooses Edge, Chrome, Brave, or Firefox for the "
-     L"current action. Each client keeps a separate slot for each browser.",
-     QuickTourTarget::BrowserSelector},
+     L"current action. Each client keeps a separate slot for each browser. For "
+     L"a 5.2 client, the first Chromium browser used to open it binds the "
+     L"existing data in place; choose the browser you previously used.",
+     QuickTourTarget::BrowserSelector, QuickTourDemo::IndependentBrowsers},
     {L"Create, Open, or Show",
      L"This primary button reflects the current selection. It can create a new "
      L"slot, open an existing one, or show an already-open window.",
@@ -17198,10 +17218,33 @@ static constexpr std::array<QuickTourStep, 9> kQuickTourSteps{{
      L"The pushpin adds or removes the selected existing client from favorites. "
      L"Pinned clients appear in the row above the CLIENT field.",
      QuickTourTarget::PinnedClients},
+    {L"Use a pinned client's menu",
+     L"Right-click a visible pin for distinct Select, Open, Restore tabs, "
+     L"copied-link, and shortcut actions. The preview below is inert.",
+     QuickTourTarget::PinnedClients, QuickTourDemo::PinnedMenu},
+    {L"Open a copied link",
+     L"Copy a complete http(s) URL, then choose Open copied link. It uses the "
+     L"selected browser and isolated client; other clipboard text is ignored. "
+     L"An open Chromium slot receives the URL and comes forward. An already-open "
+     L"isolated Firefox slot cannot accept another command-line URL.",
+     QuickTourTarget::PinnedClients, QuickTourDemo::CopiedLink},
+    {L"Create a Desktop shortcut",
+     L"Right-click a pin and choose Create desktop shortcut, or drag a visible "
+     L"pin onto the Windows Desktop. The one managed client shortcut records the "
+     L"selected browser; recreate it to change that browser.",
+     QuickTourTarget::PinnedClients, QuickTourDemo::DesktopShortcut},
+    {L"Reorder pinned clients",
+     L"Drag visible pins left or right. The new favorite order is saved for the "
+     L"next ctSpaces launch; this illustration does not reorder anything.",
+     QuickTourTarget::PinnedClients, QuickTourDemo::ReorderPins},
     {L"Switch between open sessions",
      L"Open client windows appear as tabs across the top. Select a tab to show "
      L"its window, use x to close it normally, or use overflow for extra tabs.",
      QuickTourTarget::SessionTabs},
+    {L"Reorder session tabs",
+     L"Drag open-session tabs left or right to organize the current launcher "
+     L"run. Session-tab order is not saved for the next ctSpaces launch.",
+     QuickTourTarget::SessionTabs, QuickTourDemo::ReorderSessions},
     {L"Open the client folder",
      L"For an existing client, the icon at the left of the CLIENT field opens "
      L"its folder in File Explorer. Do not edit profile files while a browser is open.",
@@ -17214,6 +17257,38 @@ static constexpr std::array<QuickTourStep, 9> kQuickTourSteps{{
      L"Temporary opens a disposable profile that ctSpaces removes after it "
      L"closes when Windows releases its files. Do not store important work there.",
      QuickTourTarget::Temporary},
+    {L"Save or discard Default changes",
+     L"Options > Edit Default profile changes the Chromium starter for future "
+     L"clients only. Save keeps approved starter bookmarks, icons, and extensions; "
+     L"No/Discard keeps the previous Default. Never sign a real client into it.",
+     QuickTourTarget::Options, QuickTourDemo::DefaultSaveDiscard},
+    {L"Rename a client",
+     L"Rename Client requires every slot for that client to be closed. It changes "
+     L"the name while preserving browser slots, preferences, icon, pinned position, "
+     L"Restore tabs choices, and a verified managed shortcut.",
+     QuickTourTarget::Options, QuickTourDemo::RenameClient},
+    {L"Archive and restore a client",
+     L"Archive Client hides a closed client without deleting browser data. Use "
+     L"Archived Clients to restore it to the normal picker; archiving is not a backup.",
+     QuickTourTarget::Options, QuickTourDemo::ArchiveRestore},
+    {L"Put client names first",
+     L"Client name first in window titles prefixes supported browser and Alt+Tab "
+     L"titles, including supported windows already open, so clients are easier to identify.",
+     QuickTourTarget::Options, QuickTourDemo::ClientFirstTitles},
+    {L"Clean up inactive clients",
+     L"Options can preview clients not opened for three calendar months. Unknown "
+     L"history begins a fresh tracking period. Archived clients can appear; "
+     L"deletion requires selection, acknowledgement, and fresh safety checks. "
+     L"It permanently deletes selected clients across every browser. Cannot be "
+     L"undone; back up first.",
+     QuickTourTarget::Options, QuickTourDemo::InactiveCleanup},
+    {L"Delete multiple clients now",
+     L"Delete Multiple Clients has no inactivity wait. Both deletion tools include "
+     L"archived clients and recheck open/safety state. Confirmed deletion removes "
+     L"all browser data after explicit selection and acknowledgement; existing "
+     L"backups are retained. It permanently deletes selected clients across "
+     L"every browser. Cannot be undone; back up first.",
+     QuickTourTarget::Options, QuickTourDemo::ManualDelete},
     {L"Open Options",
      L"Options contains icons, client management, backup and restore, themes, "
      L"browser selection, the full guide, and this Quick tour.",
@@ -17334,7 +17409,9 @@ static bool GetQuickTourTargetRect(QuickTourTarget target, RECT &rect) {
     }
     return MainClientRectToScreen(g_rcSessionTabs, rect);
   case QuickTourTarget::ClientIcon:
-    return QuickTourWindowRect(g_hBtnClientIcon, rect);
+    if (QuickTourWindowRect(g_hBtnClientIcon, rect))
+      return true;
+    return QuickTourWindowRect(g_hClientEditSurface, rect);
   case QuickTourTarget::RestoreTabs:
     return QuickTourWindowRect(g_hBtnRestoreTabs, rect);
   case QuickTourTarget::Temporary:
@@ -17393,16 +17470,26 @@ static std::wstring QuickTourBodyForPosition(size_t position) {
   if (position >= kQuickTourSteps.size())
     return L"";
   std::wstring body = kQuickTourSteps[position].body;
+  if (kQuickTourSteps[position].target == QuickTourTarget::ClientIcon &&
+      (!g_hBtnClientIcon || !IsWindowVisible(g_hBtnClientIcon))) {
+    return L"No existing client is selected, so the CLIENT field is "
+           L"highlighted. Choose a client to reveal its folder icon, which "
+           L"opens File Explorer. Do not edit profile files while a browser "
+           L"is open.";
+  }
   if (kQuickTourSteps[position].target == QuickTourTarget::PinnedClients) {
     if (g_pinnedClients.empty()) {
-      return L"No clients are pinned right now, so the real pushpin is "
-             L"highlighted. It adds or removes the selected existing client "
-             L"from favorites; the tour will not create a fake client.";
+      body += L" No clients are pinned, so the real pushpin is highlighted. "
+              L"The tour does not create a fake client.";
+      if (kQuickTourSteps[position].demo != QuickTourDemo::None)
+        body += L" Client A/B below are illustration labels only.";
+      return body;
     }
-    return L"Click a pinned client to open it in the selected browser or show "
-           L"its existing window. Right-click a visible pin for Select, Open, "
-           L"Restore tabs, copied-link, and shortcut actions. The pushpin beside "
-           L"Create/Open adds or removes the selected existing client.";
+    if (kQuickTourSteps[position].demo == QuickTourDemo::None) {
+      return L"Click a pinned client to open it in the selected browser or show "
+             L"its existing window. The highlighted row contains real favorites; "
+             L"the pushpin beside Create/Open adds or removes the selection.";
+    }
   }
   if (kQuickTourSteps[position].target == QuickTourTarget::SessionTabs &&
       g_sessions.empty()) {
@@ -17410,6 +17497,299 @@ static std::wstring QuickTourBodyForPosition(size_t position) {
             L"highlighted.";
   }
   return body;
+}
+
+static bool QuickTourStepHasDemo(size_t position) {
+  return position < kQuickTourSteps.size() &&
+         kQuickTourSteps[position].demo != QuickTourDemo::None;
+}
+
+static const wchar_t *QuickTourDemoAccessibleText(QuickTourDemo demo) {
+  switch (demo) {
+  case QuickTourDemo::IndependentBrowsers:
+    return L"Illustration only \u2014 no actions performed. Client A has separate "
+           L"Chrome and Firefox browser slots with separate sign-ins, cookies, "
+           L"history, extensions, and sessions.";
+  case QuickTourDemo::PinnedMenu:
+    return L"Illustration only \u2014 no actions performed. Pinned menu: Select "
+           L"client; Open client; Open copied link; Restore tabs; Create desktop "
+           L"shortcut. Highlighted: Open client.";
+  case QuickTourDemo::CopiedLink:
+    return L"Illustration only \u2014 no actions performed. Pinned menu: Select "
+           L"client; Open client; Open copied link; Restore tabs; Create desktop "
+           L"shortcut. Highlighted: Open copied link.";
+  case QuickTourDemo::DesktopShortcut:
+    return L"Illustration only \u2014 no actions performed. Pinned menu: Select "
+           L"client; Open client; Open copied link; Restore tabs; Create desktop "
+           L"shortcut. Highlighted: Create desktop shortcut. Right-click > "
+           L"Create desktop shortcut OR Pin Client A \u2192 Desktop.";
+  case QuickTourDemo::ReorderPins:
+    return L"Illustration only \u2014 no actions performed. Before: Client A, Client "
+           L"B. After: Client B, Client A. Reorder pinned clients.";
+  case QuickTourDemo::ReorderSessions:
+    return L"Illustration only \u2014 no actions performed. Before: Client A, Client "
+           L"B. After: Client B, Client A. Reorder session tabs.";
+  case QuickTourDemo::InactiveCleanup:
+    return L"Illustration only \u2014 no actions performed. Clean Up Inactive "
+           L"Clients... Select Client A/B, acknowledge, Delete Selected.";
+  case QuickTourDemo::ManualDelete:
+    return L"Illustration only \u2014 no actions performed. Delete Multiple "
+           L"Clients... Select Client A/B, acknowledge, Delete Selected.";
+  case QuickTourDemo::DefaultSaveDiscard:
+    return L"Illustration only \u2014 no actions performed. Options > Edit Default "
+           L"profile. Save applies approved starter changes to future clients. "
+           L"No/Discard keeps the previous Default.";
+  case QuickTourDemo::RenameClient:
+    return L"Illustration only \u2014 no actions performed. Options > Rename Client. "
+           L"Client A becomes Client North; browser data and managed settings "
+           L"are kept.";
+  case QuickTourDemo::ArchiveRestore:
+    return L"Illustration only \u2014 no actions performed. Options > Archive Client "
+           L"hides Client A. Options > Archived Clients restores Client A.";
+  case QuickTourDemo::ClientFirstTitles:
+    return L"Illustration only \u2014 no actions performed. Options > Client name "
+           L"first in window titles. Example: Client A \u2014 Browser.";
+  case QuickTourDemo::None:
+    return L"";
+  }
+  return L"";
+}
+
+static void DrawQuickTourDemo(const DRAWITEMSTRUCT &draw) {
+  RECT panel = draw.rcItem;
+  HBRUSH background = CreateSolidBrush(g_themeColors.crControl);
+  FillRect(draw.hDC, &panel, background);
+  DeleteObject(background);
+  HBRUSH border = CreateSolidBrush(g_themeColors.crControlBorder);
+  FrameRect(draw.hDC, &panel, border);
+  DeleteObject(border);
+
+  const UINT dpi = GetDpiForWindow(draw.hwndItem);
+  const int pad = ScaleByDpi(7, dpi);
+  const int headerHeight = ScaleByDpi(19, dpi);
+  const int rowHeight = max(ScaleByDpi(14, dpi),
+                            (panel.bottom - panel.top - headerHeight - pad * 2) /
+                                7);
+  HFONT font = g_quickTourState.font
+                   ? g_quickTourState.font
+                   : static_cast<HFONT>(GetStockObject(DEFAULT_GUI_FONT));
+  HGDIOBJ oldFont = SelectObject(draw.hDC, font);
+  SetBkMode(draw.hDC, TRANSPARENT);
+  SetTextColor(draw.hDC, g_themeColors.crControlText);
+
+  RECT header{panel.left + pad, panel.top + pad, panel.right - pad,
+              panel.top + pad + headerHeight};
+  DrawTextW(draw.hDC, L"Illustration only \u2014 no actions performed", -1,
+            &header, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX |
+                         DT_END_ELLIPSIS);
+  RECT content{panel.left + pad, header.bottom, panel.right - pad,
+               panel.bottom - pad};
+
+  auto drawChip = [&](RECT rect, const wchar_t *text, bool accent = false) {
+    const COLORREF fill = accent ? g_themeColors.crAccent
+                                 : g_themeColors.crWindow;
+    const COLORREF textColor = accent ? g_themeColors.crAccentText
+                                      : g_themeColors.crWindowText;
+    DrawRoundedRect(draw.hDC, rect, fill, g_themeColors.crControlBorder,
+                    ScaleByDpi(5, dpi));
+    SetTextColor(draw.hDC, textColor);
+    DrawTextW(draw.hDC, text, -1, &rect,
+              DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX |
+                  DT_END_ELLIPSIS);
+  };
+  auto drawFlow = [&](const wchar_t *first, const wchar_t *second) {
+    const int arrowWidth = ScaleByDpi(26, dpi);
+    const int chipWidth =
+        max(ScaleByDpi(76, dpi),
+            (content.right - content.left - arrowWidth - pad) / 2);
+    const int height = ScaleByDpi(30, dpi);
+    RECT flowLabel{content.left, content.top, content.right,
+                   content.top + ScaleByDpi(18, dpi)};
+    SetTextColor(draw.hDC, g_themeColors.crControlText);
+    DrawTextW(draw.hDC, L"Before   \u2192   After", -1, &flowLabel,
+              DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+    const int top = flowLabel.bottom +
+                    max(0, (content.bottom - flowLabel.bottom - height) / 2);
+    RECT firstRect{content.left, top, content.left + chipWidth, top + height};
+    drawChip(firstRect, first);
+    RECT arrow{firstRect.right, top, firstRect.right + arrowWidth,
+               top + height};
+    SetTextColor(draw.hDC, g_themeColors.crControlText);
+    DrawTextW(draw.hDC, L"\u2192", -1, &arrow,
+              DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+    RECT secondRect{arrow.right, top,
+                    min(content.right, arrow.right + chipWidth), top + height};
+    drawChip(secondRect, second, true);
+  };
+  auto drawTwoChoices = [&](const wchar_t *heading, const wchar_t *first,
+                            const wchar_t *second,
+                            const wchar_t *footer = nullptr) {
+    RECT headingRect{content.left, content.top, content.right,
+                     content.top + ScaleByDpi(18, dpi)};
+    SetTextColor(draw.hDC, g_themeColors.crControlText);
+    DrawTextW(draw.hDC, heading, -1, &headingRect,
+              DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX |
+                  DT_END_ELLIPSIS);
+    int footerHeight = 0;
+    if (footer) {
+      RECT measuredFooter{0, 0, content.right - content.left, 0};
+      DrawTextW(draw.hDC, footer, -1, &measuredFooter,
+                DT_CALCRECT | DT_WORDBREAK | DT_NOPREFIX);
+      footerHeight = max(ScaleByDpi(30, dpi),
+                         measuredFooter.bottom - measuredFooter.top +
+                             ScaleByDpi(4, dpi));
+    }
+    const int availableWidth = content.right - content.left - pad;
+    const int chipWidth = max(1, availableWidth / 2);
+    const int chipTop = headingRect.bottom + ScaleByDpi(4, dpi);
+    const int chipBottom = max(chipTop + 1, content.bottom - footerHeight);
+    RECT firstRect{content.left, chipTop, content.left + chipWidth, chipBottom};
+    RECT secondRect{firstRect.right + pad, chipTop, content.right, chipBottom};
+    drawChip(firstRect, first);
+    drawChip(secondRect, second, true);
+    if (footer) {
+      RECT footerRect{content.left, chipBottom, content.right, content.bottom};
+      SetTextColor(draw.hDC, g_themeColors.crControlText);
+      DrawTextW(draw.hDC, footer, -1, &footerRect,
+                DT_CENTER | DT_VCENTER | DT_WORDBREAK | DT_NOPREFIX);
+    }
+  };
+  auto drawPinnedMenu = [&](int selectedRow, bool shortcutDiagram) {
+    constexpr std::array<const wchar_t *, 5> labels{
+        L"Select client", L"Open client", L"Open copied link",
+        L"Restore tabs", L"Create desktop shortcut"};
+    const int diagramHeight = shortcutDiagram ? ScaleByDpi(48, dpi) : 0;
+    RECT menu = content;
+    menu.bottom -= diagramHeight;
+    const int itemHeight = max(1, (menu.bottom - menu.top) /
+                                      static_cast<int>(labels.size()));
+    for (int index = 0; index < static_cast<int>(labels.size()); ++index) {
+      RECT row{menu.left, menu.top + itemHeight * index, menu.right,
+               index + 1 == static_cast<int>(labels.size())
+                   ? menu.bottom
+                   : menu.top + itemHeight * (index + 1)};
+      const bool selected = index == selectedRow;
+      HBRUSH rowBrush = CreateSolidBrush(
+          selected ? g_themeColors.crAccent : g_themeColors.crWindow);
+      FillRect(draw.hDC, &row, rowBrush);
+      DeleteObject(rowBrush);
+      if (index == 3) {
+        HPEN separator = CreatePen(PS_SOLID, 1,
+                                   g_themeColors.crControlBorder);
+        HGDIOBJ oldPen = SelectObject(draw.hDC, separator);
+        MoveToEx(draw.hDC, row.left, row.top, nullptr);
+        LineTo(draw.hDC, row.right, row.top);
+        SelectObject(draw.hDC, oldPen);
+        DeleteObject(separator);
+      }
+      row.left += pad;
+      SetTextColor(draw.hDC, selected ? g_themeColors.crAccentText
+                                     : g_themeColors.crWindowText);
+      DrawTextW(draw.hDC, labels[index], -1, &row,
+                DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX |
+                    DT_END_ELLIPSIS);
+    }
+    if (shortcutDiagram) {
+      RECT diagram{content.left, menu.bottom + ScaleByDpi(3, dpi),
+                   content.right, content.bottom};
+      SetTextColor(draw.hDC, g_themeColors.crControlText);
+      DrawTextW(draw.hDC,
+                L"Right-click > Create desktop shortcut\r\n"
+                L"OR  Drag Pin Client A \u2192 Desktop",
+                -1,
+                &diagram, DT_CENTER | DT_VCENTER | DT_WORDBREAK |
+                              DT_NOPREFIX);
+    }
+  };
+  auto drawCleanup = [&](const wchar_t *command) {
+    RECT commandRow{content.left, content.top, content.right,
+                    content.top + rowHeight + ScaleByDpi(3, dpi)};
+    drawChip(commandRow, command, true);
+    RECT flow{content.left, commandRow.bottom + ScaleByDpi(7, dpi),
+              content.right, content.bottom};
+    const int arrowWidth = ScaleByDpi(18, dpi);
+    const int chipWidth = max(1, (flow.right - flow.left - arrowWidth * 2 -
+                                  pad * 2) /
+                                     3);
+    const std::array<const wchar_t *, 3> labels{
+        L"Select Client A/B", L"Acknowledge", L"Delete Selected"};
+    int left = flow.left;
+    for (size_t index = 0; index < labels.size(); ++index) {
+      RECT chip{left, flow.top, left + chipWidth, flow.bottom};
+      drawChip(chip, labels[index], index == labels.size() - 1);
+      left = chip.right;
+      if (index + 1 < labels.size()) {
+        RECT arrow{left, flow.top, left + arrowWidth, flow.bottom};
+        SetTextColor(draw.hDC, g_themeColors.crControlText);
+        DrawTextW(draw.hDC, L"\u2192", -1, &arrow,
+                  DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+        left = arrow.right + pad;
+      }
+    }
+  };
+  auto drawOptionFlow = [&](const wchar_t *command, const wchar_t *result) {
+    RECT commandRow{content.left, content.top, content.right,
+                    content.top + rowHeight + ScaleByDpi(5, dpi)};
+    drawChip(commandRow, command, true);
+    RECT resultRow{content.left,
+                   commandRow.bottom + ScaleByDpi(8, dpi), content.right,
+                   content.bottom};
+    SetTextColor(draw.hDC, g_themeColors.crControlText);
+    DrawTextW(draw.hDC, result, -1, &resultRow,
+              DT_CENTER | DT_VCENTER | DT_WORDBREAK | DT_NOPREFIX);
+  };
+
+  const QuickTourDemo demo =
+      g_quickTourState.position < kQuickTourSteps.size()
+          ? kQuickTourSteps[g_quickTourState.position].demo
+          : QuickTourDemo::None;
+  switch (demo) {
+  case QuickTourDemo::IndependentBrowsers:
+    drawTwoChoices(L"Client A \u2014 independent browser slots", L"Chrome slot",
+                   L"Firefox slot", L"Separate sign-ins, cookies, history, extensions, and sessions");
+    break;
+  case QuickTourDemo::PinnedMenu:
+    drawPinnedMenu(1, false);
+    break;
+  case QuickTourDemo::CopiedLink:
+    drawPinnedMenu(2, false);
+    break;
+  case QuickTourDemo::DesktopShortcut:
+    drawPinnedMenu(4, true);
+    break;
+  case QuickTourDemo::ReorderPins:
+    drawFlow(L"Client A  |  Client B", L"Client B  |  Client A");
+    break;
+  case QuickTourDemo::ReorderSessions:
+    drawFlow(L"Client A  |  Client B", L"Client B  |  Client A");
+    break;
+  case QuickTourDemo::InactiveCleanup:
+    drawCleanup(L"Clean Up Inactive Clients...");
+    break;
+  case QuickTourDemo::ManualDelete:
+    drawCleanup(L"Delete Multiple Clients...");
+    break;
+  case QuickTourDemo::DefaultSaveDiscard:
+    drawTwoChoices(L"Options > Edit Default profile", L"Save",
+                   L"No / Discard",
+                   L"Future clients get saved starter changes; discard keeps the previous Default");
+    break;
+  case QuickTourDemo::RenameClient:
+    drawOptionFlow(L"Rename Client",
+                   L"Client A  \u2192  Client North\r\nBrowser data and managed settings stay with the client");
+    break;
+  case QuickTourDemo::ArchiveRestore:
+    drawTwoChoices(L"Client A", L"Archive Client", L"Archived Clients",
+                   L"Hide without deleting  \u2192  Restore to the normal picker");
+    break;
+  case QuickTourDemo::ClientFirstTitles:
+    drawOptionFlow(L"Client name first in window titles",
+                   L"Client A \u2014 Browser\r\nEasier to identify in the window and Alt+Tab");
+    break;
+  case QuickTourDemo::None:
+    break;
+  }
+  SelectObject(draw.hDC, oldFont);
 }
 
 static void LayoutQuickTourDialog(HWND dialog, UINT dpi) {
@@ -17429,13 +17809,52 @@ static void LayoutQuickTourDialog(HWND dialog, UINT dpi) {
   const int skipLeft = client.right - margin - skipWidth;
   const int nextLeft = skipLeft - gap - buttonWidth;
   const int backLeft = nextLeft - gap - buttonWidth;
+  const bool hasDemo = QuickTourStepHasDemo(g_quickTourState.position);
+  const int bodyTop = margin + titleHeight;
+
+  DeleteQuickTourFonts();
+  g_quickTourState.font = CreateUiFont(dpi);
+  g_quickTourState.strongFont = CreateUiStrongFont(dpi);
+
+  int bodyHeight = max(1, footerTop - gap - bodyTop);
+  if (hasDemo) {
+    const int minDemoHeight = ScaleByDpi(154, dpi);
+    const int maxBodyHeight =
+        max(ScaleByDpi(68, dpi), bodyHeight - gap - minDemoHeight);
+    wchar_t bodyText[2048]{};
+    GetWindowTextW(GetDlgItem(dialog, IDC_QUICK_TOUR_BODY), bodyText,
+                   static_cast<int>(std::size(bodyText)));
+    HDC measure = GetDC(dialog);
+    RECT measured{0, 0, max(1, client.right - margin * 2), 0};
+    if (measure) {
+      HGDIOBJ oldFont = SelectObject(
+          measure, g_quickTourState.font
+                       ? g_quickTourState.font
+                       : static_cast<HFONT>(GetStockObject(DEFAULT_GUI_FONT)));
+      DrawTextW(measure, bodyText, -1, &measured,
+                DT_CALCRECT | DT_WORDBREAK | DT_NOPREFIX);
+      SelectObject(measure, oldFont);
+      ReleaseDC(dialog, measure);
+    }
+    bodyHeight = min(maxBodyHeight,
+                     max(ScaleByDpi(68, dpi),
+                         measured.bottom - measured.top + ScaleByDpi(6, dpi)));
+  }
 
   MoveWindow(GetDlgItem(dialog, IDC_QUICK_TOUR_TITLE), margin, margin,
              max(1, client.right - margin * 2), titleHeight, TRUE);
-  MoveWindow(GetDlgItem(dialog, IDC_QUICK_TOUR_BODY), margin,
-             margin + titleHeight,
+  MoveWindow(GetDlgItem(dialog, IDC_QUICK_TOUR_BODY), margin, bodyTop,
              max(1, client.right - margin * 2),
-             max(1, footerTop - gap - margin - titleHeight), TRUE);
+             bodyHeight, TRUE);
+  HWND demo = GetDlgItem(dialog, IDC_QUICK_TOUR_DEMO);
+  if (hasDemo) {
+    const int demoTop = bodyTop + bodyHeight + gap;
+    MoveWindow(demo, margin, demoTop, max(1, client.right - margin * 2),
+               max(1, footerTop - gap - demoTop), TRUE);
+    ShowWindow(demo, SW_SHOW);
+  } else {
+    ShowWindow(demo, SW_HIDE);
+  }
   MoveWindow(GetDlgItem(dialog, IDC_QUICK_TOUR_COUNT), margin, footerTop,
              max(1, backLeft - gap - margin), footerHeight, TRUE);
   MoveWindow(GetDlgItem(dialog, IDC_QUICK_TOUR_BACK), backLeft, footerTop,
@@ -17445,9 +17864,6 @@ static void LayoutQuickTourDialog(HWND dialog, UINT dpi) {
   MoveWindow(GetDlgItem(dialog, IDCANCEL), skipLeft, footerTop, skipWidth,
              footerHeight, TRUE);
 
-  DeleteQuickTourFonts();
-  g_quickTourState.font = CreateUiFont(dpi);
-  g_quickTourState.strongFont = CreateUiStrongFont(dpi);
   EnumChildWindows(
       dialog,
       [](HWND child, LPARAM) -> BOOL {
@@ -17483,7 +17899,17 @@ static void RefreshQuickTourPage() {
                       ? L"Done"
                       : L"Next");
   SetDlgItemTextW(g_hQuickTourDialog, IDCANCEL, L"Skip");
+  HWND demo = GetDlgItem(g_hQuickTourDialog, IDC_QUICK_TOUR_DEMO);
+  if (demo) {
+    const QuickTourDemo demoKind = step.demo;
+    SetWindowTextW(demo, QuickTourDemoAccessibleText(demoKind));
+    ShowWindow(demo, demoKind != QuickTourDemo::None ? SW_SHOW : SW_HIDE);
+  }
   RefreshQuickTourPlacement();
+  LayoutQuickTourDialog(g_hQuickTourDialog,
+                        GetDpiForWindow(g_hQuickTourDialog));
+  if (demo)
+    InvalidateRect(demo, nullptr, TRUE);
 }
 
 static void RefreshQuickTourPlacement() {
@@ -17529,9 +17955,12 @@ static void RefreshQuickTourPlacement() {
   MONITORINFO monitorInfo{sizeof(monitorInfo)};
   if (!GetMonitorInfoW(monitor, &monitorInfo))
     return;
-  const int cardWidth = min(ScaleByDpi(380, dpi),
+  const bool hasDemo = QuickTourStepHasDemo(g_quickTourState.position);
+  const int desiredCardWidth = hasDemo ? 430 : 380;
+  const int cardWidth = min(ScaleByDpi(desiredCardWidth, dpi),
                             monitorInfo.rcWork.right - monitorInfo.rcWork.left);
-  const int cardHeight = min(ScaleByDpi(224, dpi),
+  const int desiredCardHeight = hasDemo ? 440 : 224;
+  const int cardHeight = min(ScaleByDpi(desiredCardHeight, dpi),
                              monitorInfo.rcWork.bottom - monitorInfo.rcWork.top);
   const int gap = ScaleByDpi(12, dpi);
   RECT card = ChooseQuickTourCardRect(target, cardWidth, cardHeight, gap,
@@ -17621,6 +18050,15 @@ static INT_PTR CALLBACK QuickTourDlgProc(HWND dialog, UINT message,
     ApplyCleanupDialogTheme(dialog);
     RefreshQuickTourPlacement();
     return TRUE;
+  }
+  case WM_DRAWITEM: {
+    const auto *draw = reinterpret_cast<const DRAWITEMSTRUCT *>(lParam);
+    if (draw && draw->CtlID == IDC_QUICK_TOUR_DEMO &&
+        draw->CtlType == ODT_STATIC) {
+      DrawQuickTourDemo(*draw);
+      return TRUE;
+    }
+    break;
   }
   case WM_COMMAND:
     if (LOWORD(wParam) == IDC_QUICK_TOUR_BACK) {
@@ -18068,10 +18506,26 @@ static HICON LoadIconResScaled(int iconResId, int cx, int cy) {
 }
 
 static bool IsGuideFeatureCommandNew(UINT command) {
+  if (command == 0)
+    return false;
   const auto &topics = guided_walkthrough::Catalog();
   for (size_t index = 0; index < topics.size(); ++index) {
-    if (topics[index].announce && topics[index].targetCommand == command &&
-        guided_walkthrough::IsUnread(g_guideState, index)) {
+    if (!topics[index].announce ||
+        !guided_walkthrough::IsUnread(g_guideState, index)) {
+      continue;
+    }
+    bool matches = topics[index].targetCommand != 0 &&
+                   topics[index].targetCommand == command;
+    const std::wstring_view topicId(topics[index].id);
+    if (topicId == L"organize") {
+      matches = matches || command == IDM_CTX_ARCHIVE_PROFILE ||
+                command == IDM_CTX_ARCHIVED_CLIENTS;
+    } else if (topicId == L"cleanup") {
+      matches = matches || command == IDM_CTX_DELETE_MULTIPLE;
+    } else if (topicId == L"updates") {
+      matches = matches || command == IDM_QUICK_TOUR;
+    }
+    if (matches) {
       return true;
     }
   }
@@ -18091,7 +18545,7 @@ static void MenuAddItemOD(HMENU hMenu, UINT id, const wchar_t *text,
 
   MENUITEMINFOW mi{};
   mi.cbSize = sizeof(mi);
-  mi.fMask = MIIM_ID | MIIM_FTYPE | MIIM_DATA | MIIM_STATE;
+  mi.fMask = MIIM_ID | MIIM_FTYPE | MIIM_DATA | MIIM_STATE | MIIM_STRING;
 
   if (hSubMenu) {
     mi.fMask |= MIIM_SUBMENU;
@@ -18180,25 +18634,26 @@ static void EnsureConfigMenu(HWND hWnd) {
   g_iMenuMinWidth = 0;
   {
     const wchar_t *aTexts[] = {L"Set Profile Icon",
-                               L"Create Desktop Shortcut",
-                               L"Rename Client",
-                               L"Archive Client",
-                               L"Archived Clients",
+                               L"Create Desktop Shortcut (New)",
+                               L"Rename Client (New)",
+                               L"Archive Client (New)",
+                               L"Archived Clients (New)",
                                L"Refresh Profile",
                                L"Reset Profile",
                                L"Delete Profile",
-                               L"Clean Up Inactive Clients...",
-                               L"Delete Multiple Clients...",
-                               L"Edit Default profile",
+                               L"Clean Up Inactive Clients... (New)",
+                               L"Delete Multiple Clients... (New)",
+                               L"Edit Default profile (New)",
                                L"Themes",
-                               L"Client name first in window titles",
+                               L"Client name first in window titles (New)",
                                L"About",
                                L"Browser Selection",
                                L"Microsoft Edge",
                                L"Google Chrome",
+                               L"Mozilla Firefox (New)",
                                L"Back Up All Client Data",
                                L"Restore Client Data",
-                               L"Quick tour",
+                               L"Quick tour (New)",
                                L"Guided walkthrough (New)",
                                L"What's new (New)"};
     HDC hdc = GetDC(nullptr);

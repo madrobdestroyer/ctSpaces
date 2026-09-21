@@ -5,6 +5,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <map>
 #include <set>
 #include <stdexcept>
 #include <string>
@@ -74,8 +75,7 @@ void TestCatalogContract() {
   Expect(topics.size() == 12, "the walkthrough catalog must contain 12 topics");
 
   std::set<std::wstring> ids;
-  unsigned announced = 0;
-  size_t announcedIndex = topics.size();
+  std::set<std::wstring> announced;
   for (size_t index = 0; index < topics.size(); ++index) {
     const auto &topic = topics[index];
     Expect(topic.id && topic.id[0], "walkthrough topic id is empty");
@@ -87,29 +87,33 @@ void TestCatalogContract() {
     Expect(ids.emplace(topic.id).second,
            "walkthrough topic ids must be stable and unique");
     if (topic.announce) {
-      ++announced;
-      announcedIndex = index;
+      announced.emplace(topic.id);
     }
   }
-  Expect(announced == 1 && announcedIndex + 1 == topics.size(),
-         "only the current help/new-features topic may be announced");
+  const std::set<std::wstring> expectedAnnounced = {
+      L"browsers_restore", L"sessions",  L"pins_shortcuts", L"temporary_default",
+      L"identity",         L"organize",  L"cleanup",        L"updates"};
+  Expect(announced == expectedAnnounced,
+         "announced guide topics do not match the since-5.2.0.14 contract");
 }
 
 void TestRevisionProgressContract() {
   const auto &topics = Catalog();
-  const std::set<std::wstring> revised = {
-      L"create_open", L"sessions", L"pins_shortcuts", L"identity",
-      L"updates"};
-  const std::set<std::wstring> stable = {
-      L"welcome", L"browsers_restore", L"temporary_default", L"organize",
-      L"cleanup", L"backup_restore", L"appearance"};
-  Expect(revised.size() + stable.size() == topics.size(),
-         "revision contract does not cover the catalog");
+  const std::map<std::wstring, unsigned> expectedRevisions = {
+      {L"welcome", 1},          {L"create_open", 2},
+      {L"browsers_restore", 2}, {L"sessions", 3},
+      {L"pins_shortcuts", 3},   {L"temporary_default", 2},
+      {L"identity", 3},         {L"organize", 2},
+      {L"cleanup", 2},          {L"backup_restore", 1},
+      {L"appearance", 2},       {L"updates", 3}};
+  Expect(expectedRevisions.size() == topics.size(),
+          "revision contract does not cover the catalog");
   for (const auto &topic : topics) {
     const std::wstring id = topic.id;
-    Expect((revised.count(id) != 0) || (stable.count(id) != 0),
+    const auto expected = expectedRevisions.find(id);
+    Expect(expected != expectedRevisions.end(),
            "revision contract contains an unknown topic");
-    Expect(topic.revision == (revised.count(id) != 0 ? 2u : 1u),
+    Expect(topic.revision == expected->second,
            "topic revision does not match the guide progress contract");
   }
 
@@ -117,16 +121,23 @@ void TestRevisionProgressContract() {
   oldRead.readRevisions.assign(topics.size(), 1);
   for (size_t index = 0; index < topics.size(); ++index) {
     const std::wstring id = topics[index].id;
-    const bool shouldBeUnread = revised.count(id) != 0;
+    const bool shouldBeUnread = expectedRevisions.at(id) > 1;
     Expect(guided_walkthrough::IsUnread(oldRead, index) == shouldBeUnread,
            "old revision state did not expose exactly the changed topics");
   }
   Expect(guided_walkthrough::HasUnreadAnnouncement(oldRead),
          "old revision state did not expose the announced update");
+  const std::set<std::wstring> expectedAnnounced = {
+      L"browsers_restore", L"sessions",  L"pins_shortcuts", L"temporary_default",
+      L"identity",         L"organize",  L"cleanup",        L"updates"};
   const auto unread = guided_walkthrough::UnreadAnnouncementIndices(oldRead);
-  Expect(unread.size() == 1 &&
-             std::wstring(topics[unread.front()].id) == L"updates",
-         "old revision state exposed a non-announced topic in What's new");
+  Expect(unread.size() == expectedAnnounced.size(),
+         "old revision state exposed the wrong What's new topic count");
+  std::set<std::wstring> unreadIds;
+  for (const size_t index : unread)
+    unreadIds.emplace(topics[index].id);
+  Expect(unreadIds == expectedAnnounced,
+         "old revision state exposed the wrong What's new topics");
 
   State futureRead;
   futureRead.readRevisions.assign(topics.size(), 999);
@@ -196,10 +207,20 @@ void TestStateAndRevisionSemantics() {
          "an unread announced revision was not detected");
 
   const auto unread = guided_walkthrough::UnreadAnnouncementIndices(state);
-  Expect(unread.size() == 1 && unread.front() == Catalog().size() - 1,
-         "What's new returned a non-announced or unstable topic");
+  const std::set<std::wstring> expectedUnread = {
+      L"browsers_restore", L"sessions",  L"pins_shortcuts", L"temporary_default",
+      L"identity",         L"organize",  L"cleanup",        L"updates"};
+  std::set<std::wstring> unreadIds;
+  size_t updatesIndex = Catalog().size();
+  for (const size_t index : unread) {
+    unreadIds.emplace(Catalog()[index].id);
+    if (std::wstring(Catalog()[index].id) == L"updates")
+      updatesIndex = index;
+  }
+  Expect(unreadIds == expectedUnread && updatesIndex < Catalog().size(),
+         "What's new returned the wrong announced topics");
   const auto mutations = guided_walkthrough::ReadTopicMutations(
-      state, unread.front(), false);
+      state, updatesIndex, false);
   Expect(mutations.size() == 1 && mutations.front().key.has_value() &&
              mutations.front().value.has_value(),
          "reading one What's new topic did not produce one revision mutation");

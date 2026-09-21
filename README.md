@@ -2,11 +2,11 @@
 
 ctSpaces is a small Windows launcher for opening client-specific browser spaces. Each client can have an independent Microsoft Edge, Google Chrome, Brave, and Mozilla Firefox profile, so browser data stays separated both between clients and between browsers for the same client.
 
-The initial 6.0.0.0 milestone consolidated the previously shipped 5.2 and 5.3 work: the compact launcher, independent browser slots, profile safety, backup/restore, icons and themes, saved drag ordering, client shortcuts, copied-link actions, safe rename and archive tools, client-first titles, cleanup tools, and guided help. That milestone added no behavior beyond 5.3.0.10. The current 6.0.1.0 patch adds an optional read-only Quick tour over real launcher controls and expands the guide for existing actions without changing client or browser data behavior.
+The initial 6.0.0.0 milestone consolidated the previously shipped 5.2 and 5.3 work. The current 6.0.2.0 release expands the optional read-only Quick tour to 20 visual workflow steps, including 12 inert workflow illustrations over existing launcher controls; it does not add client or browser behavior.
 
-See [release notes](RELEASE_NOTES_6.0.1.0.md),
+See [release notes](RELEASE_NOTES_6.0.2.0.md),
 [guide help](docs/GUIDED_WALKTHROUGH.md), and the
-[current release validation](docs/RELEASE_VALIDATION_6.0.1.0.md). The
+[current release validation](docs/RELEASE_VALIDATION_6.0.2.0.md). The
 [6.0.0.0 release notes](RELEASE_NOTES_6.0.0.0.md) and
 [validation report](docs/RELEASE_VALIDATION_6.0.0.0.md) remain available as
 historical records.
@@ -18,8 +18,8 @@ original project.
 
 ## Download
 
-Download the app-only [`ctSpaces6.0.1.0.zip`](https://github.com/madrobdestroyer/ctSpaces/releases/download/v6.0.1.0/ctSpaces6.0.1.0.zip)
-from [ctSpaces 6.0 / tag v6.0.1.0](https://github.com/madrobdestroyer/ctSpaces/releases/tag/v6.0.1.0),
+Download the app-only [`ctSpaces6.0.2.0.zip`](https://github.com/madrobdestroyer/ctSpaces/releases/download/v6.0.2.0/ctSpaces6.0.2.0.zip)
+from [ctSpaces 6.0 / tag v6.0.2.0](https://github.com/madrobdestroyer/ctSpaces/releases/tag/v6.0.2.0),
 extract it to a folder, and run `ctSpaces.exe`. The runtime ZIP contains only
 `ctSpaces.exe`; documentation, release history, source, and license notices
 remain available in this GitHub repository.
@@ -46,7 +46,7 @@ The app itself installs and stores shared settings under:
 
 ## Features
 
-- Optional first-run walkthrough, replayable from Options or F1, with direct topic selection and independently tracked new-feature guidance. A separate manually started Quick tour highlights real launcher controls without clicking them or changing state. Existing users and client-shortcut launches are not interrupted by an automatic tour.
+- Optional first-run walkthrough, replayable from Options or F1, with direct topic selection and independently tracked new-feature guidance. A separate manually started 20-step Quick tour highlights real launcher controls and existing workflows without clicking them or changing state. Twelve inert illustration panels explain menu, drag, cleanup, deletion, rename/archive, titles, Default, and browser-slot actions without performing them.
 - Client profile launcher with separate data for every client/browser pair.
 - Persistent sign-ins, cookies, bookmarks, history, site data, and sessions for each saved client.
 - Per-client/browser `Restore tabs` switch. Leave it on to reopen that browser slot's previous tabs, or turn it off to start that slot on a normal new tab while keeping sign-ins and other profile data.

@@ -1,8 +1,14 @@
 # ctSpaces 6.0 - What's New
 
-The initial ctSpaces 6.0.0.0 milestone consolidated features previously shipped across 5.2 and 5.3 and added no behavior beyond 5.3.0.10. The current 6.0.1.0 patch adds optional visual help and expands the guide without changing client or browser data behavior. Existing client spaces, sign-ins, bookmarks, icons, browser history, and saved sessions remain intact during the update.
+The initial ctSpaces 6.0.0.0 milestone consolidated features previously shipped across 5.2 and 5.3. The current 6.0.2.0 release expands optional visual help without changing client or browser data behavior. Existing client spaces, sign-ins, bookmarks, icons, browser history, and saved sessions remain intact during the update.
 
-## Current 6.0.1.0 Milestone
+## Current 6.0.2.0 Milestone
+
+- **Expanded 20-step Quick tour:** The read-only tour now demonstrates existing open/show, browser-slot separation, pin menu, copied-link, shortcut, pin/session reordering, rename, archive/restore, client-first titles, Default save/discard, inactive cleanup, and bulk deletion workflows. Twelve highlighted workflow illustrations remain inert and explanatory only.
+- **Same safety boundary:** The tour never reads the clipboard, creates clients, launches browsers, reorders pins or sessions, runs cleanup/deletion, or changes preferences. It preserves the existing app-only ZIP contract: the runtime archive contains exactly `ctSpaces.exe`.
+- **Baseline-relative New topics:** For colleagues whose last shipped build was 5.2.0.14, the eight announced topics are Browsers and Restore tabs, Open browser windows, Favorites/links/shortcuts, Temporary and starter profiles, Icons and window titles, Rename and archive clients, Cache and permanent deletion, and New since 5.2.0.14. These are existing post-5.2 capabilities, not new behavior in the tour release.
+
+## Historical 6.0.1.0 Milestone
 
 - **Optional Quick tour:** Start a short tour from Options or the full guide to
   highlight the real CLIENT field, browser selector, primary action, pins,
