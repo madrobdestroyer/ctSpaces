@@ -416,3 +416,24 @@ FodyWeavers.xsd
 *.msix
 *.msm
 *.msp
+
+# ctSpaces build outputs
+/build/
+/dist/
+/7zip/build/
+/7zip/dist/
+
+# Private workspace material and handoff artifacts
+/.agents/
+/.codex/
+/.qa*/
+/VM_HANDOFF/
+/backups/
+/PROJECT_MEMORY.md
+/TEAMS_ANNOUNCEMENT.md
+
+# Local runtime state and disposable test markers
+**/config.ini
+**/ctSpaces.portable
+**/.ctSpaces*.staging-*/
+*.dmp
