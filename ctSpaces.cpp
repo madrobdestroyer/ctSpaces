@@ -46,6 +46,7 @@
 #pragma comment(lib, "winhttp.lib")
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstring>
@@ -352,6 +353,8 @@ static std::atomic_bool g_bClientTitleFirst = false;
 static bool g_bQaInstance = false;
 static guided_walkthrough::State g_guideState;
 static HWND g_hGuideDialog = nullptr;
+static HWND g_hQuickTourDialog = nullptr;
+static HWND g_hQuickTourFrame = nullptr;
 enum class MainDragKind { None, PinnedClient, SessionTab };
 static MainDragKind g_mainDragKind = MainDragKind::None;
 static int g_iMainDragIndex = -1;
@@ -375,6 +378,7 @@ static std::vector<std::wstring> g_pinnedClientsBeforeDrag;
 #define WM_APP_QA_CAN_EXPORT (WM_APP + 18)
 #define WM_APP_SHOW_GUIDE (WM_APP + 19)
 #define WM_APP_DISMISS_GUIDE (WM_APP + 20)
+#define WM_APP_REFRESH_QUICK_TOUR (WM_APP + 21)
 
 static int GetMainGuiHeightDip() {
   return g_pinnedClients.empty() ? MAIN_GUI_EMPTY_PIN_HEIGHT_DIP
@@ -570,6 +574,10 @@ static bool ProcessClientLaunchRequest(const std::wstring &arguments,
 static bool HasClientLaunchRequest(const std::wstring &arguments);
 static void ShowGuidedWalkthrough(bool whatsNewOnly,
                                   bool initialWelcome = false);
+static void ShowQuickTour();
+static void DismissQuickTour(bool restoreFocus);
+static void DismissQuickTourForOwnerClosing();
+static void RefreshQuickTourPlacement();
 static void UpdateGuideIndicators();
 static bool RenameClientProfile(const std::wstring &oldName,
                                 const std::wstring &newName,
@@ -4700,8 +4708,12 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE,
       break;
     }
     if (msg.message == WM_KEYDOWN && msg.wParam == VK_F1 &&
-        !g_hGuideDialog) {
+        !g_hGuideDialog && !g_hQuickTourDialog) {
       SendMessageW(g_hGui, WM_COMMAND, IDM_GUIDED_WALKTHROUGH, 0);
+      continue;
+    }
+    if (g_hQuickTourDialog && IsWindow(g_hQuickTourDialog) &&
+        IsDialogMessageW(g_hQuickTourDialog, &msg)) {
       continue;
     }
     // intercept Enter when focus is in the combo or its edit
@@ -5065,6 +5077,11 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam,
       // state before the handoff proceeds.
       SendMessageW(g_hGuideDialog, WM_APP_DISMISS_GUIDE, 0, 0);
     }
+    if (g_hQuickTourDialog && IsWindow(g_hQuickTourDialog)) {
+      // A client shortcut must not wait behind the read-only tour. Dismiss it
+      // synchronously before preserving the request's selected browser intent.
+      DismissQuickTour(false);
+    }
     ShowWindow(hWnd, SW_RESTORE);
     SetForegroundWindow(hWnd);
     return ProcessClientLaunchRequest(std::wstring(text, length), true)
@@ -5215,6 +5232,8 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam,
       ShowGuidedWalkthrough(false);
     } else if (wmId == IDM_WHATS_NEW) {
       ShowGuidedWalkthrough(true);
+    } else if (wmId == IDM_QUICK_TOUR) {
+      ShowQuickTour();
     } else if (wmId == IDM_ABOUT) {
       ShowAboutDialog();
     } else if (wmId == IDM_BROWSER_EDGE) {
@@ -5248,6 +5267,9 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam,
   }
   case WM_APP_SHOW_GUIDE:
     ShowGuidedWalkthrough(false, wParam != 0);
+    return 0;
+  case WM_APP_REFRESH_QUICK_TOUR:
+    RefreshQuickTourPlacement();
     return 0;
   case WM_LBUTTONDOWN: {
     if (!g_bUiEnabled)
@@ -5506,6 +5528,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam,
   }
   case WM_APP_FINALIZE_LAYOUT: {
     ResizeMainWindowForDpi(hWnd, GetDpiForWindow(hWnd));
+    RefreshQuickTourPlacement();
     return 0;
   }
   case WM_APP_RESTACK_CLIENT_SELECTOR: {
@@ -5654,6 +5677,8 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam,
     return 0;
   }
   case WM_CLOSE: {
+    if (g_hQuickTourDialog && IsWindow(g_hQuickTourDialog))
+      DismissQuickTour(false);
     if (g_bArchiveTaskInProgress) {
       MessageBeep(MB_ICONINFORMATION);
       return 0;
@@ -5691,7 +5716,16 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam,
     }
     return 0;
   }
+  case WM_QUERYENDSESSION:
+    if (g_hQuickTourDialog && IsWindow(g_hQuickTourDialog))
+      DismissQuickTour(false);
+    return TRUE;
+  case WM_ENDSESSION:
+    if (wParam && g_hQuickTourDialog && IsWindow(g_hQuickTourDialog))
+      DismissQuickTour(false);
+    return 0;
   case WM_DESTROY: {
+    DismissQuickTourForOwnerClosing();
     for (auto hbmp : g_menuBitmaps) {
       if (hbmp)
         DeleteObject(hbmp);
@@ -5785,10 +5819,20 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam,
     const UINT dpi = HIWORD(wParam);
     const RECT *rc = reinterpret_cast<RECT *>(lParam);
     ApplyDpiScaling(hWnd, dpi, rc);
+    RefreshQuickTourPlacement();
     return 0;
   }
   case WM_SIZE:
+    if (wParam == SIZE_MINIMIZED) {
+      if (g_hQuickTourDialog && IsWindow(g_hQuickTourDialog))
+        DismissQuickTour(false);
+      return 0;
+    }
     LayoutMainGui(hWnd);
+    RefreshQuickTourPlacement();
+    return 0;
+  case WM_MOVE:
+    RefreshQuickTourPlacement();
     return 0;
 
   case WM_MENUSELECT:
@@ -16565,6 +16609,7 @@ struct GuideDialogState {
   bool initialWelcome = false;
   bool externallyDismissed = false;
   bool stateChanged = false;
+  bool launchQuickTour = false;
   HFONT font = nullptr;
   HFONT strongFont = nullptr;
 };
@@ -16620,6 +16665,7 @@ static void LayoutGuideDialog(HWND dialog, GuideDialogState &state, UINT dpi,
   const int buttonHeight = ScaleByDpi(30, dpi);
   const int buttonWidth = ScaleByDpi(82, dpi);
   const int closeWidth = ScaleByDpi(88, dpi);
+  const int tourWidth = ScaleByDpi(104, dpi);
   const int topicsWidth = min(ScaleByDpi(240, dpi),
                               max(ScaleByDpi(160, dpi), client.right / 3));
   const int footerTop = client.bottom - margin - buttonHeight;
@@ -16645,8 +16691,11 @@ static void LayoutGuideDialog(HWND dialog, GuideDialogState &state, UINT dpi,
   const int closeLeft = client.right - margin - closeWidth;
   const int nextLeft = closeLeft - gap / 2 - buttonWidth;
   const int backLeft = nextLeft - gap / 2 - buttonWidth;
+  const int tourLeft = backLeft - gap / 2 - tourWidth;
   MoveWindow(GetDlgItem(dialog, IDC_GUIDE_COUNT), margin, footerTop,
-             max(1, backLeft - gap - margin), buttonHeight, TRUE);
+             max(1, tourLeft - gap - margin), buttonHeight, TRUE);
+  MoveWindow(GetDlgItem(dialog, IDC_GUIDE_QUICK_TOUR), tourLeft, footerTop,
+             tourWidth, buttonHeight, TRUE);
   MoveWindow(GetDlgItem(dialog, IDC_GUIDE_BACK), backLeft, footerTop,
              buttonWidth, buttonHeight, TRUE);
   MoveWindow(GetDlgItem(dialog, IDOK), nextLeft, footerTop, buttonWidth,
@@ -16854,6 +16903,7 @@ static INT_PTR CALLBACK GuideDlgProc(HWND dialog, UINT message, WPARAM wParam,
       const int buttonHeight = ScaleByDpi(30, dpi);
       const int buttonWidth = ScaleByDpi(82, dpi);
       const int closeWidth = ScaleByDpi(88, dpi);
+      const int tourWidth = ScaleByDpi(104, dpi);
       const int topicsWidth = min(ScaleByDpi(240, dpi),
                                   max(ScaleByDpi(160, dpi), client.right / 3));
       const int footerTop = client.bottom - margin - buttonHeight;
@@ -16877,8 +16927,11 @@ static INT_PTR CALLBACK GuideDlgProc(HWND dialog, UINT message, WPARAM wParam,
       const int closeLeft = client.right - margin - closeWidth;
       const int nextLeft = closeLeft - gap / 2 - buttonWidth;
       const int backLeft = nextLeft - gap / 2 - buttonWidth;
+      const int tourLeft = backLeft - gap / 2 - tourWidth;
       MoveWindow(GetDlgItem(dialog, IDC_GUIDE_COUNT), margin, footerTop,
-                 max(1, backLeft - gap - margin), buttonHeight, TRUE);
+                 max(1, tourLeft - gap - margin), buttonHeight, TRUE);
+      MoveWindow(GetDlgItem(dialog, IDC_GUIDE_QUICK_TOUR), tourLeft,
+                 footerTop, tourWidth, buttonHeight, TRUE);
       MoveWindow(GetDlgItem(dialog, IDC_GUIDE_BACK), backLeft, footerTop,
                  buttonWidth, buttonHeight, TRUE);
       MoveWindow(GetDlgItem(dialog, IDOK), nextLeft, footerTop, buttonWidth,
@@ -16994,6 +17047,13 @@ static INT_PTR CALLBACK GuideDlgProc(HWND dialog, UINT message, WPARAM wParam,
       }
       return TRUE;
     }
+    if (LOWORD(wParam) == IDC_GUIDE_QUICK_TOUR) {
+      if (!state->initialWelcome || PersistGuideWelcomeHandled(*state)) {
+        state->launchQuickTour = true;
+        EndDialog(dialog, IDC_GUIDE_QUICK_TOUR);
+      }
+      return TRUE;
+    }
     if (LOWORD(wParam) == IDOK) {
       const size_t topicIndex = state->visibleTopics[state->position];
       if (PersistGuideTopicRead(*state, topicIndex)) {
@@ -17099,6 +17159,573 @@ static void ShowGuidedWalkthrough(bool whatsNewOnly, bool initialWelcome) {
   }
   if (state.stateChanged)
     UpdateGuideIndicators();
+  if (state.launchQuickTour)
+    ShowQuickTour();
+}
+
+enum class QuickTourTarget {
+  ClientField,
+  BrowserSelector,
+  PrimaryAction,
+  PinnedClients,
+  SessionTabs,
+  ClientIcon,
+  RestoreTabs,
+  Temporary,
+  Options,
+};
+
+struct QuickTourStep {
+  const wchar_t *title;
+  const wchar_t *body;
+  QuickTourTarget target;
+};
+
+static constexpr std::array<QuickTourStep, 9> kQuickTourSteps{{
+    {L"Choose or name a client",
+     L"Use the CLIENT field to choose an existing client or type a new name. "
+     L"The tour only points to controls; it never changes this field.",
+     QuickTourTarget::ClientField},
+    {L"Choose a browser",
+     L"The browser selector chooses Edge, Chrome, Brave, or Firefox for the "
+     L"current action. Each client keeps a separate slot for each browser.",
+     QuickTourTarget::BrowserSelector},
+    {L"Create, Open, or Show",
+     L"This primary button reflects the current selection. It can create a new "
+     L"slot, open an existing one, or show an already-open window.",
+     QuickTourTarget::PrimaryAction},
+    {L"Pin favorite clients",
+     L"The pushpin adds or removes the selected existing client from favorites. "
+     L"Pinned clients appear in the row above the CLIENT field.",
+     QuickTourTarget::PinnedClients},
+    {L"Switch between open sessions",
+     L"Open client windows appear as tabs across the top. Select a tab to show "
+     L"its window, use x to close it normally, or use overflow for extra tabs.",
+     QuickTourTarget::SessionTabs},
+    {L"Open the client folder",
+     L"For an existing client, the icon at the left of the CLIENT field opens "
+     L"its folder in File Explorer. Do not edit profile files while a browser is open.",
+     QuickTourTarget::ClientIcon},
+    {L"Choose whether to restore tabs",
+     L"Restore tabs is saved separately for the selected client and browser. "
+     L"Changing it does not erase cookies, sign-ins, or browsing data.",
+     QuickTourTarget::RestoreTabs},
+    {L"Open a temporary profile",
+     L"Temporary opens a disposable profile that ctSpaces removes after it "
+     L"closes when Windows releases its files. Do not store important work there.",
+     QuickTourTarget::Temporary},
+    {L"Open Options",
+     L"Options contains icons, client management, backup and restore, themes, "
+     L"browser selection, the full guide, and this Quick tour.",
+     QuickTourTarget::Options},
+}};
+
+struct QuickTourState {
+  size_t position = 0;
+  bool mainWasEnabled = false;
+  bool restoreFocus = false;
+  bool ownerClosing = false;
+  bool closing = false;
+  HFONT font = nullptr;
+  HFONT strongFont = nullptr;
+};
+
+static QuickTourState g_quickTourState;
+static constexpr wchar_t kQuickTourFrameClass[] =
+    L"ctSpacesQuickTourHighlight";
+
+static bool QuickTourOperationsAllowEnable() {
+  return g_bUiEnabled && !g_bDefaultProfileUiBusy &&
+         !g_isLaunchInFlight.load() && !g_bArchiveTaskInProgress &&
+         !g_isShuttingDown.load();
+}
+
+static void DeleteQuickTourFonts() {
+  if (g_quickTourState.font) {
+    DeleteObject(g_quickTourState.font);
+    g_quickTourState.font = nullptr;
+  }
+  if (g_quickTourState.strongFont) {
+    DeleteObject(g_quickTourState.strongFont);
+    g_quickTourState.strongFont = nullptr;
+  }
+}
+
+static LRESULT CALLBACK QuickTourFrameProc(HWND window, UINT message,
+                                           WPARAM wParam, LPARAM lParam) {
+  switch (message) {
+  case WM_NCHITTEST:
+    return HTTRANSPARENT;
+  case WM_ERASEBKGND:
+    return TRUE;
+  case WM_PAINT: {
+    PAINTSTRUCT paint{};
+    HDC dc = BeginPaint(window, &paint);
+    HBRUSH brush = CreateSolidBrush(g_themeColors.crAccent);
+    FillRect(dc, &paint.rcPaint, brush);
+    DeleteObject(brush);
+    EndPaint(window, &paint);
+    return 0;
+  }
+  default:
+    return DefWindowProcW(window, message, wParam, lParam);
+  }
+}
+
+static bool EnsureQuickTourFrameClass() {
+  WNDCLASSEXW existing{sizeof(existing)};
+  if (GetClassInfoExW(g_hInst, kQuickTourFrameClass, &existing))
+    return true;
+  WNDCLASSEXW windowClass{sizeof(windowClass)};
+  windowClass.lpfnWndProc = QuickTourFrameProc;
+  windowClass.hInstance = g_hInst;
+  windowClass.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+  windowClass.lpszClassName = kQuickTourFrameClass;
+  return RegisterClassExW(&windowClass) != 0;
+}
+
+static bool MainClientRectToScreen(const RECT &clientRect, RECT &screenRect) {
+  if (!g_hGui || !IsWindow(g_hGui) || clientRect.right <= clientRect.left ||
+      clientRect.bottom <= clientRect.top) {
+    return false;
+  }
+  POINT points[2]{{clientRect.left, clientRect.top},
+                  {clientRect.right, clientRect.bottom}};
+  SetLastError(ERROR_SUCCESS);
+  if (!MapWindowPoints(g_hGui, nullptr, points, 2)) {
+    const DWORD error = GetLastError();
+    if (error != ERROR_SUCCESS)
+      return false;
+  }
+  screenRect = {points[0].x, points[0].y, points[1].x, points[1].y};
+  return true;
+}
+
+static bool QuickTourWindowRect(HWND window, RECT &rect) {
+  return window && IsWindow(window) && IsWindowVisible(window) &&
+         GetWindowRect(window, &rect) && rect.right > rect.left &&
+         rect.bottom > rect.top;
+}
+
+static bool GetQuickTourTargetRect(QuickTourTarget target, RECT &rect) {
+  switch (target) {
+  case QuickTourTarget::ClientField:
+    return QuickTourWindowRect(g_hClientEditSurface, rect);
+  case QuickTourTarget::BrowserSelector:
+    return MainClientRectToScreen(g_rcBrowserSelector, rect);
+  case QuickTourTarget::PrimaryAction:
+    return QuickTourWindowRect(g_hBtnGo, rect);
+  case QuickTourTarget::PinnedClients:
+    BuildPinnedClientRects();
+    if (!g_pinnedClients.empty() &&
+        MainClientRectToScreen(g_rcPinnedArea, rect)) {
+      return true;
+    }
+    return QuickTourWindowRect(g_hBtnPin, rect);
+  case QuickTourTarget::SessionTabs:
+    BuildSessionTabRects(g_hGui, nullptr);
+    if (g_sessions.empty() && !g_sessionTabRects.empty() &&
+        MainClientRectToScreen(g_sessionTabRects[0], rect)) {
+      return true;
+    }
+    for (size_t index = 1; index < g_sessionTabRects.size(); ++index) {
+      if (MainClientRectToScreen(g_sessionTabRects[index], rect))
+        return true;
+    }
+    return MainClientRectToScreen(g_rcSessionTabs, rect);
+  case QuickTourTarget::ClientIcon:
+    return QuickTourWindowRect(g_hBtnClientIcon, rect);
+  case QuickTourTarget::RestoreTabs:
+    return QuickTourWindowRect(g_hBtnRestoreTabs, rect);
+  case QuickTourTarget::Temporary:
+    return QuickTourWindowRect(g_hBtnTmpProf, rect);
+  case QuickTourTarget::Options:
+    return QuickTourWindowRect(g_hBtnConfig, rect);
+  }
+  return false;
+}
+
+static bool RectsOverlap(const RECT &first, const RECT &second) {
+  RECT intersection{};
+  return IntersectRect(&intersection, &first, &second) != FALSE;
+}
+
+static RECT ClampRectToWorkArea(RECT rect, const RECT &work) {
+  const int width = rect.right - rect.left;
+  const int height = rect.bottom - rect.top;
+  rect.left = min(max(rect.left, work.left), max(work.left, work.right - width));
+  rect.top = min(max(rect.top, work.top), max(work.top, work.bottom - height));
+  rect.right = rect.left + width;
+  rect.bottom = rect.top + height;
+  return rect;
+}
+
+static RECT ChooseQuickTourCardRect(const RECT &target, int width, int height,
+                                    int gap, const RECT &work) {
+  const int centeredTop = (target.top + target.bottom - height) / 2;
+  const int centeredLeft = (target.left + target.right - width) / 2;
+  const std::array<RECT, 4> candidates{{
+      {target.right + gap, centeredTop, target.right + gap + width,
+       centeredTop + height},
+      {target.left - gap - width, centeredTop, target.left - gap,
+       centeredTop + height},
+      {centeredLeft, target.bottom + gap, centeredLeft + width,
+       target.bottom + gap + height},
+      {centeredLeft, target.top - gap - height, centeredLeft + width,
+       target.top - gap},
+  }};
+  for (const RECT &candidate : candidates) {
+    if (candidate.left >= work.left && candidate.top >= work.top &&
+        candidate.right <= work.right && candidate.bottom <= work.bottom &&
+        !RectsOverlap(candidate, target)) {
+      return candidate;
+    }
+  }
+  for (const RECT &candidate : candidates) {
+    RECT clamped = ClampRectToWorkArea(candidate, work);
+    if (!RectsOverlap(clamped, target))
+      return clamped;
+  }
+  return ClampRectToWorkArea(candidates[0], work);
+}
+
+static std::wstring QuickTourBodyForPosition(size_t position) {
+  if (position >= kQuickTourSteps.size())
+    return L"";
+  std::wstring body = kQuickTourSteps[position].body;
+  if (kQuickTourSteps[position].target == QuickTourTarget::PinnedClients) {
+    if (g_pinnedClients.empty()) {
+      return L"No clients are pinned right now, so the real pushpin is "
+             L"highlighted. It adds or removes the selected existing client "
+             L"from favorites; the tour will not create a fake client.";
+    }
+    return L"Click a pinned client to open it in the selected browser or show "
+           L"its existing window. Right-click a visible pin for Select, Open, "
+           L"Restore tabs, copied-link, and shortcut actions. The pushpin beside "
+           L"Create/Open adds or removes the selected existing client.";
+  }
+  if (kQuickTourSteps[position].target == QuickTourTarget::SessionTabs &&
+      g_sessions.empty()) {
+    body += L" No client browser is open right now, so the real New tab is "
+            L"highlighted.";
+  }
+  return body;
+}
+
+static void LayoutQuickTourDialog(HWND dialog, UINT dpi) {
+  if (!dialog)
+    return;
+  if (!dpi)
+    dpi = USER_DEFAULT_SCREEN_DPI;
+  RECT client{};
+  GetClientRect(dialog, &client);
+  const int margin = ScaleByDpi(16, dpi);
+  const int titleHeight = ScaleByDpi(28, dpi);
+  const int footerHeight = ScaleByDpi(30, dpi);
+  const int gap = ScaleByDpi(8, dpi);
+  const int footerTop = client.bottom - margin - footerHeight;
+  const int buttonWidth = ScaleByDpi(72, dpi);
+  const int skipWidth = ScaleByDpi(76, dpi);
+  const int skipLeft = client.right - margin - skipWidth;
+  const int nextLeft = skipLeft - gap - buttonWidth;
+  const int backLeft = nextLeft - gap - buttonWidth;
+
+  MoveWindow(GetDlgItem(dialog, IDC_QUICK_TOUR_TITLE), margin, margin,
+             max(1, client.right - margin * 2), titleHeight, TRUE);
+  MoveWindow(GetDlgItem(dialog, IDC_QUICK_TOUR_BODY), margin,
+             margin + titleHeight,
+             max(1, client.right - margin * 2),
+             max(1, footerTop - gap - margin - titleHeight), TRUE);
+  MoveWindow(GetDlgItem(dialog, IDC_QUICK_TOUR_COUNT), margin, footerTop,
+             max(1, backLeft - gap - margin), footerHeight, TRUE);
+  MoveWindow(GetDlgItem(dialog, IDC_QUICK_TOUR_BACK), backLeft, footerTop,
+             buttonWidth, footerHeight, TRUE);
+  MoveWindow(GetDlgItem(dialog, IDOK), nextLeft, footerTop, buttonWidth,
+             footerHeight, TRUE);
+  MoveWindow(GetDlgItem(dialog, IDCANCEL), skipLeft, footerTop, skipWidth,
+             footerHeight, TRUE);
+
+  DeleteQuickTourFonts();
+  g_quickTourState.font = CreateUiFont(dpi);
+  g_quickTourState.strongFont = CreateUiStrongFont(dpi);
+  EnumChildWindows(
+      dialog,
+      [](HWND child, LPARAM) -> BOOL {
+        const HFONT font =
+            GetDlgCtrlID(child) == IDC_QUICK_TOUR_TITLE
+                ? g_quickTourState.strongFont
+                : g_quickTourState.font;
+        if (font)
+          SendMessageW(child, WM_SETFONT, reinterpret_cast<WPARAM>(font), TRUE);
+        return TRUE;
+      },
+      0);
+}
+
+static void RefreshQuickTourPage() {
+  if (!g_hQuickTourDialog || !IsWindow(g_hQuickTourDialog) ||
+      g_quickTourState.position >= kQuickTourSteps.size()) {
+    return;
+  }
+  const auto &step = kQuickTourSteps[g_quickTourState.position];
+  SetDlgItemTextW(g_hQuickTourDialog, IDC_QUICK_TOUR_TITLE, step.title);
+  const std::wstring body =
+      QuickTourBodyForPosition(g_quickTourState.position);
+  SetDlgItemTextW(g_hQuickTourDialog, IDC_QUICK_TOUR_BODY, body.c_str());
+  const std::wstring count =
+      std::format(L"{} / {}", g_quickTourState.position + 1,
+                  kQuickTourSteps.size());
+  SetDlgItemTextW(g_hQuickTourDialog, IDC_QUICK_TOUR_COUNT, count.c_str());
+  EnableWindow(GetDlgItem(g_hQuickTourDialog, IDC_QUICK_TOUR_BACK),
+               g_quickTourState.position > 0);
+  SetDlgItemTextW(g_hQuickTourDialog, IDOK,
+                  g_quickTourState.position + 1 == kQuickTourSteps.size()
+                      ? L"Done"
+                      : L"Next");
+  SetDlgItemTextW(g_hQuickTourDialog, IDCANCEL, L"Skip");
+  RefreshQuickTourPlacement();
+}
+
+static void RefreshQuickTourPlacement() {
+  if (!g_hQuickTourDialog || !IsWindow(g_hQuickTourDialog) ||
+      !g_hQuickTourFrame || !IsWindow(g_hQuickTourFrame) ||
+      !g_hGui || !IsWindow(g_hGui) || IsIconic(g_hGui) ||
+      g_quickTourState.position >= kQuickTourSteps.size()) {
+    return;
+  }
+
+  RECT target{};
+  if (!GetQuickTourTargetRect(
+          kQuickTourSteps[g_quickTourState.position].target, target)) {
+    return;
+  }
+  const UINT dpi = GetDpiForWindow(g_hGui);
+  const int padding = ScaleByDpi(5, dpi);
+  const int thickness = max(2, ScaleByDpi(3, dpi));
+  InflateRect(&target, padding, padding);
+  const int frameWidth = target.right - target.left;
+  const int frameHeight = target.bottom - target.top;
+  if (frameWidth <= thickness * 2 || frameHeight <= thickness * 2)
+    return;
+
+  HRGN outer = CreateRectRgn(0, 0, frameWidth, frameHeight);
+  HRGN inner = CreateRectRgn(thickness, thickness, frameWidth - thickness,
+                             frameHeight - thickness);
+  if (outer && inner) {
+    CombineRgn(outer, outer, inner, RGN_DIFF);
+    if (SetWindowRgn(g_hQuickTourFrame, outer, TRUE) != 0)
+      outer = nullptr; // The window owns a successfully assigned region.
+  }
+  if (outer)
+    DeleteObject(outer);
+  if (inner)
+    DeleteObject(inner);
+
+  SetWindowPos(g_hQuickTourFrame, nullptr, target.left, target.top,
+               frameWidth, frameHeight,
+               SWP_NOACTIVATE | SWP_NOZORDER | SWP_SHOWWINDOW);
+
+  HMONITOR monitor = MonitorFromRect(&target, MONITOR_DEFAULTTONEAREST);
+  MONITORINFO monitorInfo{sizeof(monitorInfo)};
+  if (!GetMonitorInfoW(monitor, &monitorInfo))
+    return;
+  const int cardWidth = min(ScaleByDpi(380, dpi),
+                            monitorInfo.rcWork.right - monitorInfo.rcWork.left);
+  const int cardHeight = min(ScaleByDpi(224, dpi),
+                             monitorInfo.rcWork.bottom - monitorInfo.rcWork.top);
+  const int gap = ScaleByDpi(12, dpi);
+  RECT card = ChooseQuickTourCardRect(target, cardWidth, cardHeight, gap,
+                                      monitorInfo.rcWork);
+  SetWindowPos(g_hQuickTourDialog, nullptr, card.left, card.top,
+               card.right - card.left, card.bottom - card.top,
+               SWP_NOACTIVATE | SWP_NOZORDER | SWP_SHOWWINDOW);
+  InvalidateRect(g_hQuickTourFrame, nullptr, TRUE);
+}
+
+static void FinishQuickTourCleanup() {
+  const bool restoreFocus = g_quickTourState.restoreFocus;
+  const bool enableMain =
+      g_quickTourState.mainWasEnabled && !g_quickTourState.ownerClosing &&
+      g_hGui && IsWindow(g_hGui) && QuickTourOperationsAllowEnable();
+  if (g_hQuickTourFrame && IsWindow(g_hQuickTourFrame))
+    DestroyWindow(g_hQuickTourFrame);
+  g_hQuickTourFrame = nullptr;
+  DeleteQuickTourFonts();
+  g_quickTourState.position = 0;
+  g_quickTourState.mainWasEnabled = false;
+  g_quickTourState.restoreFocus = false;
+  g_quickTourState.closing = false;
+  if (enableMain) {
+    EnableWindow(g_hGui, TRUE);
+    if (restoreFocus) {
+      SetActiveWindow(g_hGui);
+      FocusClientEdit();
+    }
+  }
+}
+
+static void DismissQuickTour(bool restoreFocus) {
+  g_quickTourState.restoreFocus = restoreFocus;
+  if (g_quickTourState.closing)
+    return;
+  g_quickTourState.closing = true;
+  if (g_hQuickTourDialog && IsWindow(g_hQuickTourDialog)) {
+    DestroyWindow(g_hQuickTourDialog);
+    return;
+  }
+  g_hQuickTourDialog = nullptr;
+  FinishQuickTourCleanup();
+}
+
+static void DismissQuickTourForOwnerClosing() {
+  g_quickTourState.ownerClosing = true;
+  if ((g_hQuickTourDialog && IsWindow(g_hQuickTourDialog)) ||
+      (g_hQuickTourFrame && IsWindow(g_hQuickTourFrame))) {
+    DismissQuickTour(false);
+  }
+}
+
+static INT_PTR CALLBACK QuickTourDlgProc(HWND dialog, UINT message,
+                                         WPARAM wParam, LPARAM lParam) {
+  if (const auto themed =
+          HandleCleanupDialogTheme(dialog, message, wParam, lParam)) {
+    return *themed;
+  }
+  switch (message) {
+  case WM_INITDIALOG: {
+    g_hQuickTourDialog = dialog;
+    HICON icon = LoadIconW(g_hInst, MAKEINTRESOURCEW(IDI_CTSPACES));
+    if (icon) {
+      SendMessageW(dialog, WM_SETICON, ICON_SMALL,
+                   reinterpret_cast<LPARAM>(icon));
+      SendMessageW(dialog, WM_SETICON, ICON_BIG,
+                   reinterpret_cast<LPARAM>(icon));
+    }
+    LayoutQuickTourDialog(dialog, GetDpiForWindow(dialog));
+    ApplyCleanupDialogTheme(dialog);
+    return TRUE;
+  }
+  case WM_SIZE:
+    if (wParam != SIZE_MINIMIZED)
+      LayoutQuickTourDialog(dialog, GetDpiForWindow(dialog));
+    return TRUE;
+  case WM_DPICHANGED: {
+    const auto *suggested = reinterpret_cast<const RECT *>(lParam);
+    if (suggested) {
+      SetWindowPos(dialog, nullptr, suggested->left, suggested->top,
+                   suggested->right - suggested->left,
+                   suggested->bottom - suggested->top,
+                   SWP_NOZORDER | SWP_NOACTIVATE);
+    }
+    LayoutQuickTourDialog(dialog, HIWORD(wParam));
+    ApplyCleanupDialogTheme(dialog);
+    RefreshQuickTourPlacement();
+    return TRUE;
+  }
+  case WM_COMMAND:
+    if (LOWORD(wParam) == IDC_QUICK_TOUR_BACK) {
+      if (g_quickTourState.position > 0) {
+        --g_quickTourState.position;
+        RefreshQuickTourPage();
+      }
+      return TRUE;
+    }
+    if (LOWORD(wParam) == IDOK) {
+      if (g_quickTourState.position + 1 < kQuickTourSteps.size()) {
+        ++g_quickTourState.position;
+        RefreshQuickTourPage();
+      } else {
+        DismissQuickTour(true);
+      }
+      return TRUE;
+    }
+    if (LOWORD(wParam) == IDCANCEL) {
+      DismissQuickTour(true);
+      return TRUE;
+    }
+    break;
+  case WM_CLOSE:
+    DismissQuickTour(true);
+    return TRUE;
+  case WM_NCDESTROY:
+    if (g_hQuickTourDialog == dialog)
+      g_hQuickTourDialog = nullptr;
+    FinishQuickTourCleanup();
+    return FALSE;
+  }
+  return FALSE;
+}
+
+static void ShowQuickTour() {
+  if (g_hQuickTourDialog && IsWindow(g_hQuickTourDialog)) {
+    SetActiveWindow(g_hQuickTourDialog);
+    return;
+  }
+  if (g_hGuideDialog && IsWindow(g_hGuideDialog)) {
+    SetForegroundWindow(g_hGuideDialog);
+    return;
+  }
+  if (!g_bUiEnabled || !g_hGui || !IsWindow(g_hGui) ||
+      g_bDefaultProfileUiBusy || g_isLaunchInFlight.load() ||
+      g_bArchiveTaskInProgress || g_isShuttingDown.load()) {
+    MessageBoxW(g_hGui,
+                L"Finish the current client operation, then open Quick tour "
+                L"again.",
+                L"Quick Tour", MB_OK | MB_ICONINFORMATION);
+    return;
+  }
+  if (!EnsureQuickTourFrameClass()) {
+    MessageBoxW(g_hGui,
+                L"Quick tour could not create its highlight. No settings or "
+                L"client data were changed.",
+                L"Quick Tour Unavailable", MB_OK | MB_ICONERROR);
+    return;
+  }
+
+  g_quickTourState = {};
+  g_hQuickTourFrame = CreateWindowExW(
+      WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TRANSPARENT,
+      kQuickTourFrameClass, L"", WS_POPUP, 0, 0, 0, 0, g_hGui, nullptr,
+      g_hInst, nullptr);
+  if (!g_hQuickTourFrame) {
+    MessageBoxW(g_hGui,
+                L"Quick tour could not create its highlight. No settings or "
+                L"client data were changed.",
+                L"Quick Tour Unavailable", MB_OK | MB_ICONERROR);
+    return;
+  }
+
+  DPI_AWARENESS_CONTEXT parentContext = GetWindowDpiAwarenessContext(g_hGui);
+  DPI_AWARENESS_CONTEXT previousContext =
+      SetThreadDpiAwarenessContext(parentContext);
+  HWND dialog = CreateDialogParamW(
+      g_hInst, MAKEINTRESOURCEW(IDD_QUICK_TOUR), g_hGui,
+      QuickTourDlgProc, 0);
+  const DWORD dialogError = GetLastError();
+  SetThreadDpiAwarenessContext(previousContext);
+  if (!dialog) {
+    DestroyWindow(g_hQuickTourFrame);
+    g_hQuickTourFrame = nullptr;
+    DeleteQuickTourFonts();
+    std::wstring message =
+        L"Quick tour could not open. No settings or client data were changed.";
+    if (dialogError)
+      message += std::format(L"\n\nWindows error: {}.", dialogError);
+    MessageBoxW(g_hGui, message.c_str(), L"Quick Tour Unavailable",
+                MB_OK | MB_ICONERROR);
+    return;
+  }
+
+  g_hQuickTourDialog = dialog;
+  g_quickTourState.mainWasEnabled = IsWindowEnabled(g_hGui) != FALSE;
+  if (!g_quickTourState.mainWasEnabled) {
+    DismissQuickTour(false);
+    return;
+  }
+  EnableWindow(g_hGui, FALSE);
+  RefreshQuickTourPage();
+  ShowWindow(g_hQuickTourDialog, SW_SHOW);
+  SetActiveWindow(g_hQuickTourDialog);
 }
 
 struct ThemeDlgState {
@@ -17571,6 +18198,7 @@ static void EnsureConfigMenu(HWND hWnd) {
                                L"Google Chrome",
                                L"Back Up All Client Data",
                                L"Restore Client Data",
+                               L"Quick tour",
                                L"Guided walkthrough (New)",
                                L"What's new (New)"};
     HDC hdc = GetDC(nullptr);
@@ -17687,6 +18315,7 @@ static void EnsureConfigMenu(HWND hWnd) {
   addItem(IDM_CTX_RESTORE_ALL, L"Restore Client Data", iIcoRefresh);
   MenuAddSep(g_hConfigMenu);
   const bool guideNew = guided_walkthrough::HasUnreadAnnouncement(g_guideState);
+  addItem(IDM_QUICK_TOUR, L"Quick tour", iIcoAbout);
   addItem(IDM_GUIDED_WALKTHROUGH, L"Guided walkthrough", iIcoAbout);
   addItem(IDM_WHATS_NEW, L"What's new", iIcoAbout, guideNew);
   MenuAddSep(g_hConfigMenu);
@@ -18174,6 +18803,8 @@ static void EnsureMenuTooltips(HWND hWnd) {
       L"Restore a verified backup or an older backup ZIP.";
   g_menuTipText[IDM_GUIDED_WALKTHROUGH] =
       L"Open the complete read-only guide (F1).";
+  g_menuTipText[IDM_QUICK_TOUR] =
+      L"Highlight real controls in a read-only tour.";
   g_menuTipText[IDM_WHATS_NEW] =
       L"Review announced guide topics you have not read yet.";
   g_menuTipText[IDM_ABOUT] = L"About ctSpaces";
@@ -18268,6 +18899,7 @@ static void UpdateConfigMenuEnabledState() {
   en(IDM_CTX_EXPORT_ALL, true);
   en(IDM_CTX_RESTORE_ALL, true);
   en(IDM_GUIDED_WALKTHROUGH, true);
+  en(IDM_QUICK_TOUR, true);
   en(IDM_WHATS_NEW, true);
   en(IDM_ABOUT, true);
   CheckMenuItem(g_hConfigMenu, IDM_CTX_CLIENT_TITLE_FIRST,

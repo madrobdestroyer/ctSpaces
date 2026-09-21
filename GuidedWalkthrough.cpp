@@ -27,15 +27,19 @@ const std::vector<Topic> kTopics = {
      L"This walkthrough is read-only. Moving through it never opens a browser, "
      L"changes a client, or runs the feature being described.",
      0, false},
-    {L"create_open", 1, L"Create and open a client",
-     L"New tab > CLIENT > browser selector > Create or Open",
+    {L"create_open", 2, L"Create and open a client",
+     L"New tab: CLIENT field, client icon, browser selector, and Create/Open",
      L"On the New tab, choose a browser, then choose an existing client or type "
      L"a new client name. Create makes that client's browser slot and opens it "
      L"immediately. For an existing client, the button says Open. Pressing Enter "
      L"in the client field performs the same primary action.\r\n\r\n"
      L"ctSpaces rejects reserved, invalid, empty, and overlong names. Watch the "
      L"text in the field: validation and sanitizing may change what you typed "
-     L"before a client can be created.",
+     L"before a client can be created. For an existing client, click the client "
+     L"icon at the left of the CLIENT field. File Explorer opens the client "
+     L"folder containing all of its browser slots. This is not the Temporary "
+     L"button. Do not edit or delete profile files while a client browser is "
+     L"open.",
      0, false},
     {L"browsers_restore", 1, L"Browsers and Restore tabs",
      L"Lower-left browser selector and Restore tabs switch",
@@ -49,7 +53,7 @@ const std::vector<Topic> kTopics = {
      L"Turning it off does not sign out or erase cookies. A newly created slot "
      L"always starts fresh.",
      0, false},
-    {L"sessions", 1, L"Open browser windows",
+    {L"sessions", 2, L"Open browser windows",
      L"Tabs across the top, Show, close x, and tab overflow",
      L"Open client windows appear as session tabs. The same client open in two "
      L"browsers can produce tabs with the same client name; ctSpaces tracks the "
@@ -58,13 +62,23 @@ const std::vector<Topic> kTopics = {
      L"The x asks that browser session to close normally. Closing ctSpaces "
      L"while client browsers remain open requires confirmation so tracked "
      L"windows are not abandoned accidentally. Extra tabs move into the "
-     L"overflow menu.",
+     L"overflow menu. Its first section lists client labels; choose one to show "
+     L"that window. Below the divider, choose Close followed by a client label "
+     L"to ask that session to close.",
      0, false},
-    {L"pins_shortcuts", 1, L"Favorites, links, and shortcuts",
+    {L"pins_shortcuts", 2, L"Favorites, links, and shortcuts",
      L"Pushpin, pinned-client right-click menu, and Options",
-     L"Pin an existing client for quick access. You can keep up to eight pinned "
-     L"clients; four are shown directly and the rest are in overflow. Drag pins "
-     L"to reorder them. A pinned client's menu can open a copied http(s) URL; "
+     L"Pin an existing client for quick access; click the pushpin again to "
+     L"unpin it. Unpinning removes only the favorite, not client data. You can "
+     L"keep up to eight pinned clients; four are shown "
+     L"directly and the rest are in overflow. Drag visible pins to reorder them, "
+     L"or drag a pin onto the Windows Desktop to create that client's shortcut.\r\n\r\n"
+     L"Click a pinned client to open it in the selected browser, or show its "
+     L"existing window. Right-click a visible pin for distinct actions. Select client fills the "
+     L"CLIENT field without launching. Open client opens the currently selected "
+     L"browser, or shows that client/browser session if it is already open. "
+     L"Restore tabs toggles the setting for that client and currently selected "
+     L"browser without opening it. The menu can also open a copied http(s) URL; "
      L"other clipboard text is ignored. If that client's isolated Firefox "
      L"session is already open, Firefox cannot accept another command-line URL; "
      L"ctSpaces brings the window forward and does not open the copied link.\r\n\r\n"
@@ -86,13 +100,16 @@ const std::vector<Topic> kTopics = {
      L"previous saved Default unchanged. Saved changes affect new profiles only. "
      L"Never sign a real client into Default.",
      0, false},
-    {L"identity", 1, L"Icons and window titles",
-     L"Options > Set Profile Icon, Auto-fetch Icon, and client-name-first",
+    {L"identity", 2, L"Icons and window titles",
+     L"Options > client icon and window-title commands",
      L"A custom client icon is shared by that client's browser slots and is "
      L"reflected in ctSpaces, supported live windows, and managed shortcuts. "
      L"Set Profile Icon uses a local image. Auto-fetch Icon asks for a website "
      L"domain and sends the domain you enter to Google's favicon service; use "
-     L"Set Profile Icon if that network lookup is not appropriate.\r\n\r\n"
+     L"Set Profile Icon if that network lookup is not appropriate. Remove "
+     L"Custom Icon asks for confirmation, then returns the selected existing "
+     L"client to the default icon and refreshes supported open windows without "
+     L"removing browser data.\r\n\r\n"
      L"Client name first in window titles prefixes supported browser and "
      L"Alt+Tab titles, making many open client windows easier to distinguish.",
      0, false},
@@ -138,15 +155,22 @@ const std::vector<Topic> kTopics = {
      L"Enter in the client field to launch. Press F1 from the main window to "
      L"open this walkthrough at any time.",
      0, false},
-    {L"updates", 1, L"Help and new features",
-     L"Options > Guided walkthrough or What's new",
+    {L"updates", 2, L"Help and new features",
+     L"Options > Quick tour, Guided walkthrough, or What's new",
      L"Guided walkthrough always opens the full topic list, so you can replay "
      L"the guide or jump directly to a subject. What's new shows only announced "
      L"topics whose current revision you have not read.\r\n\r\n"
      L"A dot and the text (New) identify unseen revised guidance. Next or Done "
      L"marks only the page currently shown as read. Skip, Close, Escape, and the "
      L"window X leave unseen topics unread. The guide never performs the client "
-     L"or browser operations it describes.",
+     L"or browser operations it describes.\r\n\r\n"
+     L"New optional Quick tour: start it from Options or the full guide to "
+     L"highlight real launcher controls with short Back, Next, Skip, and Done "
+     L"callouts. It never clicks controls, changes selections or preferences, "
+     L"creates clients, or launches browsers.\r\n\r\n"
+     L"Updated guide: this revision documents existing folder, icon, pin, "
+     L"shortcut, and session-menu actions more completely; reopen the full guide "
+     L"from Options > Guided walkthrough or press F1 to review every topic.",
      kGuidedWalkthroughCommand, true},
 };
 

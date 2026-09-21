@@ -1,8 +1,27 @@
 # ctSpaces 6.0 - What's New
 
-ctSpaces 6.0 is a consolidated major milestone for the features previously shipped across 5.2 and 5.3. It does not add new behavior beyond 5.3.0.10. Existing client spaces, sign-ins, bookmarks, icons, browser history, and saved sessions remain intact during the update.
+The initial ctSpaces 6.0.0.0 milestone consolidated features previously shipped across 5.2 and 5.3 and added no behavior beyond 5.3.0.10. The current 6.0.1.0 patch adds optional visual help and expands the guide without changing client or browser data behavior. Existing client spaces, sign-ins, bookmarks, icons, browser history, and saved sessions remain intact during the update.
 
-## Current 6.0.0.0 Milestone
+## Current 6.0.1.0 Milestone
+
+- **Optional Quick tour:** Start a short tour from Options or the full guide to
+  highlight the real CLIENT field, browser selector, primary action, pins,
+  session tabs, folder icon, Restore tabs, Temporary, and Options controls.
+  Back, Next, Skip, Done, Escape, and close provide navigation without clicking
+  a highlighted control or changing selections, browser preferences, sessions,
+  pins, Restore tabs, or client data.
+- **More complete built-in help:** The existing walkthrough now explains how to
+  open a selected client's profile folder, remove a custom icon, unpin a client,
+  drag a pin to the Windows Desktop for a shortcut, and use the session overflow
+  menu.
+- **Clearer pinned actions:** The guide now distinguishes selecting a pinned
+  client from opening it and from changing its browser-specific Restore tabs
+  setting. These are documentation additions for existing behavior, not new
+  client or browser features.
+- **Same focused download:** The release ZIP contains only `ctSpaces.exe`;
+  guides, source, license notices, and historical reports stay in the repository.
+
+## Previous 6.0.0.0 Milestone (Historical)
 
 - **One current release:** The 6.0 release gathers the launcher, browser isolation, profile-safety, backup, cleanup, client-management, and guided-help work described below under one current version.
 - **No new breaking behavior:** Storage locations, client/browser profile layout, update prompts, shortcuts, settings, and supported workflows remain compatible with 5.3.0.10.

@@ -95,6 +95,57 @@ void TestCatalogContract() {
          "only the current help/new-features topic may be announced");
 }
 
+void TestRevisionProgressContract() {
+  const auto &topics = Catalog();
+  const std::set<std::wstring> revised = {
+      L"create_open", L"sessions", L"pins_shortcuts", L"identity",
+      L"updates"};
+  const std::set<std::wstring> stable = {
+      L"welcome", L"browsers_restore", L"temporary_default", L"organize",
+      L"cleanup", L"backup_restore", L"appearance"};
+  Expect(revised.size() + stable.size() == topics.size(),
+         "revision contract does not cover the catalog");
+  for (const auto &topic : topics) {
+    const std::wstring id = topic.id;
+    Expect((revised.count(id) != 0) || (stable.count(id) != 0),
+           "revision contract contains an unknown topic");
+    Expect(topic.revision == (revised.count(id) != 0 ? 2u : 1u),
+           "topic revision does not match the guide progress contract");
+  }
+
+  State oldRead;
+  oldRead.readRevisions.assign(topics.size(), 1);
+  for (size_t index = 0; index < topics.size(); ++index) {
+    const std::wstring id = topics[index].id;
+    const bool shouldBeUnread = revised.count(id) != 0;
+    Expect(guided_walkthrough::IsUnread(oldRead, index) == shouldBeUnread,
+           "old revision state did not expose exactly the changed topics");
+  }
+  Expect(guided_walkthrough::HasUnreadAnnouncement(oldRead),
+         "old revision state did not expose the announced update");
+  const auto unread = guided_walkthrough::UnreadAnnouncementIndices(oldRead);
+  Expect(unread.size() == 1 &&
+             std::wstring(topics[unread.front()].id) == L"updates",
+         "old revision state exposed a non-announced topic in What's new");
+
+  State futureRead;
+  futureRead.readRevisions.assign(topics.size(), 999);
+  for (size_t index = 0; index < topics.size(); ++index)
+    Expect(!guided_walkthrough::IsUnread(futureRead, index),
+           "a future revision was treated as unread");
+  Expect(!guided_walkthrough::HasUnreadAnnouncement(futureRead),
+         "a future revision left What's new announced");
+  for (size_t index = 0; index < topics.size(); ++index) {
+    Expect(guided_walkthrough::ReadTopicMutations(futureRead, index, false)
+                   .empty(),
+           "a future revision generated a redundant read mutation");
+    const unsigned before = futureRead.readRevisions[index];
+    guided_walkthrough::ApplyTopicRead(futureRead, index);
+    Expect(futureRead.readRevisions[index] == before,
+           "applying a current topic downgraded a future revision");
+  }
+}
+
 void TestFreshFolderDetection() {
   TemporaryDirectory temporary;
   const fs::path absent = temporary.path() / L"absent";
@@ -177,6 +228,7 @@ void TestStateAndRevisionSemantics() {
 int wmain() {
   try {
     TestCatalogContract();
+    TestRevisionProgressContract();
     TestFreshFolderDetection();
     TestStateAndRevisionSemantics();
     std::wcout << L"Guided walkthrough unit tests passed: catalog, fresh-data "

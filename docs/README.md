@@ -4,7 +4,7 @@ These documents describe ctSpaces 6.0 for users, support staff, and maintainers.
 
 ## For People Using ctSpaces
 
-- [Guided Walkthrough](GUIDED_WALKTHROUGH.md): optional first-run help, replaying topics, and per-feature update indicators.
+- [Guided Walkthrough](GUIDED_WALKTHROUGH.md): optional first-run help, the read-only Quick tour over real controls, replaying topics, and per-feature update indicators.
 - [User Guide](USER_GUIDE.md): everyday use, independent browser slots, pins, tabs, shortcuts, rename/archive, icons, themes, temporary browsing, and profile tools.
 - [Feature Reference](FEATURE_REFERENCE.md): complete list of current controls and behavior.
 - [Installation and Updates](INSTALLATION_AND_UPDATES.md): first run, updating, running once, and removing the app.
@@ -14,7 +14,8 @@ These documents describe ctSpaces 6.0 for users, support staff, and maintainers.
 ## For Maintainers
 
 - [Developer Guide](DEVELOPER_GUIDE.md): architecture, profile lifecycle, build, tests, and release process.
-- [Release Validation](RELEASE_VALIDATION_6.0.0.0.md): current public validation scope, evidence, and retained boundaries.
+- [Release Validation](RELEASE_VALIDATION_6.0.1.0.md): current public validation scope, evidence, and retained boundaries.
+- [6.0.0.0 Release Validation](RELEASE_VALIDATION_6.0.0.0.md): historical validation evidence for the previous release.
 - [Improvement Roadmap](ROADMAP.md): prioritized ideas that preserve the compact launcher.
 - [User Changelog](../USER_CHANGELOG.md): the nontechnical update summary for distribution.
 
@@ -23,7 +24,7 @@ These documents describe ctSpaces 6.0 for users, support staff, and maintainers.
 When documentation and behavior disagree, use this order:
 
 1. The current release code and automated tests.
-2. The current [release validation report](RELEASE_VALIDATION_6.0.0.0.md) for tested behavior and known boundaries.
+2. The current [release validation report](RELEASE_VALIDATION_6.0.1.0.md) for tested behavior and known boundaries.
 3. The other documents in this folder.
 
 Update the affected document whenever a user-visible behavior, storage rule, installer prompt, or release step changes.
