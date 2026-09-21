@@ -1,8 +1,17 @@
 # ctSpaces 6.0 - What's New
 
-The initial ctSpaces 6.0.0.0 milestone consolidated features previously shipped across 5.2 and 5.3. The current 6.0.3.0 release refines upgrade-oriented visual help without changing client or browser data behavior. Existing client spaces, sign-ins, bookmarks, icons, browser history, and saved sessions remain intact during the update.
+The initial ctSpaces 6.0.0.0 milestone consolidated features previously shipped across 5.2 and 5.3. The current 6.0.4.0 release improves cleanup responsiveness without changing client or browser data behavior. Existing client spaces, sign-ins, bookmarks, icons, browser history, and saved sessions remain intact during the update.
 
-## Current 6.0.3.0 Milestone
+## Current 6.0.4.0 Milestone
+
+- **Responsive cleanup discovery:** Delete Multiple Clients and inactive cleanup
+  move intensive profile discovery and validation away from the main window.
+  Themed progress and Cancel feedback keep the launcher responsive while the
+  existing safety checks continue to run before deletion.
+- **No profile format change:** Client and browser profile layout, browser
+  behavior, and the read only guide and Quick Tour remain unchanged.
+
+## Previous 6.0.3.0 Milestone
 
 - **Corrected upgrade guidance:** The 20-step Quick tour and its 12 inert illustrations are unchanged. This release separates the change-only What's-new copy from the full guide, removes the Default/starter-profile New marker, and assigns the eight baseline-relative topic titles listed below.
 - **Same safety boundary:** The tour never reads the clipboard, creates clients, launches browsers, reorders pins or sessions, runs cleanup/deletion, or changes preferences. It preserves the existing app-only ZIP contract: the runtime archive contains exactly `ctSpaces.exe`.

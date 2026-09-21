@@ -2,11 +2,11 @@
 
 ctSpaces is a small Windows launcher for opening client-specific browser spaces. Each client can have an independent Microsoft Edge, Google Chrome, Brave, and Mozilla Firefox profile, so browser data stays separated both between clients and between browsers for the same client.
 
-The initial 6.0.0.0 milestone consolidated the previously shipped 5.2 and 5.3 work. The current 6.0.3.0 release corrects the baseline-relative What's-new guidance while leaving the 20-step, 12-illustration read-only Quick tour unchanged; it does not add client or browser behavior.
+The initial 6.0.0.0 milestone consolidated the previously shipped 5.2 and 5.3 work. The current 6.0.4.0 release moves intensive cleanup discovery off the main window and adds themed progress with Cancel while preserving deletion safety checks. It does not change client or browser profile layout.
 
-See [release notes](RELEASE_NOTES_6.0.3.0.md),
+See [release notes](RELEASE_NOTES_6.0.4.0.md),
 [guide help](docs/GUIDED_WALKTHROUGH.md), and the
-[current release validation](docs/RELEASE_VALIDATION_6.0.3.0.md). The
+[current release validation](docs/RELEASE_VALIDATION_6.0.4.0.md). The
 [6.0.0.0 release notes](RELEASE_NOTES_6.0.0.0.md) and
 [validation report](docs/RELEASE_VALIDATION_6.0.0.0.md) remain available as
 historical records.
@@ -18,8 +18,8 @@ original project.
 
 ## Download
 
-Download the app-only [`ctSpaces6.0.3.0.zip`](https://github.com/madrobdestroyer/ctSpaces/releases/download/v6.0.3.0/ctSpaces6.0.3.0.zip)
-from [ctSpaces 6.0 / tag v6.0.3.0](https://github.com/madrobdestroyer/ctSpaces/releases/tag/v6.0.3.0),
+Download the app-only [`ctSpaces6.0.4.0.zip`](https://github.com/madrobdestroyer/ctSpaces/releases/download/v6.0.4.0/ctSpaces6.0.4.0.zip)
+from [ctSpaces 6.0 / tag v6.0.4.0](https://github.com/madrobdestroyer/ctSpaces/releases/tag/v6.0.4.0),
 extract it to a folder, and run `ctSpaces.exe`. The runtime ZIP contains only
 `ctSpaces.exe`; documentation, release history, source, and license notices
 remain available in this GitHub repository.

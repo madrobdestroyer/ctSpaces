@@ -1,4 +1,4 @@
-ctSpaces 6.0.3.0 - Internal colleague release
+ctSpaces 6.0.4.0 - Internal colleague release
 Reviewed September 21, 2026
 
 The runtime ZIP contains exactly one file: ctSpaces.exe. This readme, the user
@@ -33,7 +33,7 @@ Cleanup permanently deletes live client data after confirmation. Archived
 clients can be included. Exported backups and prior restore recovery copies
 are retained. See the quick-start guide before deleting clients.
 
-Repository review evidence and test boundaries: docs/RELEASE_VALIDATION_6.0.3.0.md
+Repository review evidence and test boundaries: docs/RELEASE_VALIDATION_6.0.4.0.md
 Historical 6.0.0.0 evidence: docs/RELEASE_VALIDATION_6.0.0.0.md
 Repository application license: LICENSE
 Repository bundled 7-Zip license notices: 3p/7zip/DOC/

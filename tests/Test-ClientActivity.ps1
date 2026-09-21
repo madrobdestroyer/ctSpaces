@@ -12,10 +12,12 @@ foreach ($guard in @('client_activity::Write(activityRoot',
     'HandleCleanupDialogTheme(dialog, message, wParam, lParam)',
     'ApplyCleanupDialogTheme(dialog)',
     'ShowCleanupResult(summary, L"Cleanup Complete")',
-    'DeleteEntireClient(client.name, true, expectedActivity, outcome)',
-    'ProbeClientProfilesInUse(name, details)',
-    'ValidateWholeClientDeleteTarget(name, root, validatedRoot, details)')) {
+    'DeleteEntireClient(client.name, true, expectedActivity, outcome)')) {
     if (-not $source.Contains($guard)) { throw "Missing cleanup guard: $guard" }
+}
+if ($source -notmatch '(?s)ProbeClientProfilesInUse\s*\(\s*name,\s*details,\s*&cancellation\s*\)' -or
+    $source -notmatch '(?s)ValidateWholeClientDeleteTarget\s*\(\s*name,\s*root,\s*validatedRoot,\s*details,\s*&cancellation\s*\)') {
+    throw 'Cleanup preview validation is not wired to cooperative scan cancellation.'
 }
 $launchMatch = [regex]::Match($source, '(?s)DWORD LaunchProfile\([^;{]*\)\s*\{.*?\n\}\r?\n\r?\nvoid UpdateClientsComboBox')
 $launch = $launchMatch.Value

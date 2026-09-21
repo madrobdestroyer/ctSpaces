@@ -347,6 +347,26 @@ static bool g_bSyncingClientInput = false;
 static bool g_bExitWhenProfilesClose = false;
 static bool g_bClosePendingDuringLaunch = false;
 static bool g_bArchiveTaskInProgress = false;
+static std::atomic_bool g_bCleanupBusy = false;
+static HWND g_hCleanupScanDialog = nullptr;
+struct CleanupScanCancellation {
+  const std::atomic_bool *requested = nullptr;
+  DWORD qaEntryDelayMs = 0;
+
+  bool IsRequested() const {
+    return requested && requested->load();
+  }
+
+  bool PauseAndCheck() const {
+    DWORD remaining = qaEntryDelayMs;
+    while (remaining > 0 && !IsRequested()) {
+      const DWORD interval = (std::min)(remaining, DWORD{10});
+      Sleep(interval);
+      remaining -= interval;
+    }
+    return IsRequested();
+  }
+};
 static bool g_bClientSelectorRestackPending = false;
 static bool g_bRestoreTabsToggleAvailable = false;
 static bool g_bRestoreTabsForSelection = false;
@@ -3478,7 +3498,8 @@ static bool PostOwnedStringMessage(UINT message, WPARAM wParam,
                                    bool retryWhileWindowExists = false);
 static bool IsClientActiveAnyBrowser(const std::wstring &clientName);
 static ProfileUseState ProbeClientProfilesInUse(
-    const std::wstring &clientName, std::wstring &errorDetails);
+    const std::wstring &clientName, std::wstring &errorDetails,
+    const CleanupScanCancellation *cancellation = nullptr);
 static ProfileUseState ProbeExactBrowserProfileInUse(
     const fs::path &profilePath, std::wstring &errorDetails);
 static ProfileUseState ProbeAnySitesProfileInUse(std::wstring &errorDetails);
@@ -4132,8 +4153,9 @@ static bool IsSafeHybridClientRoot(
   return true;
 }
 
-static bool ValidateNoReparsePointsInTree(const fs::path &root,
-                                          std::wstring &errorDetails) {
+static bool ValidateNoReparsePointsInTree(
+    const fs::path &root, std::wstring &errorDetails,
+    const CleanupScanCancellation *cancellation = nullptr) {
   const auto fail = [&errorDetails](const std::wstring &message) {
     errorDetails = message;
     return false;
@@ -4147,6 +4169,9 @@ static bool ValidateNoReparsePointsInTree(const fs::path &root,
   if ((rootAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0) {
     return fail(L"The client folder is a reparse point.");
   }
+  if (cancellation && cancellation->PauseAndCheck()) {
+    return fail(L"Client inspection was cancelled.");
+  }
 
   std::error_code iteratorError;
   fs::recursive_directory_iterator entry(
@@ -4157,6 +4182,9 @@ static bool ValidateNoReparsePointsInTree(const fs::path &root,
   }
 
   while (entry != end) {
+    if (cancellation && cancellation->PauseAndCheck()) {
+      return fail(L"Client inspection was cancelled.");
+    }
     const fs::path currentPath = entry->path();
     const DWORD attributes = GetFileAttributesW(currentPath.c_str());
     if (attributes == INVALID_FILE_ATTRIBUTES) {
@@ -4180,7 +4208,9 @@ static bool ValidateNoReparsePointsInTree(const fs::path &root,
 static bool ValidateWholeClientDeleteTarget(const std::wstring &clientName,
                                             const fs::path &expectedRoot,
                                             fs::path &validatedRoot,
-                                            std::wstring &errorDetails) {
+                                            std::wstring &errorDetails,
+                                            const CleanupScanCancellation
+                                                *cancellation = nullptr) {
   const auto fail = [&errorDetails](const std::wstring &message) {
     errorDetails = message;
     return false;
@@ -4231,7 +4261,8 @@ static bool ValidateWholeClientDeleteTarget(const std::wstring &clientName,
     }
   }
 
-  if (!ValidateNoReparsePointsInTree(currentRoot, errorDetails))
+  if (!ValidateNoReparsePointsInTree(currentRoot, errorDetails,
+                                     cancellation))
     return false;
 
   validatedRoot = currentRoot;
@@ -5072,6 +5103,13 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam,
       ++length;
     if (length == capacity)
       return FALSE;
+    if (g_bCleanupBusy.load()) {
+      if (g_hCleanupScanDialog && IsWindow(g_hCleanupScanDialog)) {
+        ShowWindow(g_hCleanupScanDialog, SW_RESTORE);
+        SetForegroundWindow(g_hCleanupScanDialog);
+      }
+      return FALSE;
+    }
     if (g_hGuideDialog && IsWindow(g_hGuideDialog)) {
       // Do not let a read-only modal guide delay a client shortcut. This is
       // not a user Skip/Close action, so it must preserve welcome and read
@@ -5090,6 +5128,10 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam,
                : FALSE;
   }
   case WM_COMMAND: {
+    if (g_bCleanupBusy.load()) {
+      MessageBeep(MB_ICONINFORMATION);
+      return 0;
+    }
     int wmId = LOWORD(wParam);
     int wmEvent = HIWORD(wParam);
     if (wmId == IDC_CLIENT_EDIT) {
@@ -5678,6 +5720,16 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam,
     return 0;
   }
   case WM_CLOSE: {
+    if (g_bCleanupBusy.load()) {
+      if (g_hCleanupScanDialog && IsWindow(g_hCleanupScanDialog)) {
+        PostMessageW(g_hCleanupScanDialog, WM_CLOSE, 0, 0);
+        ShowWindow(g_hCleanupScanDialog, SW_RESTORE);
+        SetForegroundWindow(g_hCleanupScanDialog);
+      } else {
+        MessageBeep(MB_ICONINFORMATION);
+      }
+      return 0;
+    }
     if (g_hQuickTourDialog && IsWindow(g_hQuickTourDialog))
       DismissQuickTour(false);
     if (g_bArchiveTaskInProgress) {
@@ -5718,10 +5770,20 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam,
     return 0;
   }
   case WM_QUERYENDSESSION:
+    if (g_bCleanupBusy.load()) {
+      if (g_hCleanupScanDialog && IsWindow(g_hCleanupScanDialog))
+        PostMessageW(g_hCleanupScanDialog, WM_CLOSE, 0, 0);
+      return FALSE;
+    }
     if (g_hQuickTourDialog && IsWindow(g_hQuickTourDialog))
       DismissQuickTour(false);
     return TRUE;
   case WM_ENDSESSION:
+    if (wParam && g_bCleanupBusy.load()) {
+      if (g_hCleanupScanDialog && IsWindow(g_hCleanupScanDialog))
+        PostMessageW(g_hCleanupScanDialog, WM_CLOSE, 0, 0);
+      return 0;
+    }
     if (wParam && g_hQuickTourDialog && IsWindow(g_hQuickTourDialog))
       DismissQuickTour(false);
     return 0;
@@ -7563,7 +7625,12 @@ static BrowserProfileArgument ExtractBrowserProfileArgument(
 
 static ProfileUseState ProbeBrowserProcessesAgainstProfiles(
     const std::vector<fs::path> &exactProfiles,
-    const std::optional<fs::path> &sitesScope, std::wstring &errorDetails) {
+    const std::optional<fs::path> &sitesScope, std::wstring &errorDetails,
+    const CleanupScanCancellation *cancellation = nullptr) {
+  if (cancellation && cancellation->IsRequested()) {
+    errorDetails = L"Browser process inspection was cancelled.";
+    return ProfileUseState::Indeterminate;
+  }
   HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
   if (snapshot == INVALID_HANDLE_VALUE) {
     errorDetails = std::format(
@@ -7584,6 +7651,11 @@ static ProfileUseState ProbeBrowserProcessesAgainstProfiles(
   }
 
   do {
+    if (cancellation && cancellation->IsRequested()) {
+      CloseHandle(snapshot);
+      errorDetails = L"Browser process inspection was cancelled.";
+      return ProfileUseState::Indeterminate;
+    }
     const auto browser = BrowserKindFromProcessName(entry.szExeFile);
     if (!browser)
       continue;
@@ -7662,8 +7734,13 @@ static ProfileUseState ProbeExactBrowserProfileInUse(
 }
 
 static ProfileUseState ProbeClientProfilesInUse(
-    const std::wstring &clientName, std::wstring &errorDetails) {
+    const std::wstring &clientName, std::wstring &errorDetails,
+    const CleanupScanCancellation *cancellation) {
   errorDetails.clear();
+  if (cancellation && cancellation->IsRequested()) {
+    errorDetails = L"Client inspection was cancelled.";
+    return ProfileUseState::Indeterminate;
+  }
   {
     std::lock_guard<std::mutex> lock(g_activeProfilesMutex);
     if (std::ranges::any_of(g_activeProfiles, [&](const auto &active) {
@@ -7688,7 +7765,7 @@ static ProfileUseState ProbeClientProfilesInUse(
   for (const auto &location : locations)
     profiles.push_back(location.profileRoot);
   return ProbeBrowserProcessesAgainstProfiles(profiles, std::nullopt,
-                                               errorDetails);
+                                               errorDetails, cancellation);
 }
 
 static ProfileUseState ProbeAnySitesProfileInUse(std::wstring &errorDetails) {
@@ -11457,9 +11534,10 @@ bool EnsureBundledDefaultTemplate() {
 
 void SetUiState(bool enabled) {
   // Completion messages can run inside a modal Default-save prompt. Enabling
-  // is only safe when both that operation and the launch worker have finished.
+  // is only safe when every operation that owns the disabled main UI has
+  // finished.
   enabled = enabled && !g_bDefaultProfileUiBusy &&
-            !g_isLaunchInFlight.load();
+            !g_isLaunchInFlight.load() && !g_bCleanupBusy.load();
   g_bUiEnabled = enabled;
   EnableWindow(g_hComboClient, enabled);
   EnableWindow(g_hClientEdit, enabled);
@@ -16202,52 +16280,73 @@ static INT_PTR CALLBACK InactiveClientsDlgProc(HWND dialog, UINT message,
   return FALSE;
 }
 
-static void GuiCleanupInactiveClients(bool manualSelection) {
-  if (!g_bUiEnabled || g_isLaunchInFlight.load())
-    return;
-  SetUiState(false);
-  struct UiStateRestore {
-    ~UiStateRestore() { SetUiState(true); }
-  } restoreUi;
-  ResetCleanupQaDecisionLog(manualSelection);
+struct CleanupScanState {
+  bool manualSelection = false;
+  std::atomic_bool cancelRequested = false;
+  std::atomic_bool finished = false;
+  HANDLE completed = nullptr;
+  std::thread worker;
   std::vector<InactiveClientCandidate> candidates;
   size_t skipped = 0;
+  std::wstring failure;
+  DWORD qaEntryDelayMs = 0;
+  bool qaFailTimer = false;
+  bool qaFailWorker = false;
+};
+
+static void CollectCleanupCandidates(CleanupScanState &state) {
+  const CleanupScanCancellation cancellation{&state.cancelRequested,
+                                             state.qaEntryDelayMs};
+  const auto cancelled = [&]() {
+    return cancellation.IsRequested();
+  };
   const auto now = client_activity::Now();
   try {
+    if (cancelled())
+      return;
     if (!ValidateSitesRoot(false))
       throw std::runtime_error("The client collection is unsafe or unavailable.");
     std::error_code error;
     const auto sites = g_sDataDir / L"Sites";
-    if (!fs::exists(sites, error) && !error) {
-      MessageBoxW(g_hGui, L"There are no clients to clean up.", L"Inactive Clients", MB_OK);
+    if (!fs::exists(sites, error) && !error)
       return;
-    }
+    if (error)
+      throw std::system_error(error, "The client collection could not be inspected.");
+
     for (const auto &entry : fs::directory_iterator(sites)) {
+      if (cancellation.IsRequested())
+        return;
       const auto name = entry.path().filename().wstring();
       fs::path root;
       if (!TryGetSafeClientProfilePath(name, root) ||
           !IsSafeExistingDirectory(root)) {
-        ++skipped;
+        ++state.skipped;
         LogCleanupQaDecision(name, L"skipped-unsafe-root");
         continue;
       }
-      // Import/upgrade with no history starts a fresh three-month grace period.
+      // Preserve the existing import/upgrade behavior: unknown history starts
+      // a fresh three-month tracking period even in manual-selection mode.
       client_activity::Write(root, {now, true}, true);
+      if (cancelled())
+        return;
       const auto activity = client_activity::Read(root);
-      if (!activity && !manualSelection) {
-        ++skipped;
+      if (!activity && !state.manualSelection) {
+        ++state.skipped;
         LogCleanupQaDecision(name, L"skipped-unverifiable-activity");
         continue;
       }
-      if (!manualSelection && !client_activity::IsInactive(*activity, now)) {
+      if (!state.manualSelection &&
+          !client_activity::IsInactive(*activity, now)) {
         LogCleanupQaDecision(name, L"not-inactive");
         continue;
       }
       std::wstring details;
       const ProfileUseState profileUse =
-          ProbeClientProfilesInUse(name, details);
+          ProbeClientProfilesInUse(name, details, &cancellation);
+      if (cancelled())
+        return;
       if (profileUse != ProfileUseState::NotInUse) {
-        ++skipped;
+        ++state.skipped;
         LogCleanupQaDecision(
             name,
             profileUse == ProfileUseState::InUse ? L"skipped-profile-open"
@@ -16256,22 +16355,253 @@ static void GuiCleanupInactiveClients(bool manualSelection) {
         continue;
       }
       fs::path validatedRoot;
-      if (!ValidateWholeClientDeleteTarget(name, root, validatedRoot, details)) {
-        ++skipped;
+      if (!ValidateWholeClientDeleteTarget(name, root, validatedRoot, details,
+                                           &cancellation)) {
+        if (cancelled())
+          return;
+        ++state.skipped;
         LogCleanupQaDecision(name, L"skipped-delete-target-invalid", details);
         continue;
       }
       LogCleanupQaDecision(name, L"candidate");
-      candidates.push_back({name, activity.value_or(client_activity::Record{})});
+      state.candidates.push_back(
+          {name, activity.value_or(client_activity::Record{})});
     }
   } catch (const std::exception &error) {
-    LogCleanupQaDecision(L"(collection)", L"inspection-failed",
-                         AnsiToWide(error.what()));
+    if (!cancelled())
+      state.failure = AnsiToWide(error.what());
+  } catch (...) {
+    if (!cancelled())
+      state.failure = L"An unexpected error interrupted client inspection.";
+  }
+}
+
+static void RequestCleanupScanCancel(HWND dialog, CleanupScanState &state) {
+  state.cancelRequested.store(true);
+  SetDlgItemTextW(dialog, IDC_CLEANUP_SCAN_STATUS,
+                  L"Cancelling safely. Waiting for the current check to finish...");
+  EnableWindow(GetDlgItem(dialog, IDCANCEL), FALSE);
+}
+
+static void PositionCleanupScanDialog(HWND dialog) {
+  RECT window{};
+  RECT owner{};
+  if (!GetWindowRect(dialog, &window))
+    return;
+  if (!g_hGui || !GetWindowRect(g_hGui, &owner))
+    owner = window;
+  const LONG width = window.right - window.left;
+  const LONG height = window.bottom - window.top;
+  LONG left = owner.left + (owner.right - owner.left - width) / 2;
+  LONG top = owner.top + (owner.bottom - owner.top - height) / 2;
+  const HMONITOR monitor = MonitorFromWindow(
+      g_hGui ? g_hGui : dialog, MONITOR_DEFAULTTONEAREST);
+  MONITORINFO monitorInfo{sizeof(monitorInfo)};
+  if (GetMonitorInfoW(monitor, &monitorInfo)) {
+    const RECT work = monitorInfo.rcWork;
+    left = (std::max)(work.left, (std::min)(left, work.right - width));
+    top = (std::max)(work.top, (std::min)(top, work.bottom - height));
+  }
+  SetWindowPos(dialog, nullptr, left, top, 0, 0,
+               SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+}
+
+static INT_PTR CALLBACK CleanupScanDlgProc(HWND dialog, UINT message,
+                                           WPARAM wParam, LPARAM lParam) {
+  auto *state = reinterpret_cast<CleanupScanState *>(
+      GetWindowLongPtrW(dialog, DWLP_USER));
+  if (const auto themed =
+          HandleCleanupDialogTheme(dialog, message, wParam, lParam)) {
+    return *themed;
+  }
+  switch (message) {
+  case WM_INITDIALOG: {
+    state = reinterpret_cast<CleanupScanState *>(lParam);
+    if (!state || !state->completed) {
+      EndDialog(dialog, IDCANCEL);
+      return TRUE;
+    }
+    SetWindowLongPtrW(dialog, DWLP_USER, reinterpret_cast<LONG_PTR>(state));
+    g_hCleanupScanDialog = dialog;
+    SetWindowTextW(dialog, state->manualSelection
+                               ? L"Preparing Delete Multiple Clients"
+                               : L"Preparing Inactive Cleanup");
+    SetDlgItemTextW(dialog, IDC_CLEANUP_SCAN_STATUS,
+                    state->manualSelection
+                        ? L"Inspecting closed clients before the deletion preview..."
+                        : L"Inspecting inactive clients before the cleanup preview...");
+    ApplyCleanupDialogTheme(dialog);
+    PositionCleanupScanDialog(dialog);
+    HWND progress = GetDlgItem(dialog, IDC_CLEANUP_SCAN_PROGRESS);
+    if (progress) {
+      // Use the selected ctSpaces palette rather than the system progress
+      // accent so custom light and dark themes remain coherent.
+      SetWindowTheme(progress, L"", L"");
+      SendMessageW(progress, PBM_SETBKCOLOR, 0, g_themeColors.crWindow);
+      SendMessageW(progress, PBM_SETBARCOLOR, 0, g_themeColors.crAccent);
+      SendMessageW(progress, PBM_SETMARQUEE, TRUE, 35);
+    }
+    if (state->qaFailTimer || !SetTimer(dialog, 1, 50, nullptr)) {
+      state->failure = L"The cleanup progress timer could not be started.";
+      g_hCleanupScanDialog = nullptr;
+      EndDialog(dialog, IDCANCEL);
+      return TRUE;
+    }
+    try {
+      if (state->qaFailWorker)
+        throw std::runtime_error(
+            "The cleanup inspection worker could not be started.");
+      state->worker = std::thread([state]() {
+        CollectCleanupCandidates(*state);
+        state->finished.store(true);
+        SetEvent(state->completed);
+      });
+    } catch (const std::exception &error) {
+      state->failure = AnsiToWide(error.what());
+      KillTimer(dialog, 1);
+      g_hCleanupScanDialog = nullptr;
+      EndDialog(dialog, IDCANCEL);
+      return TRUE;
+    } catch (...) {
+      state->failure = L"The cleanup inspection worker could not be started.";
+      KillTimer(dialog, 1);
+      g_hCleanupScanDialog = nullptr;
+      EndDialog(dialog, IDCANCEL);
+      return TRUE;
+    }
+    SetFocus(GetDlgItem(dialog, IDCANCEL));
+    return FALSE;
+  }
+  case WM_TIMER:
+    if (state && wParam == 1 && state->finished.load()) {
+      KillTimer(dialog, 1);
+      EndDialog(dialog, state->cancelRequested.load() ? IDCANCEL : IDOK);
+      return TRUE;
+    }
+    break;
+  case WM_COMMAND:
+    if (state && LOWORD(wParam) == IDCANCEL) {
+      RequestCleanupScanCancel(dialog, *state);
+      return TRUE;
+    }
+    break;
+  case WM_CLOSE:
+    if (state) {
+      RequestCleanupScanCancel(dialog, *state);
+      return TRUE;
+    }
+    break;
+  case WM_QUERYENDSESSION:
+    if (state)
+      RequestCleanupScanCancel(dialog, *state);
+    return FALSE;
+  case WM_NCDESTROY:
+    KillTimer(dialog, 1);
+    if (g_hCleanupScanDialog == dialog)
+      g_hCleanupScanDialog = nullptr;
+    break;
+  }
+  return FALSE;
+}
+
+static void DrainCleanupScanWorker(CleanupScanState &state) {
+  bool repostQuit = false;
+  int quitCode = 0;
+  while (!state.finished.load()) {
+    const DWORD waitResult = MsgWaitForMultipleObjectsEx(
+        1, &state.completed, 100, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
+    if (waitResult == WAIT_FAILED) {
+      // The atomic completion flag remains authoritative even if the event
+      // wait itself fails. Keep the UI responsive without spinning or joining
+      // a worker that may still reference this state.
+      MsgWaitForMultipleObjectsEx(0, nullptr, 50, QS_ALLINPUT,
+                                  MWMO_INPUTAVAILABLE);
+    }
+
+    MSG message{};
+    while (PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE)) {
+      if (message.message == WM_QUIT) {
+        repostQuit = true;
+        quitCode = static_cast<int>(message.wParam);
+        continue;
+      }
+      TranslateMessage(&message);
+      DispatchMessageW(&message);
+    }
+  }
+  if (state.worker.joinable())
+    state.worker.join();
+  if (repostQuit)
+    PostQuitMessage(quitCode);
+}
+
+static void GuiCleanupInactiveClients(bool manualSelection) {
+  if (!g_bUiEnabled || g_isLaunchInFlight.load() ||
+      g_bCleanupBusy.exchange(true))
+    return;
+  struct CleanupBusyRestore {
+    ~CleanupBusyRestore() {
+      g_bCleanupBusy.store(false);
+      SetUiState(true);
+    }
+  } restoreUi;
+  SetUiState(false);
+  ResetCleanupQaDecisionLog(manualSelection);
+  CleanupScanState scan;
+  scan.manualSelection = manualSelection;
+  if (g_bQaInstance && !g_sConfigPath.empty()) {
+    scan.qaEntryDelayMs = (std::min<DWORD>)(
+        GetPrivateProfileIntW(L"qa", L"cleanup_scan_entry_delay_ms", 0,
+                              g_sConfigPath.c_str()),
+        250);
+    wchar_t fault[32]{};
+    GetPrivateProfileStringW(L"qa", L"cleanup_scan_fault", L"", fault,
+                             static_cast<DWORD>(std::size(fault)),
+                             g_sConfigPath.c_str());
+    scan.qaFailTimer = _wcsicmp(fault, L"timer") == 0;
+    scan.qaFailWorker = _wcsicmp(fault, L"worker") == 0;
+  }
+  scan.completed = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+  if (!scan.completed) {
+    ShowCleanupResult(
+        L"The client inspection worker could not be prepared. Nothing was deleted.",
+        L"Cleanup Unavailable");
+    return;
+  }
+  const INT_PTR scanResult = ShowCleanupDialogResource(
+      IDD_CLEANUP_SCAN, CleanupScanDlgProc,
+      reinterpret_cast<LPARAM>(&scan), L"scan");
+  const DWORD scanDialogError =
+      scanResult == -1 ? GetLastError() : ERROR_SUCCESS;
+  if (scan.worker.joinable() &&
+      !scan.finished.load()) {
+    scan.cancelRequested.store(true);
+    DrainCleanupScanWorker(scan);
+  } else if (scan.worker.joinable()) {
+    scan.worker.join();
+  }
+  CloseHandle(scan.completed);
+  scan.completed = nullptr;
+
+  if (scanResult == -1 || !scan.failure.empty()) {
+    const std::wstring details = !scan.failure.empty()
+                                     ? scan.failure
+                                     : scanDialogError
+                                           ? std::format(L"Windows error {}.",
+                                                         scanDialogError)
+                                           : L"The cleanup scan could not be opened.";
+    LogCleanupQaDecision(L"(collection)", L"inspection-failed", details);
     ShowCleanupResult(L"The collection could not be inspected completely. "
-                      L"Nothing was deleted.\n\n" + AnsiToWide(error.what()),
+                      L"Nothing was deleted.\n\n" + details,
                       L"Cleanup Cancelled");
     return;
   }
+  if (scanResult != IDOK || scan.cancelRequested.load()) {
+    LogCleanupQaDecision(L"(collection)", L"inspection-cancelled");
+    return;
+  }
+  auto &candidates = scan.candidates;
+  size_t skipped = scan.skipped;
   if (candidates.empty()) {
     std::wstring message = manualSelection
         ? L"No closed, safe clients are available to delete."

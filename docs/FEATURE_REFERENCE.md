@@ -1,6 +1,6 @@
 # ctSpaces Feature Reference
 
-Applies to ctSpaces 6.0.3.0.
+Applies to ctSpaces 6.0.4.0.
 
 ## Core Purpose
 
@@ -105,6 +105,13 @@ Dropping a visible pinned client on the Windows Desktop creates one `.lnk` launc
 ## Inactive Client Cleanup
 
 Available from the Options (gear) button as `Clean Up Inactive Clients...`.
+Both cleanup tools first show a themed progress dialog while inspecting
+clients in the background. Cancel, Escape, or closing that dialog stops the
+inspection safely without deleting clients or showing a partial selection
+list. Large collections can still take time to inspect, but the interface
+remains responsive. This cancellation applies before the selection preview,
+not to an actual deletion after confirmation.
+
 The preview has a scrollable multi-selection client/date list, Select All and
 Clear Selection, an acknowledgement checkbox, a `Delete Selected (count)`
 button, and Cancel (the default action). Click a row to toggle selection; Ctrl
@@ -246,7 +253,7 @@ ctSpaces includes:
 
 - Per-user install under `%LOCALAPPDATA%`; administrator rights are not required for the normal path.
 - Optional Start Menu, Desktop, and current-user startup entries.
-- A short user-facing release label such as `6.0`, backed by the current four-part Windows version `6.0.3.0`.
+- A short user-facing release label such as `6.0`, backed by the current four-part Windows version `6.0.4.0`.
 - Newer, same-version, and older external copies have distinct prompts.
 - Updates stage the new executable beside the installed copy and retry replacement.
 - Relaunch waits for the updater process to exit before acquiring the single-instance mutex.
