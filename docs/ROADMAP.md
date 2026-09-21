@@ -2,9 +2,9 @@
 
 The first section records recently completed work. The remaining items are proposed improvements ordered to improve reliability first and keep the main launcher compact.
 
-## Implemented In Current 5.3 Work
+## Implemented In 5.3 (Historical)
 
-These items are present in the validated `5.3.0.3` project-local candidate.
+These items were present in the validated `5.3.0.3` project-local candidate.
 Automated release controls are complete; installation and the manual deployment
 pilot remain separate decisions.
 

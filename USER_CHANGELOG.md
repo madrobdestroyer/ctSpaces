@@ -1,22 +1,28 @@
-# ctSpaces 5.3 - What's New
+# ctSpaces 6.0 - What's New
 
-ctSpaces 5.3 makes favorite clients faster to arrange, launch, identify, and manage. Existing client spaces, sign-ins, bookmarks, icons, browser history, and saved sessions remain intact during the update.
+ctSpaces 6.0 is a consolidated major milestone for the features previously shipped across 5.2 and 5.3. It does not add new behavior beyond 5.3.0.10. Existing client spaces, sign-ins, bookmarks, icons, browser history, and saved sessions remain intact during the update.
 
-## Current 5.3.0.10 Update
+## Current 6.0.0.0 Milestone
+
+- **One current release:** The 6.0 release gathers the launcher, browser isolation, profile-safety, backup, cleanup, client-management, and guided-help work described below under one current version.
+- **No new breaking behavior:** Storage locations, client/browser profile layout, update prompts, shortcuts, settings, and supported workflows remain compatible with 5.3.0.10.
+- **Same focused download:** The release ZIP contains only `ctSpaces.exe`; guides, source, license notices, and historical reports stay in the repository.
+
+## Previously Shipped In 5.3.0.10 (Historical)
 
 - **Optional guided walkthrough:** A skippable welcome for fresh users and a full guide available later from Options or F1. Existing users and client-shortcut launches are not forced through onboarding.
 - **Precise, read-only help:** Jump between topics covering everyday work, browser separation, Default changes, cleanup and backups. The guide explains actions without performing them.
 - **Feature update guidance:** What's new and labelled indicators track individual topic revisions, so future changes can be highlighted without repeating the whole tour.
 - **Theme and keyboard support:** The walkthrough follows the selected theme and display scale, with keyboard navigation and readable scrollable explanations.
 
-## Included In 5.3.0.9
+## Previously Shipped In 5.3.0.9 (Historical)
 
 - **Retryable cleanup failures:** A file lock no longer removes the client identifiers needed to retry deletion. Partial cleanup preserves the activity date, so an unsuccessful cleanup does not restart the three-month timer.
 - **Cleanup error recovery:** Failure to open a selection dialog deletes nothing and reports the problem. Failure to open a result dialog preserves the complete summary in themed, bounded pages.
 - **Display-scale consistency:** Secondary buttons and text menus use the font and scaling of their own window.
 - **Safe overlapping work:** The launcher stays disabled until both an in-progress client launch and any Default-profile processing have finished.
 
-## Included In 5.3.0.8
+## Previously Shipped In 5.3.0.8 (Historical)
 
 - **Clean up inactive clients:** Settings can preview clients that have not been opened for three calendar months and permanently delete only the clients you explicitly acknowledge. The preview includes archived clients, rechecks activity and browser use before deletion, and skips anything open, changed, unsafe, or unverifiable.
 - **Delete multiple closed clients:** `Delete Multiple Clients` provides the same multi-selection preview and safety checks without the three-month waiting period. It starts with nothing selected and requires the permanent-deletion acknowledgement before the delete action is enabled.
@@ -25,7 +31,7 @@ ctSpaces 5.3 makes favorite clients faster to arrange, launch, identify, and man
 - **Simpler text-field menus:** Right-click editable client-name and input fields for Undo, Cut, Copy, Paste, Delete, and Select All. Read-only result fields offer Copy and Select All. Availability follows the current selection, clipboard, undo, password, and read-only state; standard keyboard shortcuts and international text input are unchanged.
 - **Cleanup idea credit:** About now credits Cameron Kincer for the Client Cleanup Idea.
 
-## New In 5.3
+## Previously Shipped In 5.3 (Historical)
 
 - **Reorder pinned clients:** Drag visible pins left or right. The new order is saved for the next time ctSpaces opens.
 - **Clean open-client labels:** Each open-session tab shows only the client name, without a browser suffix or separator. Drag active client tabs into the order that works best for the current session.
@@ -56,9 +62,9 @@ The separation provided by ctSpaces is browser-profile isolation for everyday ac
 
 ## Updating
 
-Close ctSpaces, then run the new ctSpaces 5.3 file and approve the update when prompted. Client browser profiles are stored separately and remain available afterward.
+Close ctSpaces, then run the ctSpaces 6.0 executable and approve the update when prompted. Client browser profiles are stored separately and remain available afterward.
 
-## Previous 5.2 Changes
+## Previous 5.2 Changes (Historical)
 
 ctSpaces 5.2 refreshed the launcher and improved session, icon, theme, update, and backup reliability.
 

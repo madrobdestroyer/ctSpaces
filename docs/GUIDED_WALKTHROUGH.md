@@ -1,5 +1,7 @@
 # Guided walkthrough and feature updates
 
+Applies to ctSpaces 6.0.
+
 The built-in guide explains ctSpaces without performing any client operations.
 Reading a page does not create a client, launch a browser, change a profile,
 toggle Restore tabs, fetch an icon, or delete data.

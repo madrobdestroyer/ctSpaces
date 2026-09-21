@@ -2,13 +2,11 @@
 
 ctSpaces is a small Windows launcher for opening client-specific browser spaces. Each client can have an independent Microsoft Edge, Google Chrome, Brave, and Mozilla Firefox profile, so browser data stays separated both between clients and between browsers for the same client.
 
-Version 5.3 adds saved drag ordering, client desktop shortcuts, open-copied-link actions, safe rename and archive tools, optional client-first browser titles, and all of the compact launcher, profile safety, backup/restore, icon, and theme improvements from 5.2.
+Version 6.0 consolidates the previously shipped 5.2 and 5.3 work: the compact launcher, independent browser slots, profile safety, backup/restore, icons and themes, saved drag ordering, client shortcuts, copied-link actions, safe rename and archive tools, client-first titles, cleanup tools, and guided help. It does not add new behavior beyond 5.3.0.10.
 
-Maintenance build **5.3.0.10** adds a skippable, replayable guided walkthrough
-and per-feature update guidance while retaining the 5.3.0.9 safety fixes.
-See [release notes](RELEASE_NOTES_5.3.0.10.md),
+See [release notes](RELEASE_NOTES_6.0.0.0.md),
 [guide help](docs/GUIDED_WALKTHROUGH.md), and the
-[current adversarial validation](docs/RELEASE_VALIDATION_5.3.0.10.md).
+[current release validation](docs/RELEASE_VALIDATION_6.0.0.0.md).
 
 This is a maintained fork of the
 [original ctSpaces project](https://github.com/BiatuAutMiahn/ctSpaces) by
@@ -17,8 +15,8 @@ original project.
 
 ## Download
 
-Download `ctSpaces5.3.0.10.zip` from the
-[latest GitHub release](https://github.com/madrobdestroyer/ctSpaces/releases/latest),
+Download the app-only [`ctSpaces6.0.0.0.zip`](https://github.com/madrobdestroyer/ctSpaces/releases/download/v6.0.0.0/ctSpaces6.0.0.0.zip)
+from [ctSpaces 6.0 / tag v6.0.0.0](https://github.com/madrobdestroyer/ctSpaces/releases/tag/v6.0.0.0),
 extract it to a folder, and run `ctSpaces.exe`. The runtime ZIP contains only
 `ctSpaces.exe`; documentation, release history, source, and license notices
 remain available in this GitHub repository.
@@ -194,7 +192,7 @@ Rapid theme changes can be stress-tested against a disposable QA launcher:
 & .\tests\Test-ThemeResponsiveness.ps1
 ```
 
-The 5.3 pin, shortcut, rename, archive, restore, and title-preference workflow runs above without touching live clients or the real Desktop.
+The pin, shortcut, rename, archive, restore, and title-preference workflow runs above without touching live clients or the real Desktop.
 
 ## License
 

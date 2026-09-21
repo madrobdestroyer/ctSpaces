@@ -1,6 +1,6 @@
 # Installation And Updates
 
-Applies to ctSpaces 5.3.
+Applies to ctSpaces 6.0.
 
 ## Requirements
 
@@ -64,7 +64,7 @@ Windows cannot replace an executable that is still held open. Antivirus scanning
 | Run this older copy once | The installed app is newer; launch the older external build only for troubleshooting. |
 | ctSpaces Is Open | Another launcher instance is still active or Windows is still finishing shutdown. |
 
-Every distributed code fix should increment the fourth version component so ordinary updates do not look like same-version replacement.
+Distributed builds use a four-part `major.minor.patch.build` version. A bug-fix release may advance the patch component, such as `6.0.1.0`; a feature release may advance the minor component, such as `6.1.0.0`. Distinct distributed builds must use distinct four-part versions so ordinary updates do not look like same-version replacement.
 
 ## If An Update Says ctSpaces Is Still Running
 

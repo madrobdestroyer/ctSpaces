@@ -1,6 +1,6 @@
 # ctSpaces Feature Reference
 
-Applies to ctSpaces 5.3.
+Applies to ctSpaces 6.0.
 
 ## Core Purpose
 
@@ -228,7 +228,7 @@ ctSpaces includes:
 
 - Per-user install under `%LOCALAPPDATA%`; administrator rights are not required for the normal path.
 - Optional Start Menu, Desktop, and current-user startup entries.
-- A short user-facing release label such as `5.3`, backed by the current four-part Windows version `5.3.0.3`.
+- A short user-facing release label such as `6.0`, backed by the current four-part Windows version `6.0.0.0`.
 - Newer, same-version, and older external copies have distinct prompts.
 - Updates stage the new executable beside the installed copy and retry replacement.
 - Relaunch waits for the updater process to exit before acquiring the single-instance mutex.

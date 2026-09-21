@@ -1,6 +1,6 @@
 # Data, Backups, and Privacy
 
-Applies to ctSpaces 5.3.
+Applies to ctSpaces 6.0.
 
 ## What Profile Separation Means
 
