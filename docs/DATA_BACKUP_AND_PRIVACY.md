@@ -1,6 +1,6 @@
 # Data, Backups, and Privacy
 
-Applies to ctSpaces 6.0.
+Applies to ctSpaces 6.1.
 
 ## What Profile Separation Means
 
@@ -25,6 +25,7 @@ The important items are:
 | `Sites\<ClientName>` | Persistent client container holding every browser slot | Until whole-client Delete or full removal |
 | `Sites\<ClientName>\Browsers\<browser>\Profile` | Independent Edge, Chrome, Brave, or Firefox profile in the v2 layout | Retained with that client |
 | `Sites\<ClientName>\client.ico` | Optional custom client icon | Retained with that client |
+| `Sites\<ClientName>\ctSpaces-client-notes.txt` | Optional local UTF8 notes, limited to 128 KiB | Retained through rename, archive, and full backup; removed with whole client deletion |
 | `Default.7z` | Sanitized Chromium starter copied into new Edge, Chrome, and Brave profiles | Retained and revisioned |
 | `default-template-revision.txt` | Installed starter-template revision | Retained across launches |
 | `Default` | Temporary working folder for the Chromium Default editor | Recreated for one singleton Edge, Chrome, or Brave editing session; Firefox selection is not accepted |
@@ -47,6 +48,7 @@ A normal client profile may contain sensitive browser data, including:
 - Local storage, IndexedDB, service-worker data, and cached files.
 - Session files used to reopen browser tabs.
 - The optional `client.ico` identity icon.
+- Optional local client notes. These are plain text, not encrypted or synced. Avoid storing passwords or secrets in them.
 
 Normal updates replace the app executable and may revise the new-client starter. They do not rewrite existing folders under `Sites`.
 

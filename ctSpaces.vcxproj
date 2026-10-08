@@ -170,6 +170,7 @@
     <ClInclude Include="BrowserPreferencesJson.h" />
     <ClInclude Include="ClientShortcutName.h" />
     <ClInclude Include="ClientActivity.h" />
+    <ClInclude Include="ClientNotes.h" />
     <ClInclude Include="ConfigPersistence.h" />
     <ClInclude Include="GuidedWalkthrough.h" />
     <ClInclude Include="InProc7z.h" />

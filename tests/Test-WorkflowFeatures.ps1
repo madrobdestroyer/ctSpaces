@@ -35,6 +35,11 @@ if (1 + $deepTailRelativePath.Length -ne 150) {
     throw 'The case-only rename deep-tail fixture is not exactly 150 UTF-16 characters from the client root.'
 }
 $alphaDeepTailPath = Join-Path $alphaRoot $deepTailRelativePath
+$notesFileName = 'ctSpaces-client-notes.txt'
+$notesPayload = "Client workflow notes`r`nSecond line with symbols: " +
+    [char]0x00E9 + ' ' + [char]0x65E5 + [char]0x672C
+$notesPath = Join-Path $alphaRoot $notesFileName
+$notesHash = $null
 $liveDataDir = Join-Path $env:LOCALAPPDATA 'InfinitySys\ctSpaces'
 $liveConfigPath = Join-Path $liveDataDir 'config.ini'
 $liveClientPaths = @(
@@ -409,6 +414,16 @@ function Assert-V2SlotSentinels {
     }
 }
 
+function Assert-ClientNotes {
+    param([Parameter(Mandatory = $true)][string]$ClientRoot)
+
+    $path = Join-Path $ClientRoot $notesFileName
+    if (-not (Test-Path -LiteralPath $path -PathType Leaf) -or
+        (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash -cne $notesHash) {
+        throw "Client notes changed or disappeared: $path"
+    }
+}
+
 function Assert-LiveDataUnchanged {
     if ((Get-FileFingerprint $liveConfigPath) -ne $liveConfigBefore) {
         throw 'Workflow QA changed the live ctSpaces configuration.'
@@ -479,6 +494,8 @@ try {
     [IO.File]::WriteAllText(
         $alphaDeepTailPath, 'case-only-deep-tail', $utf8NoBom
     )
+    [IO.File]::WriteAllText($notesPath, $notesPayload, $utf8NoBom)
+    $notesHash = (Get-FileHash -LiteralPath $notesPath -Algorithm SHA256).Hash
     Copy-Item -LiteralPath (Join-Path $projectRoot 'icons\ctdkgrsq.ico') `
         -Destination (Join-Path $alphaRoot 'client.ico') -Force
     [IO.File]::WriteAllText(
@@ -494,6 +511,7 @@ try {
         $utf8NoBom
     )
     Assert-V2SlotSentinels $alphaRoot
+    Assert-ClientNotes $alphaRoot
 
     $arguments = '--qa-instance=' + $runId.Substring(0, 10) +
         ' --qa-data-dir="' + $qaDataDir + '"' +
@@ -704,6 +722,7 @@ try {
         -not ($exactNames -ccontains $alphaName)
     } 'The case-only rename did not commit the exact requested directory casing.')
     Assert-V2SlotSentinels $caseOnlyRoot
+    Assert-ClientNotes $caseOnlyRoot
     $caseOnlyDeepTailPath = Join-Path $caseOnlyRoot $deepTailRelativePath
     if (-not (Test-Path -LiteralPath $caseOnlyDeepTailPath -PathType Leaf)) {
         throw 'The case-only rename lost the valid 150-character managed file tail.'
@@ -750,6 +769,7 @@ try {
         -not (Test-Path -LiteralPath $alphaRoot)
     } 'The client profile folder was not renamed safely.')
     Assert-V2SlotSentinels $renamedProfilePath
+    Assert-ClientNotes $renamedProfilePath
     if (-not (Test-Path -LiteralPath `
             (Join-Path $renamedProfilePath $deepTailRelativePath) `
             -PathType Leaf)) {
@@ -783,6 +803,7 @@ try {
         throw 'Archiving moved or deleted the browser profile.'
     }
     Assert-V2SlotSentinels $renamedProfilePath
+    Assert-ClientNotes $renamedProfilePath
     Wait-ForConfigPattern "(?ms)^\[restore_tabs\].*?^disabled_client\d+=${renamedRegex}\|edge\r?$"
     Wait-ForConfigPattern "(?ms)^\[restore_tabs\].*?^disabled_client\d+=${renamedRegex}\|chrome\r?$"
     if (-not (Test-Path -LiteralPath $renamedShortcutPath -PathType Leaf)) {
@@ -798,6 +819,7 @@ try {
     Wait-ForConfigPattern "(?ms)^\[restore_tabs\].*?^disabled_client\d+=${renamedRegex}\|edge\r?$"
     Wait-ForConfigPattern "(?ms)^\[restore_tabs\].*?^disabled_client\d+=${renamedRegex}\|chrome\r?$"
     Assert-V2SlotSentinels $renamedProfilePath
+    Assert-ClientNotes $renamedProfilePath
     if (-not (Test-Path -LiteralPath $renamedShortcutPath -PathType Leaf)) {
         throw 'Restoring the archived client lost its shortcut.'
     }
@@ -808,6 +830,35 @@ try {
 
     Invoke-AppCommand 41016
     Wait-ForConfigPattern '(?m)^client_title_first=1\r?$'
+    Assert-LiveDataUnchanged
+
+    Set-WindowTextValue $clientEdit $renamedName
+    Invoke-AppCommand 41004
+    $deletePrompt = Wait-Until {
+        $window = [CtWorkflowQaNative]::FindWindow(
+            [uint32]$launcher.Id, '#32770', 'Delete Entire Client'
+        )
+        if ($window -ne [IntPtr]::Zero) { $window }
+    } 'The app did not show its whole-client deletion confirmation.'
+    if (-not [CtWorkflowQaNative]::PostMessageW(
+            $deletePrompt, 0x0111, [UIntPtr]::new(6), [IntPtr]::Zero
+        )) {
+        throw 'Could not confirm whole-client deletion.'
+    }
+    $deletedNotice = Wait-Until {
+        $window = [CtWorkflowQaNative]::FindWindow(
+            [uint32]$launcher.Id, '#32770', 'Client Deleted'
+        )
+        if ($window -ne [IntPtr]::Zero) { $window }
+    } 'The app did not complete whole-client deletion.'
+    [void](Wait-Until {
+        -not (Test-Path -LiteralPath $renamedProfilePath)
+    } 'Whole-client deletion left the notes or client root behind.')
+    if (-not [CtWorkflowQaNative]::PostMessageW(
+            $deletedNotice, 0x0111, [UIntPtr]::new(1), [IntPtr]::Zero
+        )) {
+        throw 'Could not close the deletion result.'
+    }
     Assert-LiveDataUnchanged
 
     [pscustomobject]@{
@@ -835,6 +886,8 @@ try {
         ArchiveRetainedBothRestoreSettings = $true
         ArchiveRetainedSingleShortcut = $true
         ArchivedClientRestored = $true
+        ClientNotesPreservedAcrossRenameAndArchive = $true
+        WholeClientDeleteRemovedNotes = $true
         ClientTitlePreferencePersisted = $true
         LiveConfigUnchanged = $true
         LiveSitesUnchanged = $true

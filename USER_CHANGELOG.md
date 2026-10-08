@@ -1,8 +1,15 @@
-# ctSpaces 6.0 - What's New
+# ctSpaces 6.1 What's New
 
-The initial ctSpaces 6.0.0.0 milestone consolidated features previously shipped across 5.2 and 5.3. The current 6.0.4.0 release improves cleanup responsiveness without changing client or browser data behavior. Existing client spaces, sign-ins, bookmarks, icons, browser history, and saved sessions remain intact during the update.
+The initial ctSpaces 6.0.0.0 milestone consolidated features previously shipped across 5.2 and 5.3. The current 6.1.0.0 release adds client filtering, local notes, and Close All Clients. Existing client spaces, sign ins, bookmarks, icons, browser history, and saved sessions remain intact during the update.
 
-## Current 6.0.4.0 Milestone
+## Current 6.1.0.0 Milestone
+
+1. Close All Clients requests normal browser closure and leaves ctSpaces running. Refused or delayed closes stay tracked without silent forced termination.
+2. Typing filters existing client names by any part of the name. The old autocomplete replacement is removed so overlapping new names stay exactly as typed.
+3. Client Notes adds a separate themed local reminders window. Notes move with renames, survive archive, are included in full client backups, and are removed with whole client deletion.
+4. The full guide, visual tour, and What's new cover the three additions. The runtime ZIP still contains only `ctSpaces.exe`.
+
+## Previous 6.0.4.0 Milestone
 
 - **Responsive cleanup discovery:** Delete Multiple Clients and inactive cleanup
   move intensive profile discovery and validation away from the main window.

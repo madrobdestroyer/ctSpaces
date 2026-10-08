@@ -1,6 +1,6 @@
 # ctSpaces User Guide
 
-Applies to ctSpaces 6.0.
+Applies to ctSpaces 6.1.
 
 ## What ctSpaces Does
 
@@ -26,7 +26,7 @@ The launcher is divided into a few compact areas:
 - **Client tabs:** display only the client name for each space opened by the current ctSpaces session. If one client is open in two browsers, both tabs intentionally use that client name; ctSpaces still tracks each browser slot separately.
 - **Overflow button:** appears when all open clients cannot fit. It can show or close hidden client tabs.
 - **Pinned row:** shows favorite existing clients as compact customer-icon shortcuts. Left-click one to open it or switch to its open tab, drag pins to reorder them, or right-click one for more choices.
-- **Client field:** type a new client name or select an existing one from the same editable control.
+- **Client field:** type any part of an existing name to filter the list, or type an exact new name. Filtering does not complete or replace your text. Choose a result explicitly to use its full name.
 - **Pushpin button:** adds or removes the selected existing client from the Pinned row. It stays unavailable for names that have not been created yet.
 - **Create button:** appears for a new typed name and creates that client when selected.
 - **Open button:** opens the selected client. Pressing Enter in the client field does the same thing.
@@ -56,6 +56,18 @@ Existing standard clients request their previous browser session by default, so 
 
 Only one instance of the same client/browser pair can be opened through one ctSpaces launcher at a time. The same client may be open in different browsers simultaneously, such as Client A in both Chrome and Firefox.
 
+## Filter Clients
+
+Type any part of a client name in the Client field. Matching is not case sensitive. For example, `cme` matches `Acme`, `Acme West`, and `North Acme`. Archived clients remain hidden from this list.
+
+Choose a result with the mouse or arrow keys and confirm your selection to fill its full name. Dismissing the list does not change your typed name. If you intend to create `Acme New`, type that complete name and use Create or Enter. The existing `Acme` client will not replace it.
+
+## Client Notes
+
+Select an existing client, then choose `Client Notes` from Settings. The same command is available by right clicking a visible pinned client. Add local reminders in the separate themed window and select Save. Cancel or closing the window with unsaved changes asks whether to save, discard, or keep editing. A failed save leaves your draft available to retry.
+
+Notes belong to the client rather than a particular browser slot. They stay with the client through rename and archive and are included in a full client backup. Deleting the whole client also deletes its notes. Notes are plain local text, not encrypted or synced, so do not put passwords or other secrets in them.
+
 ## Choose Whether A Browser Slot Restores Tabs
 
 1. Select an existing client in the Client field and choose the browser whose slot you want to change.
@@ -71,7 +83,7 @@ For a pinned favorite, first choose the intended browser, then right-click its s
 2. Select the pushpin beside the field.
 3. The client and its customer icon appear in the Pinned row.
 
-Left-click a pinned client to open it in the currently selected browser. If that client/browser slot is already open, ctSpaces switches to its existing tab and browser window. Right-click it for `Select client`, `Open client`, `Open copied link`, browser-specific `Restore tabs`, and `Create desktop shortcut`. Select the filled pushpin again to remove it from favorites. Up to eight clients can be pinned; the first four remain visible and additional pins appear under the overflow control.
+Click a pinned client to open it in the currently selected browser. If that client/browser slot is already open, ctSpaces switches to its existing tab and browser window. Use its context menu for `Select client`, `Open client`, `Open copied link`, browser specific `Restore tabs`, `Create desktop shortcut`, and `Client Notes`. Select the filled pushpin again to remove it from favorites. Up to eight clients can be pinned; the first four remain visible and additional pins appear under the overflow control.
 
 Drag visible pins left or right to put them in your preferred order. The order is saved automatically. Dragging a visible pin onto an open area of the Windows Desktop creates that client's desktop shortcut.
 
@@ -102,6 +114,8 @@ The clean shortcut does not restrict the client's browser spaces. Change the bro
 - The overflow menu has one section for showing clients and another for closing them.
 
 Closing a client normally gives the browser time to save its current session and sign-in state.
+
+Use `Close all` to request normal closure of the tracked saved client browsers together while keeping ctSpaces open. Confirm the request, then respond to any prompts in the browser windows. Browsers that refuse or delay closure stay tracked; this command does not silently force them to exit. It leaves the Default editor, Temporary profile, and unrelated browser windows open and does not delete saved client data.
 
 You may also close the slot from the browser window. If the browser asks whether to close all tabs, choose `Close all` to finish closing it. When that client/browser slot's `Restore tabs` switch is on, ctSpaces requests those saved tabs the next time that slot is opened. The browser does not need a separate "close and save" button.
 

@@ -145,6 +145,7 @@ function Capture-CurrentStepDpis([IntPtr]$tour,[string]$theme,[string]$slug){
 
 $expectedSteps=@(
     [pscustomobject]@{Title='Choose or name a client';Needles=@('CLIENT field','never changes this field');Demo='';Slug='client'},
+    [pscustomobject]@{Title='Find clients while typing';Needles=@('part of an existing name','keeps your typed text','does not type, select, or create');Demo='';Slug='filter'},
     [pscustomobject]@{Title='Choose a browser';Needles=@('Edge, Chrome, Brave, or Firefox','separate slot','5.2 client','binds the existing data in place');Demo='Illustration only — no actions performed. Client A has separate Chrome and Firefox browser slots with separate sign-ins, cookies, history, extensions, and sessions.';Slug='browser'},
     [pscustomobject]@{Title='Create, Open, or Show';Needles=@('create a new slot','open an existing one','show an already-open window');Demo='';Slug='primary'},
     [pscustomobject]@{Title='Pin favorite clients';Needles=@('pushpin','favorites');Demo='';Slug='pin-intro'},
@@ -153,6 +154,7 @@ $expectedSteps=@(
     [pscustomobject]@{Title='Create a Desktop shortcut';Needles=@('Right-click a pin','drag a visible pin onto the Windows Desktop','one managed client shortcut','selected browser','recreate it to change that browser');Demo='Illustration only — no actions performed. Pinned menu: Select client; Open client; Open copied link; Restore tabs; Create desktop shortcut. Highlighted: Create desktop shortcut. Right-click > Create desktop shortcut OR Pin Client A → Desktop.';Slug='desktop-shortcut'},
     [pscustomobject]@{Title='Reorder pinned clients';Needles=@('Drag visible pins left or right','saved for the next ctSpaces launch','illustration does not reorder anything');Demo='Illustration only — no actions performed. Before: Client A, Client B. After: Client B, Client A. Reorder pinned clients.';Slug='reorder-pins'},
     [pscustomobject]@{Title='Switch between open sessions';Needles=@('tabs across the top','Select a tab to show','use x to close','overflow');Demo='';Slug='sessions'},
+    [pscustomobject]@{Title='Close all browser sessions';Needles=@('After confirmation','tracked client browsers to close','ctSpaces stays open','Temporary and Default editor','refuses remains','never presses');Demo='';Slug='close-all'},
     [pscustomobject]@{Title='Reorder session tabs';Needles=@('Drag open-session tabs left or right','current launcher run','not saved for the next ctSpaces launch');Demo='Illustration only — no actions performed. Before: Client A, Client B. After: Client B, Client A. Reorder session tabs.';Slug='reorder-tabs'},
     [pscustomobject]@{Title='Open the client folder';Needles=@('File Explorer','Do not edit profile files while a browser is open');Demo='';Slug='folder'},
     [pscustomobject]@{Title='Choose whether to restore tabs';Needles=@('separately for the selected client and browser','does not erase cookies, sign-ins, or browsing data');Demo='';Slug='restore-tabs'},
@@ -161,13 +163,14 @@ $expectedSteps=@(
     [pscustomobject]@{Title='Rename a client';Needles=@('every slot for that client to be closed','preserving browser slots','pinned position','Restore tabs choices','verified managed shortcut');Demo='Illustration only — no actions performed. Options > Rename Client. Client A becomes Client North; browser data and managed settings are kept.';Slug='rename-client'},
     [pscustomobject]@{Title='Archive and restore a client';Needles=@('hides a closed client without deleting browser data','Archived Clients','normal picker','not a backup');Demo='Illustration only — no actions performed. Options > Archive Client hides Client A. Options > Archived Clients restores Client A.';Slug='archive-restore'},
     [pscustomobject]@{Title='Put client names first';Needles=@('Client name first in window titles','browser and Alt+Tab titles','windows already open');Demo='Illustration only — no actions performed. Options > Client name first in window titles. Example: Client A — Browser.';Slug='client-first-titles'},
+    [pscustomobject]@{Title='Keep Client Notes';Needles=@('existing client','Settings > Client Notes','open its pin menu','Save keeps local notes','Save, Discard, and Cancel','does not open or edit');Demo='Illustration only: no actions performed. Select Client A, then Settings > Client Notes or open its pin menu. Save keeps local notes; leaving with edits offers Save, Discard, and Cancel.';Slug='client-notes'},
     [pscustomobject]@{Title='Clean up inactive clients';Needles=@('three calendar months','Unknown history begins a fresh tracking period','Archived clients can appear','selection, acknowledgement, and fresh safety checks','permanently deletes','Cannot be undone','back up first');Demo='Illustration only — no actions performed. Clean Up Inactive Clients... Select Client A/B, acknowledge, Delete Selected.';Slug='inactive-cleanup'},
     [pscustomobject]@{Title='Delete multiple clients now';Needles=@('no inactivity wait','archived clients','recheck open/safety state','all browser data','existing backups are retained','permanently deletes','Cannot be undone','back up first');Demo='Illustration only — no actions performed. Delete Multiple Clients... Select Client A/B, acknowledge, Delete Selected.';Slug='manual-delete'},
     [pscustomobject]@{Title='Open Options';Needles=@('client management','backup and restore','full guide','Quick tour');Demo='';Slug='options'}
 )
 $pinStepTitles=@('Pin favorite clients',"Use a pinned client's menu",'Open a copied link','Create a Desktop shortcut','Reorder pinned clients')
 $sessionStepTitles=@('Switch between open sessions','Reorder session tabs')
-$anchorByTitle=@{'Choose or name a client'=205;'Create, Open, or Show'=1;'Choose whether to restore tabs'=207;'Open a temporary profile'=200;'Save or discard Default changes'=201;'Rename a client'=201;'Archive and restore a client'=201;'Put client names first'=201;'Clean up inactive clients'=201;'Delete multiple clients now'=201;'Open Options'=201}
+$anchorByTitle=@{'Choose or name a client'=205;'Find clients while typing'=205;'Create, Open, or Show'=1;'Close all browser sessions'=209;'Choose whether to restore tabs'=207;'Open a temporary profile'=200;'Save or discard Default changes'=201;'Rename a client'=201;'Archive and restore a client'=201;'Put client names first'=201;'Keep Client Notes'=201;'Clean up inactive clients'=201;'Delete multiple clients now'=201;'Open Options'=201}
 
 function Assert-CurrentStep([IntPtr]$tour,$step,[int]$index,[bool]$expectPinned,[bool]$expectSession){
     $title=Wait-Until{$value=[QuickTourQa]::ControlText([QuickTourQa]::GetDlgItem($tour,1310));if($value){$value}} "Quick Tour title $index did not become ready."
@@ -176,7 +179,7 @@ function Assert-CurrentStep([IntPtr]$tour,$step,[int]$index,[bool]$expectPinned,
     Assert([QuickTourQa]::TextFits([QuickTourQa]::GetDlgItem($tour,1310),$false)) "Quick Tour '$title' title is clipped."
     $bodyControl=[QuickTourQa]::GetDlgItem($tour,1311)
     if(-not[QuickTourQa]::TextFits($bodyControl,$true)){$failureFrame=Find-Frame;$failureShot=Save-OverlayCapture $tour $failureFrame (($title-replace'[^A-Za-z0-9]+','-')+'-text-failure');throw "Quick Tour '$title' body is clipped ($([QuickTourQa]::TextFitDetails($bodyControl,$true))). Capture: $failureShot"}
-    Assert(([QuickTourQa]::ControlText([QuickTourQa]::GetDlgItem($tour,1312)))-eq("$($index+1) / 20")) "Quick Tour '$title' count is wrong."
+    Assert(([QuickTourQa]::ControlText([QuickTourQa]::GetDlgItem($tour,1312)))-eq("$($index+1) / $($expectedSteps.Count)")) "Quick Tour '$title' count is wrong."
     $demo=[QuickTourQa]::GetDlgItem($tour,1314);Assert($demo-ne[IntPtr]::Zero) 'Quick Tour demo control is missing.'
     if($step.Demo){Assert([QuickTourQa]::IsWindowVisible($demo)) "Quick Tour '$title' illustration is hidden.";Assert(([QuickTourQa]::ControlText($demo))-eq$step.Demo) "Quick Tour '$title' accessible illustration text is wrong."}else{Assert(-not[QuickTourQa]::IsWindowVisible($demo)) "Quick Tour '$title' showed an unrelated illustration.";Assert(([QuickTourQa]::ControlText($demo))-eq'') "Quick Tour '$title' retained stale illustration text."}
     if($pinStepTitles-contains$title){if($expectPinned){Assert(-not$body.Contains('No clients are pinned')) "Populated pin step '$title' claimed the pin row was empty."}else{Assert($body.Contains('No clients are pinned')) "Empty pin step '$title' omitted its no-fake-client explanation."}}
@@ -256,10 +259,11 @@ try {
     $owned=Wait-Until{@(Get-CimInstance Win32_Process -Filter "Name='msedge.exe'" -ErrorAction SilentlyContinue|Where-Object{$_.CommandLine-and$_.CommandLine-match[regex]::Escape($profile)})} 'WM_COPYDATA did not launch the exact isolated Edge profile.' 20
     Wait-Until{[QuickTourQa]::IsWindowEnabled($main)} 'Launcher did not finish the isolated Edge handoff.' 15|Out-Null
     $sessionConfigBefore=Get-StableFingerprint $config;$tour=Open-Tour
-    for($index=0;$index-lt 8;$index++){[void][QuickTourQa]::PostMessageW($tour,0x111,[UIntPtr]1,[IntPtr]::Zero);$next=$expectedSteps[$index+1].Title;Wait-Until{[QuickTourQa]::ControlText([QuickTourQa]::GetDlgItem($tour,1310))-eq$next} "Quick Tour did not reach populated session step '$next'."|Out-Null}
-    $sessionState=Assert-CurrentStep $tour $expectedSteps[8] 8 $true $true;$populatedSessionShot=Save-OverlayCapture $tour $sessionState.Frame 'Dark-Gothic-populated-session'
-    [void][QuickTourQa]::PostMessageW($tour,0x111,[UIntPtr]1,[IntPtr]::Zero);Wait-Until{[QuickTourQa]::ControlText([QuickTourQa]::GetDlgItem($tour,1310))-eq$expectedSteps[9].Title} 'Quick Tour did not reach populated session reorder step.'|Out-Null
-    [void](Assert-CurrentStep $tour $expectedSteps[9] 9 $true $true);[void][QuickTourQa]::PostMessageW($tour,0x111,[UIntPtr]2,[IntPtr]::Zero);Wait-TourClosed $tour 'Populated session tour did not close.'
+    $sessionIndex=[array]::IndexOf(@($expectedSteps|ForEach-Object{$_.Title}),'Switch between open sessions')
+    for($index=0;$index-lt$sessionIndex;$index++){[void][QuickTourQa]::PostMessageW($tour,0x111,[UIntPtr]1,[IntPtr]::Zero);$next=$expectedSteps[$index+1].Title;Wait-Until{[QuickTourQa]::ControlText([QuickTourQa]::GetDlgItem($tour,1310))-eq$next} "Quick Tour did not reach populated session step '$next'."|Out-Null}
+    $sessionState=Assert-CurrentStep $tour $expectedSteps[$sessionIndex] $sessionIndex $true $true;$populatedSessionShot=Save-OverlayCapture $tour $sessionState.Frame 'Dark-Gothic-populated-session'
+    [void][QuickTourQa]::PostMessageW($tour,0x111,[UIntPtr]1,[IntPtr]::Zero);Wait-Until{[QuickTourQa]::ControlText([QuickTourQa]::GetDlgItem($tour,1310))-eq$expectedSteps[$sessionIndex+1].Title} 'Quick Tour did not reach Close all step.'|Out-Null
+    [void](Assert-CurrentStep $tour $expectedSteps[$sessionIndex+1] ($sessionIndex+1) $true $true);[void][QuickTourQa]::PostMessageW($tour,0x111,[UIntPtr]2,[IntPtr]::Zero);Wait-TourClosed $tour 'Populated session tour did not close.'
     Assert((Get-StableFingerprint $config)-eq$sessionConfigBefore) 'Populated-session tour changed preferences or pinned order.'
     $otherClients=@(Get-ChildItem -LiteralPath (Join-Path $data 'Sites') -Directory|Where-Object{$_.Name-ne$client-and$_.Name-ne$clientB});Assert($otherClients.Count-eq 0) 'Quick Tour or handoff created an unexpected client profile.'
     foreach($edgeProcess in @($owned)){[QuickTourQa]::ClosePidWindows([uint32]$edgeProcess.ProcessId)}
@@ -268,7 +272,7 @@ try {
 
     Assert((Get-Fingerprint $liveConfig)-eq$liveConfigBefore) 'Live ctSpaces configuration changed.'
     $completed=$true
-    [pscustomobject]@{QuickTourSteps=$steps;DistinctBodies=$seenBodies.Count;DemoSteps=12;GuideButtonHandoff=$true;ActualAnchorChecks=@('CLIENT field','primary action','empty-state pushpin','client folder','Restore tabs','Temporary','Options');StateSensitiveCopyChecks=@('populated pin guidance','empty session guidance','populated session guidance');OverlayFrameLifetime=$true;MarineCaptures=$marineShots;GothicCaptures=$gothicShots;PopulatedSessionCapture=$populatedSessionShot;ExpectedDpis=$ExpectedDpis;CloseMinimizeCleanup=$true;CopyDataLaunchHonored=$true;ConfigPinnedAndClientIsolation=$true;GdiDelta=($gdiAfter-$gdiBefore)}|ConvertTo-Json
+    [pscustomobject]@{QuickTourSteps=$steps;DistinctBodies=$seenBodies.Count;DemoSteps=13;GuideButtonHandoff=$true;ActualAnchorChecks=@('CLIENT field','Close all','primary action','empty-state pushpin','client folder','Restore tabs','Temporary','Options');StateSensitiveCopyChecks=@('populated pin guidance','empty session guidance','populated session guidance');OverlayFrameLifetime=$true;MarineCaptures=$marineShots;GothicCaptures=$gothicShots;PopulatedSessionCapture=$populatedSessionShot;ExpectedDpis=$ExpectedDpis;CloseMinimizeCleanup=$true;CopyDataLaunchHonored=$true;ConfigPinnedAndClientIsolation=$true;GdiDelta=($gdiAfter-$gdiBefore)}|ConvertTo-Json
 } catch {
     New-Item -ItemType Directory -Path $artifactRoot -Force|Out-Null;[IO.File]::WriteAllText((Join-Path $artifactRoot ($run+'-failure.txt')),$_.Exception.ToString(),$utf8);throw
 } finally {

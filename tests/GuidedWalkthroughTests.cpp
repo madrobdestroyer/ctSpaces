@@ -72,7 +72,7 @@ std::wstring ReadIni(const fs::path &path, const wchar_t *section,
 
 void TestCatalogContract() {
   const auto &topics = Catalog();
-  Expect(topics.size() == 12, "the walkthrough catalog must contain 12 topics");
+  Expect(topics.size() == 15, "the walkthrough catalog must contain 15 topics");
 
   std::set<std::wstring> ids;
   std::set<std::wstring> announced;
@@ -105,7 +105,8 @@ void TestCatalogContract() {
   }
   const std::set<std::wstring> expectedAnnounced = {
       L"browsers_restore", L"sessions",  L"pins_shortcuts", L"identity",
-      L"organize",         L"cleanup",   L"appearance",     L"updates"};
+      L"organize",         L"cleanup",   L"appearance",     L"updates",
+      L"client_filter", L"close_all", L"client_notes"};
   Expect(announced == expectedAnnounced,
          "announced guide topics do not match the since-5.2.0.14 contract");
   const std::map<std::wstring, std::wstring> expectedAnnouncementTitles = {
@@ -116,7 +117,10 @@ void TestCatalogContract() {
       {L"organize", L"Rename & archive clients"},
       {L"cleanup", L"Two bulk-delete tools"},
       {L"appearance", L"Improved themed popups"},
-      {L"updates", L"Guides & visual tour"}};
+      {L"updates", L"Guides & visual tour"},
+      {L"client_filter", L"Find clients by part of a name"},
+      {L"close_all", L"Close all browser windows"},
+      {L"client_notes", L"Client Notes"}};
   Expect(announcementTitles == expectedAnnouncementTitles,
          "dedicated announcement titles do not match the release contract");
 }
@@ -129,7 +133,8 @@ void TestRevisionProgressContract() {
       {L"pins_shortcuts", 4},   {L"temporary_default", 2},
       {L"identity", 4},         {L"organize", 3},
       {L"cleanup", 3},          {L"backup_restore", 1},
-      {L"appearance", 3},       {L"updates", 4}};
+      {L"appearance", 3},       {L"updates", 4},
+      {L"client_filter", 1}, {L"close_all", 1}, {L"client_notes", 1}};
   Expect(expectedRevisions.size() == topics.size(),
           "revision contract does not cover the catalog");
   for (const auto &topic : topics) {
@@ -147,7 +152,8 @@ void TestRevisionProgressContract() {
       {L"pins_shortcuts", 3},   {L"temporary_default", 2},
       {L"identity", 3},         {L"organize", 2},
       {L"cleanup", 2},          {L"backup_restore", 1},
-      {L"appearance", 2},       {L"updates", 3}};
+      {L"appearance", 2},       {L"updates", 3},
+      {L"client_filter", 0}, {L"close_all", 0}, {L"client_notes", 0}};
   Expect(prior602Revisions.size() == topics.size(),
          "6.0.2 progress contract does not cover the catalog");
   State oldRead;
@@ -167,7 +173,8 @@ void TestRevisionProgressContract() {
          "6.0.2 progress did not expose the announced update");
   const std::set<std::wstring> expectedAnnounced = {
       L"browsers_restore", L"sessions",  L"pins_shortcuts", L"identity",
-      L"organize",         L"cleanup",   L"appearance",     L"updates"};
+      L"organize",         L"cleanup",   L"appearance",     L"updates",
+      L"client_filter", L"close_all", L"client_notes"};
   const auto unread = guided_walkthrough::UnreadAnnouncementIndices(oldRead);
   Expect(unread.size() == expectedAnnounced.size(),
          "6.0.2 progress exposed the wrong What's new topic count");
@@ -176,6 +183,23 @@ void TestRevisionProgressContract() {
     unreadIds.emplace(topics[index].id);
   Expect(unreadIds == expectedAnnounced,
          "6.0.2 progress exposed the wrong What's new topics");
+
+  State priorReleaseRead;
+  priorReleaseRead.readRevisions.resize(topics.size(), 0);
+  for (size_t index = 0; index < topics.size(); ++index) {
+    const std::wstring id = topics[index].id;
+    if (id != L"client_filter" && id != L"close_all" &&
+        id != L"client_notes")
+      priorReleaseRead.readRevisions[index] = topics[index].revision;
+  }
+  const auto newAnnouncements =
+      guided_walkthrough::UnreadAnnouncementIndices(priorReleaseRead);
+  std::set<std::wstring> newIds;
+  for (size_t index : newAnnouncements)
+    newIds.emplace(topics[index].id);
+  Expect(newIds == std::set<std::wstring>{L"client_filter", L"close_all",
+                                           L"client_notes"},
+         "previous release progress must announce only the three new workflows");
 
   State futureRead;
   futureRead.readRevisions.assign(topics.size(), 999);
@@ -247,7 +271,8 @@ void TestStateAndRevisionSemantics() {
   const auto unread = guided_walkthrough::UnreadAnnouncementIndices(state);
   const std::set<std::wstring> expectedUnread = {
       L"browsers_restore", L"sessions",  L"pins_shortcuts", L"identity",
-      L"organize",         L"cleanup",   L"appearance",     L"updates"};
+      L"organize",         L"cleanup",   L"appearance",     L"updates",
+      L"client_filter", L"close_all", L"client_notes"};
   std::set<std::wstring> unreadIds;
   size_t updatesIndex = Catalog().size();
   for (const size_t index : unread) {

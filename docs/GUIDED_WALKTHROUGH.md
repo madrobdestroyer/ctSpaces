@@ -1,6 +1,6 @@
 # Guided walkthrough and feature updates
 
-Applies to ctSpaces 6.0.3.0.
+Applies to ctSpaces 6.1.0.0.
 
 The built-in guide explains ctSpaces without performing any client operations.
 Reading a page does not create a client, launch a browser, change a profile,
@@ -20,7 +20,7 @@ Use the topic list to jump directly to the subject you need. **Back** and
 ## Quick tour of the real controls
 
 Open **Options (gear) > Quick tour**, or choose **Quick tour** from the full
-guide or fresh-user welcome, for a 20-step visual tour with 12 inert workflow
+guide or fresh-user welcome, for a 23 step visual tour with 13 inert workflow
 illustrations. It outlines the actual
 CLIENT field, browser selector, primary Create/Open/Show button, pushpin or
 pinned row, session tabs, client-folder icon, Restore tabs control, Temporary,
@@ -48,6 +48,9 @@ launch. Background/minimized startup is also kept free of an automatic guide.
 - How client and browser profiles stay separate, and why this is workflow
   isolation rather than an operating-system security sandbox.
 - Creating a client, opening an existing one, and showing an open window.
+- Filtering names without autocomplete replacement, keeping overlapping new names intact.
+- Closing all tracked clients normally while keeping the launcher open.
+- Saving local client notes and understanding their rename, archive, backup, and deletion lifetime.
 - Opening an existing client's folder in File Explorer from the client icon at
   the left of the CLIENT field (not from the Temporary button). The folder
   contains all browser slots; do not edit or delete its profile files while a
@@ -87,13 +90,18 @@ patch. Guidance is tracked per feature and content revision, independently of
 the application's patch version.
 
 For colleagues coming from the supplied 5.2.0.14 ZIP, What's new announces
-eight change-only topics with dedicated titles: **Firefox & browser slots**,
+the original eight change only topics with dedicated titles: **Firefox & browser slots**,
 **Reorder open tabs**, **Links, shortcuts & ordering**, **Client-first window
 titles**, **Rename & archive clients**, **Two bulk-delete tools**, **Improved
 themed popups**, and **Guides & visual tour**. Temporary and starter profiles
 are still explained in the full guide, but are not marked New in this release.
 Existing actions are explained in the full walkthrough without being falsely
 presented as newly added functionality in 6.0.3.0.
+
+Version 6.1 adds three independently tracked announcements for client filtering,
+Close All Clients, and Client Notes. People who already acknowledged the older
+topics still receive these additions. The full guide has fifteen topics, and
+the visual tour adds three steps without operating the controls it describes.
 
 The 6.0.3.0 update leaves the 20-step, 12-illustration Quick tour unchanged.
 It separates the dedicated change-only What's-new copy from the full guide and

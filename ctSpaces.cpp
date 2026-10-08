@@ -20,6 +20,7 @@
 #include "BrowserPreferencesJson.h"
 #include "ClientShortcutName.h"
 #include "ClientActivity.h"
+#include "ClientNotes.h"
 #include "CleanupResultPages.h"
 #include "ConfigPersistence.h"
 #include "GuidedWalkthrough.h"
@@ -319,6 +320,7 @@ HWND g_hBtnClientIcon = NULL;
 HWND g_hBtnClientDrop = NULL;
 HWND g_hBtnPin = NULL;
 HWND g_hBtnRestoreTabs = NULL;
+HWND g_hBtnCloseAll = NULL;
 HWND g_hBtnTmpProf = NULL;
 HWND g_hBtnConfig = NULL;
 HWND g_hBtnPinTip = NULL;
@@ -343,7 +345,14 @@ static bool g_bHotBrowserSelector = false;
 static int g_iSelectedSessionTab = 0; // 0 = New, 1..n = open client
 static bool g_bUiEnabled = true;
 static bool g_bDefaultProfileUiBusy = false;
+static std::atomic_bool g_bClientNotesBusy = false;
+static std::vector<std::unique_ptr<ProfileExitPayload>> g_notesDeferredExits;
 static bool g_bSyncingClientInput = false;
+static bool g_bFilteringClientList = false;
+static bool g_bClientListNavigated = false;
+static bool g_bSuppressClientSelectionCommit = false;
+static std::vector<std::wstring> g_allClientNames;
+static bool g_bCloseAllClientsPending = false;
 static bool g_bExitWhenProfilesClose = false;
 static bool g_bClosePendingDuringLaunch = false;
 static bool g_bArchiveTaskInProgress = false;
@@ -474,6 +483,8 @@ IShellLink *shellLink = NULL;
 #define IDC_CLIENT_EDIT_SURFACE 205
 #define IDC_CLIENT_EDIT 206
 #define IDC_BTN_RESTORE_TABS 207
+#define IDC_BTN_CLOSE_ALL 209
+constexpr UINT_PTR kCloseAllCheckTimer = 209;
 
 // Config menu command IDs
 #define IDM_CTX_SET_PROFILE_ICON 41001
@@ -493,6 +504,7 @@ IShellLink *shellLink = NULL;
 #define IDM_CTX_ARCHIVED_CLIENTS 41014
 #define IDM_CTX_CREATE_SHORTCUT 41015
 #define IDM_CTX_CLIENT_TITLE_FIRST 41016
+#define IDM_CTX_CLIENT_NOTES 41020
 #define IDM_GUIDED_WALKTHROUGH 41017
 #define IDM_WHATS_NEW 41018
 #define IDM_BROWSER_EDGE 42001
@@ -558,6 +570,13 @@ void GuiProfExportAll();
 void GuiProfRestoreAll();
 void GuiRemoveIcon();
 static std::wstring GetSelectedClientNameSanitized(bool preferListSelection);
+static std::wstring GetClientInputText();
+static void SetClientInputText(const std::wstring &text);
+static bool SyncClientInputFromComboSelection(bool selectAll);
+static void FilterClientList(const std::wstring &query, bool showResults);
+static void UpdateCloseAllButtonState();
+static void RequestCloseAllClientsNormally();
+static bool IsStandardClientSession(const Session &session);
 static void LoadPinnedClients();
 static bool SavePinnedClients();
 static void PrunePinnedClients();
@@ -2366,26 +2385,43 @@ static LRESULT CALLBACK ClientEditSubclassProc(HWND hWnd, UINT msg,
           SendMessageW(g_hComboClient, CB_GETDROPPEDSTATE, 0, 0) != 0;
       if (wParam == VK_F4 ||
           (wParam == VK_DOWN && (GetKeyState(VK_MENU) & 0x8000))) {
+        g_bClientListNavigated = false;
+        if (dropped)
+          g_bSuppressClientSelectionCommit = true;
         SendMessageW(g_hComboClient, CB_SHOWDROPDOWN, !dropped, 0);
+        g_bSuppressClientSelectionCommit = false;
         return 0;
       }
       if (wParam == VK_DOWN || wParam == VK_UP) {
         if (!dropped)
           SendMessageW(g_hComboClient, CB_SHOWDROPDOWN, TRUE, 0);
+        g_bClientListNavigated = true;
         SendMessageW(g_hComboClient, WM_KEYDOWN, wParam, lParam);
         return 0;
       }
       if (wParam == VK_RETURN) {
-        if (dropped) {
-          SendMessageW(g_hComboClient, WM_KEYDOWN, wParam, lParam);
-        } else if (g_hGui) {
+        if (dropped && g_bClientListNavigated)
+          SyncClientInputFromComboSelection(true);
+        g_bClientListNavigated = false;
+        // Closing the native combo can emit SELENDOK for a highlighted row.
+        // This Return belongs to the edit unless an arrow selection was
+        // explicitly accepted above.
+        g_bSuppressClientSelectionCommit = true;
+        const std::wstring requestedName = GetClientInputText();
+        if (dropped)
+          SendMessageW(g_hComboClient, CB_SHOWDROPDOWN, FALSE, 0);
+        SetClientInputText(requestedName);
+        if (g_hGui) {
           PostMessageW(g_hGui, WM_COMMAND, MAKEWPARAM(IDOK, BN_CLICKED),
                        (LPARAM)g_hBtnGo);
         }
         return 0;
       }
       if (wParam == VK_ESCAPE && dropped) {
+        g_bClientListNavigated = false;
+        g_bSuppressClientSelectionCommit = true;
         SendMessageW(g_hComboClient, CB_SHOWDROPDOWN, FALSE, 0);
+        g_bSuppressClientSelectionCommit = false;
         return 0;
       }
     }
@@ -3517,6 +3553,7 @@ inline void EnsureMouseVisible();
 inline void FocusClientEdit();
 static void ShowAboutDialog();
 static void ShowThemeDialog();
+static void ShowClientNotes(const std::wstring &clientName);
 static INT_PTR CALLBACK ThemeDlgProc(HWND hDlg, UINT msg, WPARAM wParam,
                                      LPARAM lParam);
 static HBRUSH HandleThemeCtlColor(UINT msg, HDC hdc, HWND hCtl);
@@ -3592,11 +3629,34 @@ static bool SyncClientInputFromComboSelection(bool selectAll) {
   return true;
 }
 
+static void FilterClientList(const std::wstring &query, bool showResults) {
+  if (!g_hComboClient || g_bFilteringClientList)
+    return;
+  g_bFilteringClientList = true;
+  const bool wasSyncing = g_bSyncingClientInput;
+  g_bSyncingClientInput = true;
+  SendMessageW(g_hComboClient, CB_SHOWDROPDOWN, FALSE, 0);
+  SendMessageW(g_hComboClient, CB_RESETCONTENT, 0, 0);
+  for (const auto &name : g_allClientNames) {
+    if (query.empty() || StrStrIW(name.c_str(), query.c_str()))
+      SendMessageW(g_hComboClient, CB_ADDSTRING, 0, (LPARAM)name.c_str());
+  }
+  SendMessageW(g_hComboClient, CB_SETCURSEL, (WPARAM)-1, 0);
+  g_bSyncingClientInput = wasSyncing;
+  g_bFilteringClientList = false;
+  if (showResults && !query.empty() &&
+      SendMessageW(g_hComboClient, CB_GETCOUNT, 0, 0) > 0) {
+    SendMessageW(g_hComboClient, CB_SHOWDROPDOWN, TRUE, 0);
+    EnsureMouseVisible();
+  }
+}
+
 static void HandleClientInputChanged() {
-  if (g_bSyncingClientInput || !g_hComboClient)
+  if (g_bSyncingClientInput || g_bFilteringClientList || !g_hComboClient)
     return;
 
   SwitchToLaunchModeForInput();
+  g_bClientListNavigated = false;
   const std::wstring currentText = GetClientInputText();
   bool hasInvalidChar = false;
   for (wchar_t c : currentText) {
@@ -3604,20 +3664,6 @@ static void HandleClientInputChanged() {
       hasInvalidChar = true;
       break;
     }
-  }
-
-  if (GetAsyncKeyState(VK_BACK) & 0x8000 ||
-      GetAsyncKeyState(VK_DELETE) & 0x8000) {
-    if (!hasInvalidChar) {
-      g_sLastValidComboText = currentText;
-      TOOLINFOW tip{sizeof(TOOLINFOW)};
-      tip.hwnd = g_hGui;
-      tip.uId = (UINT_PTR)g_hComboClient;
-      SendMessageW(g_hValidationTooltip, TTM_TRACKACTIVATE, FALSE,
-                   (LPARAM)&tip);
-    }
-    UpdateIconPreviewForSelection(false);
-    return;
   }
 
   if (hasInvalidChar) {
@@ -3651,48 +3697,9 @@ static void HandleClientInputChanged() {
   tip.uId = (UINT_PTR)g_hComboClient;
   SendMessageW(g_hValidationTooltip, TTM_TRACKACTIVATE, FALSE, (LPARAM)&tip);
 
-  if (currentText.empty()) {
-    SendMessageW(g_hComboClient, CB_SETCURSEL, (WPARAM)-1, 0);
-    SendMessageW(g_hComboClient, CB_SHOWDROPDOWN, FALSE, 0);
-    UpdateIconPreviewForSelection(false);
-    return;
-  }
-
-  int caseInsensitiveMatch = -1;
-  int caseSensitiveMatch = -1;
-  wchar_t listText[512]{};
-  const int count = (int)SendMessageW(g_hComboClient, CB_GETCOUNT, 0, 0);
-  for (int i = 0; i < count; ++i) {
-    SendMessageW(g_hComboClient, CB_GETLBTEXT, i, (LPARAM)listText);
-    const std::wstring item = listText;
-    if (caseSensitiveMatch == -1 && item.size() >= currentText.size() &&
-        item.compare(0, currentText.size(), currentText) == 0) {
-      caseSensitiveMatch = i;
-      break;
-    }
-    if (caseInsensitiveMatch == -1 && item.size() >= currentText.size() &&
-        _wcsnicmp(item.c_str(), currentText.c_str(), currentText.size()) == 0) {
-      caseInsensitiveMatch = i;
-    }
-  }
-
-  if (caseSensitiveMatch != -1) {
-    SendMessageW(g_hComboClient, CB_GETLBTEXT, caseSensitiveMatch,
-                 (LPARAM)listText);
-    SendMessageW(g_hComboClient, CB_SETCURSEL, caseSensitiveMatch, 0);
-    SendMessageW(g_hComboClient, CB_SHOWDROPDOWN, TRUE, 0);
-    EnsureMouseVisible();
-    SetClientInputText(listText);
-  } else if (caseInsensitiveMatch != -1) {
-    SendMessageW(g_hComboClient, CB_SETCURSEL, caseInsensitiveMatch, 0);
-    SendMessageW(g_hComboClient, CB_SHOWDROPDOWN, TRUE, 0);
-    EnsureMouseVisible();
-  } else {
-    SendMessageW(g_hComboClient, CB_SETCURSEL, (WPARAM)-1, 0);
-    SendMessageW(g_hComboClient, CB_SHOWDROPDOWN, FALSE, 0);
-  }
-
-  SetClientInputSelection((int)currentText.length(), -1);
+  // The edit is a separate child over the combo. Rebuilding the filtered list
+  // does not replace the query or disturb a paste, IME commit, or caret edit.
+  FilterClientList(currentText, true);
   UpdateIconPreviewForSelection(false);
 }
 
@@ -4957,6 +4964,14 @@ BOOL InitInstance(HINSTANCE hInstance, int nCmdShow) {
         (LPWSTR)L"Reopen this client's tabs next time. Sign-ins and profile "
                  L"data stay saved when this is off.");
   }
+  g_hBtnCloseAll = CreateWindowW(
+      L"BUTTON", L"Close all", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
+      ScaleByDpi(1, dpi), ScaleByDpi(1, dpi), ScaleByDpi(84, dpi),
+      ScaleByDpi(26, dpi), g_hGui,
+      (HMENU)(INT_PTR)IDC_BTN_CLOSE_ALL, hInstance, nullptr);
+  if (g_hBtnCloseAll)
+    CreateToolTip(g_hBtnCloseAll, g_hGui,
+                  (LPWSTR)L"Close open client browsers and keep ctSpaces open");
   // HWND
   // hToolTip=CreateWindowEx(0,TOOLTIPS_CLASS,NULL,TTS_ALWAYSTIP|TTS_NOPREFIX,CW_USEDEFAULT,CW_USEDEFAULT,CW_USEDEFAULT,CW_USEDEFAULT,g_hGui,NULL,g_hInst,NULL);
   RECT rc{};
@@ -4973,7 +4988,7 @@ BOOL InitInstance(HINSTANCE hInstance, int nCmdShow) {
   if (!hPrompt || !g_hValidationTooltip || !g_hComboClient ||
       !g_hClientEditSurface || !g_hClientEdit || !g_hBtnClientIcon ||
       !g_hBtnClientDrop || !g_hBtnGo || !g_hBtnPin ||
-      !g_hBtnRestoreTabs || !g_hBtnConfig || !g_hBtnTmpProf) {
+      !g_hBtnRestoreTabs || !g_hBtnCloseAll || !g_hBtnConfig || !g_hBtnTmpProf) {
     std::vector<std::wstring> missingControls;
     const auto recordMissing = [&missingControls](HWND control,
                                                    const wchar_t *name) {
@@ -4990,6 +5005,7 @@ BOOL InitInstance(HINSTANCE hInstance, int nCmdShow) {
     recordMissing(g_hBtnGo, L"Open button");
     recordMissing(g_hBtnPin, L"pin button");
     recordMissing(g_hBtnRestoreTabs, L"restore-tabs button");
+    recordMissing(g_hBtnCloseAll, L"Close all button");
     recordMissing(g_hBtnConfig, L"options button");
     recordMissing(g_hBtnTmpProf, L"temporary-profile button");
     g_sStartupInitFailure = L"Missing required control(s): ";
@@ -5039,6 +5055,8 @@ BOOL InitInstance(HINSTANCE hInstance, int nCmdShow) {
     SetWindowSubclass(g_hBtnClientDrop, ButtonHotSubclassProc, 1, 0);
   if (g_hBtnRestoreTabs)
     SetWindowSubclass(g_hBtnRestoreTabs, ButtonHotSubclassProc, 1, 0);
+  if (g_hBtnCloseAll)
+    SetWindowSubclass(g_hBtnCloseAll, ButtonHotSubclassProc, 1, 0);
   if (g_hComboClient) {
     ApplyComboTheme(g_hComboClient);
     UpdateComboBoxMetrics(dpi);
@@ -5076,6 +5094,7 @@ BOOL InitInstance(HINSTANCE hInstance, int nCmdShow) {
     SendMessageW(g_hClientEdit, WM_SETFONT, (WPARAM)g_hFontClient, TRUE);
   LayoutClientComboChildren(g_hComboClient);
   UpdateClientsComboBox();
+  UpdateCloseAllButtonState();
   ApplyTheme(g_iThemeMode, false);
   FocusClientEdit();
   ShowWindow(g_hGui, nCmdShow);
@@ -5103,7 +5122,8 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam,
       ++length;
     if (length == capacity)
       return FALSE;
-    if (g_bCleanupBusy.load()) {
+    if (g_bCleanupBusy.load() || g_bClientNotesBusy.load() ||
+        g_bCloseAllClientsPending) {
       if (g_hCleanupScanDialog && IsWindow(g_hCleanupScanDialog)) {
         ShowWindow(g_hCleanupScanDialog, SW_RESTORE);
         SetForegroundWindow(g_hCleanupScanDialog);
@@ -5128,7 +5148,8 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam,
                : FALSE;
   }
   case WM_COMMAND: {
-    if (g_bCleanupBusy.load()) {
+    if (g_bCleanupBusy.load() || g_bClientNotesBusy.load() ||
+        g_bCloseAllClientsPending) {
       MessageBeep(MB_ICONINFORMATION);
       return 0;
     }
@@ -5179,22 +5200,26 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam,
         return 0;
       }
       if (wmEvent == CBN_SELCHANGE) {
-        SwitchToLaunchModeForInput();
-        SyncClientInputFromComboSelection(false);
-        UpdateIconPreviewForSelection(true);
+        // Arrow navigation previews a row without replacing the typed query.
         return 0;
       }
       if (wmEvent == CBN_SELENDOK) {
+        if (g_bSuppressClientSelectionCommit)
+          return 0;
         SwitchToLaunchModeForInput();
         SyncClientInputFromComboSelection(true);
+        g_bClientListNavigated = false;
         FocusClientEdit();
         UpdateIconPreviewForSelection(true);
         return 0;
       }
       if (wmEvent == CBN_CLOSEUP) {
-        SyncClientInputFromComboSelection(true);
-        UpdateIconPreviewForSelection(true);
+        g_bClientListNavigated = false;
         QueueClientSelectorRestack();
+        return 0;
+      }
+      if (wmEvent == CBN_SELENDCANCEL) {
+        g_bClientListNavigated = false;
         return 0;
       }
       if (wmEvent == CBN_KILLFOCUS) {
@@ -5202,6 +5227,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam,
         return 0;
       }
     } else if (wmId == IDOK) {
+      g_bSuppressClientSelectionCommit = false;
       if (g_iSelectedSessionTab > 0 &&
           g_iSelectedSessionTab <= (int)g_sessions.size()) {
         BringSessionToFront(g_sessions[g_iSelectedSessionTab - 1].pid);
@@ -5223,6 +5249,8 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam,
       ToggleSelectedClientPin();
     } else if (wmId == IDC_BTN_RESTORE_TABS && wmEvent == BN_CLICKED) {
       ToggleRestoreTabsForSelectedClient();
+    } else if (wmId == IDC_BTN_CLOSE_ALL && wmEvent == BN_CLICKED) {
+      RequestCloseAllClientsNormally();
     } else if (wmId == IDC_BTN_CONFIG && wmEvent == BN_CLICKED) {
       UINT cmd = ShowConfigMenuFromButton(hWnd);
       if (cmd)
@@ -5241,6 +5269,8 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam,
       GuiCleanupInactiveClients(true);
     } else if (wmId == IDM_CTX_RENAME_PROFILE) {
       GuiRenameClient();
+    } else if (wmId == IDM_CTX_CLIENT_NOTES) {
+      ShowClientNotes(GetSelectedClientNameSanitized(false));
     } else if (wmId == IDM_CTX_ARCHIVE_PROFILE) {
       GuiArchiveClient();
     } else if (wmId == IDM_CTX_ARCHIVED_CLIENTS) {
@@ -5543,6 +5573,12 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam,
   case WM_APP_PROFILE_EXITED: {
     std::unique_ptr<ProfileExitPayload> payload(
         reinterpret_cast<ProfileExitPayload *>(lParam));
+    if (payload && g_bClientNotesBusy.load()) {
+      // A Default editor close can open a save prompt. Keep lifecycle work
+      // owned until the notes modal ends instead of stacking owner dialogs.
+      g_notesDeferredExits.push_back(std::move(payload));
+      return 0;
+    }
     if (payload)
       HandleProfileExitOnUiThread(*payload);
     return 0;
@@ -5719,7 +5755,27 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam,
         L"Exit ctSpaces", MB_OK | MB_ICONWARNING);
     return 0;
   }
+  case WM_TIMER:
+    if (wParam == kCloseAllCheckTimer) {
+      KillTimer(hWnd, kCloseAllCheckTimer);
+      g_bCloseAllClientsPending = false;
+      SetWindowTextW(g_hBtnCloseAll, L"Close all");
+      SetUiState(true);
+      if (std::ranges::any_of(g_sessions, IsStandardClientSession)) {
+        MessageBoxW(hWnd,
+                    L"One or more client browsers are still open. A browser "
+                    L"may be waiting for you to confirm closing a page. "
+                    L"ctSpaces left those browsers running.",
+                    L"Close all clients", MB_OK | MB_ICONINFORMATION);
+      }
+      return 0;
+    }
+    break;
   case WM_CLOSE: {
+    if (g_bClientNotesBusy.load() || g_bCloseAllClientsPending) {
+      MessageBeep(MB_ICONINFORMATION);
+      return 0;
+    }
     if (g_bCleanupBusy.load()) {
       if (g_hCleanupScanDialog && IsWindow(g_hCleanupScanDialog)) {
         PostMessageW(g_hCleanupScanDialog, WM_CLOSE, 0, 0);
@@ -5770,7 +5826,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam,
     return 0;
   }
   case WM_QUERYENDSESSION:
-    if (g_bCleanupBusy.load()) {
+    if (g_bCleanupBusy.load() || g_bClientNotesBusy.load()) {
       if (g_hCleanupScanDialog && IsWindow(g_hCleanupScanDialog))
         PostMessageW(g_hCleanupScanDialog, WM_CLOSE, 0, 0);
       return FALSE;
@@ -8552,7 +8608,6 @@ DWORD LaunchProfile(const std::wstring &clientName, bool isTemp,
 }
 
 void UpdateClientsComboBox() {
-  SendMessage(g_hComboClient, CB_RESETCONTENT, 0, 0);
   PruneArchivedClients();
   fs::path sitesDir = g_sDataDir / "Sites";
   std::vector<std::wstring> clientNames;
@@ -8574,8 +8629,8 @@ void UpdateClientsComboBox() {
   } catch (...) {
   }
   std::sort(clientNames.begin(), clientNames.end(), CaseInsensitiveLess{});
-  for (const auto &clientName : clientNames)
-    SendMessageW(g_hComboClient, CB_ADDSTRING, 0, (LPARAM)clientName.c_str());
+  g_allClientNames = std::move(clientNames);
+  FilterClientList(L"", false);
 
   const bool hadPinnedClients = !g_pinnedClients.empty();
   PrunePinnedClients();
@@ -11537,7 +11592,8 @@ void SetUiState(bool enabled) {
   // is only safe when every operation that owns the disabled main UI has
   // finished.
   enabled = enabled && !g_bDefaultProfileUiBusy &&
-            !g_isLaunchInFlight.load() && !g_bCleanupBusy.load();
+            !g_isLaunchInFlight.load() && !g_bCleanupBusy.load() &&
+            !g_bClientNotesBusy.load() && !g_bCloseAllClientsPending;
   g_bUiEnabled = enabled;
   EnableWindow(g_hComboClient, enabled);
   EnableWindow(g_hClientEdit, enabled);
@@ -11551,6 +11607,7 @@ void SetUiState(bool enabled) {
   InvalidateRect(g_hClientEditSurface, nullptr, TRUE);
   UpdatePinButtonState();
   UpdateRestoreTabsToggleState();
+  UpdateCloseAllButtonState();
 
   if (enabled)
     FocusClientEdit();
@@ -15737,7 +15794,8 @@ static void ApplyCleanupDialogTheme(HWND dialog) {
       g_themedPopups.push_back(dialog);
   }
   for (const int id : {IDC_INACTIVE_LIST, IDC_CLEANUP_RESULT_TEXT,
-                       IDC_GUIDE_TOPICS, IDC_GUIDE_BODY}) {
+                       IDC_GUIDE_TOPICS, IDC_GUIDE_BODY,
+                       IDC_CLIENT_NOTES_TEXT}) {
     HWND control = GetDlgItem(dialog, id);
     if (!control)
       continue;
@@ -15790,7 +15848,8 @@ static std::optional<INT_PTR> HandleCleanupDialogTheme(
     GetClientRect(dialog, &rect);
     FillRect(reinterpret_cast<HDC>(wParam), &rect, g_hbrThemeWindow);
     for (const int id : {IDC_INACTIVE_LIST, IDC_CLEANUP_RESULT_TEXT,
-                         IDC_GUIDE_TOPICS, IDC_GUIDE_BODY}) {
+                         IDC_GUIDE_TOPICS, IDC_GUIDE_BODY,
+                         IDC_CLIENT_NOTES_TEXT}) {
       HWND control = GetDlgItem(dialog, id);
       RECT border{};
       if (!control || !GetWindowRect(control, &border))
@@ -15896,6 +15955,197 @@ static std::optional<INT_PTR> HandleCleanupDialogTheme(
   }
   }
   return std::nullopt;
+}
+
+struct ClientNotesDialogState {
+  std::wstring clientName;
+  fs::path clientRoot;
+  client_notes::ReadResult original;
+};
+
+static bool GetClientNotesDraft(HWND dialog, std::wstring &text) {
+  HWND edit = GetDlgItem(dialog, IDC_CLIENT_NOTES_TEXT);
+  if (!edit)
+    return false;
+  const int length = GetWindowTextLengthW(edit);
+  if (length < 0 || length > static_cast<int>(client_notes::kMaxBytes))
+    return false;
+  text.resize(static_cast<size_t>(length) + 1);
+  const int copied = GetWindowTextW(edit, text.data(), length + 1);
+  if (copied != length)
+    return false;
+  text.resize(static_cast<size_t>(copied));
+  return true;
+}
+
+static bool SaveClientNotesDraft(HWND dialog, ClientNotesDialogState &state) {
+  if (!SendDlgItemMessageW(dialog, IDC_CLIENT_NOTES_TEXT, EM_GETMODIFY, 0, 0)) {
+    EndDialog(dialog, IDOK);
+    return true;
+  }
+  std::wstring draft;
+  if (!GetClientNotesDraft(dialog, draft)) {
+    MessageBoxW(dialog, L"The note is too long to save. Shorten it and try again.",
+                L"Client Notes", MB_OK | MB_ICONWARNING);
+    return false;
+  }
+  if (draft == state.original.text) {
+    EndDialog(dialog, IDOK);
+    return true;
+  }
+  const auto safeClient = [&]() {
+    return RevalidateSafeClientContainerPath(state.clientName,
+                                             state.clientRoot) &&
+           IsExistingClientProfile(state.clientName) &&
+           !IsClientArchived(state.clientName);
+  };
+  if (!safeClient() ||
+      !client_notes::Write(state.clientRoot, draft, state.original, safeClient)) {
+    MessageBoxW(dialog,
+                L"The note could not be saved safely. It may have changed on "
+                L"disk, or the client folder may be unavailable. Your text "
+                L"is still here; copy it or try saving again.",
+                L"Client Notes", MB_OK | MB_ICONWARNING);
+    return false;
+  }
+  EndDialog(dialog, IDOK);
+  return true;
+}
+
+static void CloseClientNotesDialog(HWND dialog,
+                                   ClientNotesDialogState &state) {
+  if (!SendDlgItemMessageW(dialog, IDC_CLIENT_NOTES_TEXT, EM_GETMODIFY, 0, 0)) {
+    EndDialog(dialog, IDCANCEL);
+    return;
+  }
+  std::wstring draft;
+  if (!GetClientNotesDraft(dialog, draft)) {
+    MessageBoxW(dialog, L"The note could not be read. Copy your text before "
+                        L"closing this window.",
+                L"Client Notes", MB_OK | MB_ICONWARNING);
+    return;
+  }
+  if (draft == state.original.text) {
+    EndDialog(dialog, IDCANCEL);
+    return;
+  }
+  const int choice = MessageBoxW(dialog,
+                                L"Save changes to this client's notes?",
+                                L"Client Notes", MB_YESNOCANCEL |
+                                                     MB_ICONQUESTION);
+  if (choice == IDYES)
+    SaveClientNotesDraft(dialog, state);
+  else if (choice == IDNO)
+    EndDialog(dialog, IDCANCEL);
+}
+
+static INT_PTR CALLBACK ClientNotesDlgProc(HWND dialog, UINT message,
+                                            WPARAM wParam, LPARAM lParam) {
+  auto *state = reinterpret_cast<ClientNotesDialogState *>(
+      GetWindowLongPtrW(dialog, DWLP_USER));
+  if (message == WM_INITDIALOG) {
+    state = reinterpret_cast<ClientNotesDialogState *>(lParam);
+    SetWindowLongPtrW(dialog, DWLP_USER, lParam);
+    if (!state)
+      return FALSE;
+    const std::wstring title = L"Client Notes: " + state->clientName;
+    SetWindowTextW(dialog, title.c_str());
+    HWND edit = GetDlgItem(dialog, IDC_CLIENT_NOTES_TEXT);
+    SendMessageW(edit, EM_LIMITTEXT, client_notes::kMaxBytes, 0);
+    SetWindowTextW(edit, state->original.text.c_str());
+    SendMessageW(edit, EM_SETMODIFY, FALSE, 0);
+    ApplyCleanupDialogTheme(dialog);
+    SetFocus(edit);
+    return FALSE;
+  }
+  if (const auto themed = HandleCleanupDialogTheme(dialog, message, wParam,
+                                                   lParam))
+    return *themed;
+  if (!state)
+    return FALSE;
+  switch (message) {
+  case WM_GETMINMAXINFO: {
+    auto *limits = reinterpret_cast<MINMAXINFO *>(lParam);
+    limits->ptMinTrackSize.x = ScaleByDpi(390, GetDpiForWindow(dialog));
+    limits->ptMinTrackSize.y = ScaleByDpi(290, GetDpiForWindow(dialog));
+    return TRUE;
+  }
+  case WM_SIZE: {
+    RECT area{};
+    GetClientRect(dialog, &area);
+    const UINT dpi = GetDpiForWindow(dialog);
+    const int margin = ScaleByDpi(12, dpi);
+    const int buttonWidth = ScaleByDpi(68, dpi);
+    const int buttonHeight = ScaleByDpi(23, dpi);
+    const int gap = ScaleByDpi(6, dpi);
+    const int buttonTop = area.bottom - margin - buttonHeight;
+    const int cancelLeft = area.right - margin - buttonWidth;
+    SetWindowPos(GetDlgItem(dialog, IDC_CLIENT_NOTES_TEXT), nullptr, margin,
+                 margin, area.right - 2 * margin,
+                 buttonTop - gap - margin,
+                 SWP_NOZORDER | SWP_NOACTIVATE);
+    SetWindowPos(GetDlgItem(dialog, IDOK), nullptr,
+                 cancelLeft - gap - buttonWidth, buttonTop,
+                 buttonWidth, buttonHeight, SWP_NOZORDER | SWP_NOACTIVATE);
+    SetWindowPos(GetDlgItem(dialog, IDCANCEL), nullptr,
+                 cancelLeft, buttonTop, buttonWidth, buttonHeight,
+                 SWP_NOZORDER | SWP_NOACTIVATE);
+    InvalidateRect(dialog, nullptr, TRUE);
+    return TRUE;
+  }
+  case WM_COMMAND:
+    if (LOWORD(wParam) == IDOK) {
+      SaveClientNotesDraft(dialog, *state);
+      return TRUE;
+    }
+    if (LOWORD(wParam) == IDCANCEL) {
+      CloseClientNotesDialog(dialog, *state);
+      return TRUE;
+    }
+    break;
+  case WM_CLOSE:
+    CloseClientNotesDialog(dialog, *state);
+    return TRUE;
+  }
+  return FALSE;
+}
+
+static void ShowClientNotes(const std::wstring &clientName) {
+  if (!g_bUiEnabled || g_bClientNotesBusy.load())
+    return;
+  fs::path clientRoot;
+  if (!IsExistingClientProfile(clientName) || IsClientArchived(clientName) ||
+      !TryGetSafeClientProfilePath(clientName, clientRoot) ||
+      !RevalidateSafeClientContainerPath(clientName, clientRoot)) {
+    MessageBoxW(g_hGui, L"Select an existing client first.", L"Client Notes",
+                MB_OK | MB_ICONINFORMATION);
+    return;
+  }
+  ClientNotesDialogState state{clientName, clientRoot,
+                               client_notes::Read(clientRoot)};
+  if (state.original.status == client_notes::ReadStatus::Error ||
+      !RevalidateSafeClientContainerPath(clientName, clientRoot)) {
+    MessageBoxW(g_hGui,
+                L"The client's notes could not be read safely. Check the "
+                L"client folder before editing them.",
+                L"Client Notes", MB_OK | MB_ICONWARNING);
+    return;
+  }
+  g_bClientNotesBusy.store(true);
+  SetUiState(false);
+  const INT_PTR result = DialogBoxParamW(g_hInst,
+                                          MAKEINTRESOURCEW(IDD_CLIENT_NOTES),
+                                          g_hGui, ClientNotesDlgProc,
+                                          reinterpret_cast<LPARAM>(&state));
+  g_bClientNotesBusy.store(false);
+  auto deferredExits = std::move(g_notesDeferredExits);
+  g_notesDeferredExits.clear();
+  for (const auto &payload : deferredExits)
+    HandleProfileExitOnUiThread(*payload);
+  SetUiState(true);
+  if (result == -1)
+    MessageBoxW(g_hGui, L"The notes window could not be opened.",
+                L"Client Notes", MB_OK | MB_ICONWARNING);
 }
 
 static LRESULT CALLBACK MessageButtonThemeSubclass(HWND window, UINT message,
@@ -17511,6 +17761,7 @@ enum class QuickTourTarget {
   PrimaryAction,
   PinnedClients,
   SessionTabs,
+  CloseAll,
   ClientIcon,
   RestoreTabs,
   Temporary,
@@ -17531,6 +17782,7 @@ enum class QuickTourDemo {
   RenameClient,
   ArchiveRestore,
   ClientFirstTitles,
+  ClientNotes,
 };
 
 struct QuickTourStep {
@@ -17540,10 +17792,15 @@ struct QuickTourStep {
   QuickTourDemo demo = QuickTourDemo::None;
 };
 
-static constexpr std::array<QuickTourStep, 20> kQuickTourSteps{{
+static constexpr std::array<QuickTourStep, 23> kQuickTourSteps{{
     {L"Choose or name a client",
      L"Use the CLIENT field to choose an existing client or type a new name. "
      L"The tour only points to controls; it never changes this field.",
+     QuickTourTarget::ClientField},
+    {L"Find clients while typing",
+     L"Type part of an existing name to narrow the CLIENT choices. Browsing "
+     L"matches keeps your typed text until you choose one. The tour does not "
+     L"type, select, or create a client.",
      QuickTourTarget::ClientField},
     {L"Choose a browser",
      L"The browser selector chooses Edge, Chrome, Brave, or Firefox for the "
@@ -17582,6 +17839,12 @@ static constexpr std::array<QuickTourStep, 20> kQuickTourSteps{{
      L"Open client windows appear as tabs across the top. Select a tab to show "
      L"its window, use x to close it normally, or use overflow for extra tabs.",
      QuickTourTarget::SessionTabs},
+    {L"Close all browser sessions",
+     L"After confirmation, Close all asks tracked client browsers to close "
+     L"normally while ctSpaces stays open. Temporary and Default editor "
+     L"windows stay open. A browser that refuses remains in the session "
+     L"tabs. The tour never presses the button.",
+     QuickTourTarget::CloseAll},
     {L"Reorder session tabs",
      L"Drag open-session tabs left or right to organize the current launcher "
      L"run. Session-tab order is not saved for the next ctSpaces launch.",
@@ -17616,6 +17879,12 @@ static constexpr std::array<QuickTourStep, 20> kQuickTourSteps{{
      L"Client name first in window titles prefixes supported browser and Alt+Tab "
      L"titles, including supported windows already open, so clients are easier to identify.",
      QuickTourTarget::Options, QuickTourDemo::ClientFirstTitles},
+    {L"Keep Client Notes",
+     L"Select an existing client, then use Settings > Client Notes or open "
+     L"its pin menu. Save keeps local notes; leaving with edits offers Save, "
+     L"Discard, and Cancel. "
+     L"This illustration does not open or edit notes.",
+     QuickTourTarget::Options, QuickTourDemo::ClientNotes},
     {L"Clean up inactive clients",
      L"Options can preview clients not opened for three calendar months. Unknown "
      L"history begins a fresh tracking period. Archived clients can appear; "
@@ -17749,6 +18018,8 @@ static bool GetQuickTourTargetRect(QuickTourTarget target, RECT &rect) {
         return true;
     }
     return MainClientRectToScreen(g_rcSessionTabs, rect);
+  case QuickTourTarget::CloseAll:
+    return QuickTourWindowRect(g_hBtnCloseAll, rect);
   case QuickTourTarget::ClientIcon:
     if (QuickTourWindowRect(g_hBtnClientIcon, rect))
       return true;
@@ -17890,6 +18161,10 @@ static const wchar_t *QuickTourDemoAccessibleText(QuickTourDemo demo) {
   case QuickTourDemo::ClientFirstTitles:
     return L"Illustration only \u2014 no actions performed. Options > Client name "
            L"first in window titles. Example: Client A \u2014 Browser.";
+  case QuickTourDemo::ClientNotes:
+    return L"Illustration only: no actions performed. Select Client A, "
+           L"then Settings > Client Notes or open its pin menu. Save keeps "
+           L"local notes; leaving with edits offers Save, Discard, and Cancel.";
   case QuickTourDemo::None:
     return L"";
   }
@@ -18126,6 +18401,10 @@ static void DrawQuickTourDemo(const DRAWITEMSTRUCT &draw) {
   case QuickTourDemo::ClientFirstTitles:
     drawOptionFlow(L"Client name first in window titles",
                    L"Client A \u2014 Browser\r\nEasier to identify in the window and Alt+Tab");
+    break;
+  case QuickTourDemo::ClientNotes:
+    drawOptionFlow(L"Settings > Client Notes",
+                   L"Selected existing client\r\nSave local notes or Cancel edits");
     break;
   case QuickTourDemo::None:
     break;
@@ -18977,6 +19256,7 @@ static void EnsureConfigMenu(HWND hWnd) {
     const wchar_t *aTexts[] = {L"Set Profile Icon",
                                L"Create Desktop Shortcut (New)",
                                L"Rename Client (New)",
+                               L"Client Notes",
                                L"Archive Client (New)",
                                L"Archived Clients (New)",
                                L"Refresh Profile",
@@ -19029,6 +19309,7 @@ static void EnsureConfigMenu(HWND hWnd) {
   addItem(IDM_CTX_CREATE_SHORTCUT, L"Create Desktop Shortcut", iIcoAbout);
   MenuAddSep(g_hConfigMenu);
   addItem(IDM_CTX_RENAME_PROFILE, L"Rename Client", iIcoEdit);
+  addItem(IDM_CTX_CLIENT_NOTES, L"Client Notes", iIcoEdit);
   addItem(IDM_CTX_ARCHIVE_PROFILE, L"Archive Client", iIcoAbout);
   addItem(IDM_CTX_RESET_PROFILE, L"Reset (Nuke)", iIcoReset);
   addItem(IDM_CTX_VACUUM_PROFILE, L"Vacuum (Clear Cache)", iIcoVacuum);
@@ -19584,6 +19865,8 @@ static void EnsureMenuTooltips(HWND hWnd) {
       L"Create a customer-icon shortcut for this client on the desktop.";
   g_menuTipText[IDM_CTX_RENAME_PROFILE] =
       L"Rename this closed client while keeping its profile data.";
+  g_menuTipText[IDM_CTX_CLIENT_NOTES] =
+      L"Edit notes stored with this client.";
   g_menuTipText[IDM_CTX_ARCHIVE_PROFILE] =
       L"Hide this closed client without deleting its profile.";
   g_menuTipText[IDM_CTX_ARCHIVED_CLIENTS] =
@@ -19680,6 +19963,7 @@ static void UpdateConfigMenuEnabledState() {
   en(IDM_CTX_REMOVE_ICON, hasCustomIcon);
   en(IDM_CTX_CREATE_SHORTCUT, hasExistingClient);
   en(IDM_CTX_RENAME_PROFILE, selectedClientIsClosed);
+  en(IDM_CTX_CLIENT_NOTES, hasExistingClient);
   en(IDM_CTX_ARCHIVE_PROFILE, selectedClientIsClosed);
   en(IDM_CTX_RESET_PROFILE, selectedClientIsClosed);
   en(IDM_CTX_VACUUM_PROFILE, selectedClientIsClosed);
@@ -19943,6 +20227,8 @@ static void ShowPinnedClientOptionsMenu(HWND hWnd,
   restoreData.text = L"Restore tabs";
   MenuItemData shortcutData;
   shortcutData.text = L"Create desktop shortcut";
+  MenuItemData notesData;
+  notesData.text = L"Client Notes";
   const auto clipboardUrl = GetClipboardWebUrl();
 
   auto addItem = [&](UINT id, MenuItemData &data, bool checked = false,
@@ -19971,6 +20257,7 @@ static void ShowPinnedClientOptionsMenu(HWND hWnd,
   constexpr UINT commandRestoreTabs = 47102;
   constexpr UINT commandOpenClipboard = 47103;
   constexpr UINT commandCreateShortcut = 47104;
+  constexpr UINT commandClientNotes = 47105;
   addItem(commandSelect, selectData);
   addItem(commandOpen, openData);
   addItem(commandOpenClipboard, openClipboardData, false,
@@ -19979,6 +20266,7 @@ static void ShowPinnedClientOptionsMenu(HWND hWnd,
   addItem(commandRestoreTabs, restoreData,
           ShouldRestoreTabsForClient(clientName, g_selectedBrowser));
   addItem(commandCreateShortcut, shortcutData);
+  addItem(commandClientNotes, notesData);
 
   const int previousMenuMinWidth = g_iMenuMinWidth;
   g_iMenuMinWidth = 0;
@@ -20002,6 +20290,8 @@ static void ShowPinnedClientOptionsMenu(HWND hWnd,
     ToggleRestoreTabsForSelectedClient();
   } else if (command == commandCreateShortcut) {
     CreateClientDesktopShortcut(clientName, g_selectedBrowser);
+  } else if (command == commandClientNotes) {
+    ShowClientNotes(clientName);
   }
 }
 
@@ -20245,6 +20535,12 @@ static void LayoutMainGui(HWND hWnd) {
   const int H = rc.bottom - rc.top;
 
   g_rcSessionTabs = {0, 0, W, tabH};
+  if (g_hBtnCloseAll) {
+    const int closeW = MulDiv(84, dpi, 96);
+    const int closeH = MulDiv(26, dpi, 96);
+    MoveWindow(g_hBtnCloseAll, W - m - closeW,
+               (tabH - closeH) / 2, closeW, closeH, TRUE);
+  }
   g_rcUtilityBar = {0, max(tabH, H - footerH), W, H};
   g_rcBrowserSelector = {
       m, g_rcUtilityBar.top + MulDiv(5, dpi, 96),
@@ -20327,8 +20623,13 @@ static std::wstring GetSelectedClientNameSanitized(bool preferListSelection) {
   }
 
   // Edit text (what the user typed)
-  const std::wstring editName =
-      ResolveExistingClientName(GetClientInputText());
+  std::wstring editName = SanitizeName(GetClientInputText());
+  for (const auto &name : g_allClientNames) {
+    if (_wcsicmp(name.c_str(), editName.c_str()) == 0) {
+      editName = name;
+      break;
+    }
+  }
 
   // Current list selection (what the dropdown is on)
   wchar_t selBuf[256]{};
@@ -20336,7 +20637,7 @@ static std::wstring GetSelectedClientNameSanitized(bool preferListSelection) {
   int sel = (int)SendMessageW(g_hComboClient, CB_GETCURSEL, 0, 0);
   if (sel != CB_ERR) {
     SendMessageW(g_hComboClient, CB_GETLBTEXT, sel, (LPARAM)selBuf);
-    selName = ResolveExistingClientName(selBuf);
+    selName = SanitizeName(selBuf);
   }
 
   std::wstring result;
@@ -20344,7 +20645,7 @@ static std::wstring GetSelectedClientNameSanitized(bool preferListSelection) {
     result = selName;
   else if (!editName.empty())
     result = editName;
-  else
+  else if (preferListSelection)
     result = selName;
 
   fs::path profilePath;
@@ -20401,7 +20702,8 @@ static void BuildSessionTabRects(HWND hWnd, HDC hdc) {
           (g_rcSessionTabs.bottom - g_rcSessionTabs.top) - iTabTop -
               iTabBottom);
   const int iAvail =
-      max(0, (g_rcSessionTabs.right - g_rcSessionTabs.left) - iOuter * 2);
+      max(0, (g_rcSessionTabs.right - g_rcSessionTabs.left) - iOuter * 2 -
+                 ScaleByDpi(94, dpi));
 
   HDC hMeasure = hdc ? hdc : GetDC(hWnd);
   HFONT hOldFont = nullptr;
@@ -20464,7 +20766,8 @@ static void BuildSessionTabRects(HWND hWnd, HDC hdc) {
   }
 
   int x = g_rcSessionTabs.left + iOuter;
-  const int iRightLimit = g_rcSessionTabs.right - iOuter;
+  const int iRightLimit = g_rcSessionTabs.right - iOuter -
+                          ScaleByDpi(94, dpi);
   const int y = g_rcSessionTabs.top + iTabTop;
 
   auto placeTab = [&](int i) {
@@ -20710,6 +21013,94 @@ static void SelectSessionTab(int iTab, bool bBringToFront) {
   InvalidateSessionTabs(g_hGui);
 }
 
+static bool IsStandardClientSession(const Session &session) {
+  return _wcsicmp(session.clientName.c_str(), L"Temp") != 0 &&
+         _wcsicmp(session.clientName.c_str(), L"Default") != 0;
+}
+
+static void UpdateCloseAllButtonState() {
+  if (!g_hBtnCloseAll)
+    return;
+  const bool hasClients = std::ranges::any_of(g_sessions,
+                                             IsStandardClientSession);
+  EnableWindow(g_hBtnCloseAll,
+               g_bUiEnabled && !g_bCloseAllClientsPending && hasClients);
+}
+
+static bool RequestSessionCloseNormally(DWORD pid) {
+  EnumData data{pid};
+  EnumWindows(EnumWindowsCallback, (LPARAM)&data);
+  bool posted = false;
+  for (HWND window : data.windows) {
+    if (IsWindowVisible(window))
+      posted = PostMessageW(window, WM_CLOSE, 0, 0) != FALSE || posted;
+  }
+  return posted;
+}
+
+static void RequestCloseAllClientsNormally() {
+  if (g_bCloseAllClientsPending || g_isLaunchInFlight.load() ||
+      g_bClientNotesBusy.load() || !g_bUiEnabled)
+    return;
+  std::vector<DWORD> processIds;
+  for (const Session &session : g_sessions) {
+    if (IsStandardClientSession(session) &&
+        std::find(processIds.begin(), processIds.end(), session.pid) ==
+            processIds.end())
+      processIds.push_back(session.pid);
+  }
+  if (processIds.empty())
+    return;
+  const int result = MessageBoxW(
+      g_hGui,
+      L"Close all open client browser windows?\n\n"
+      L"The browsers can ask about unsaved changes. ctSpaces will remain open. "
+      L"Default and temporary browsers are not included.",
+      L"Close all clients", MB_YESNO | MB_ICONQUESTION);
+  if (result != IDYES)
+    return;
+  // Confirmation pumps messages, including external shortcut requests and
+  // browser exits. Take the actual target snapshot only after it completes.
+  if (g_isLaunchInFlight.load() || g_bClientNotesBusy.load() || !g_bUiEnabled) {
+    MessageBoxW(g_hGui,
+                L"A client operation is still finishing. Try Close all again "
+                L"when it has completed.",
+                L"Close all clients", MB_OK | MB_ICONINFORMATION);
+    return;
+  }
+  processIds.clear();
+  for (const Session &session : g_sessions) {
+    if (IsStandardClientSession(session) &&
+        std::find(processIds.begin(), processIds.end(), session.pid) ==
+            processIds.end())
+      processIds.push_back(session.pid);
+  }
+  if (processIds.empty())
+    return;
+  g_bCloseAllClientsPending = true;
+  SetWindowTextW(g_hBtnCloseAll, L"Closing...");
+  SetUiState(false);
+  bool allPosted = true;
+  for (DWORD pid : processIds)
+    allPosted = RequestSessionCloseNormally(pid) && allPosted;
+  if (!allPosted) {
+    g_bCloseAllClientsPending = false;
+    SetWindowTextW(g_hBtnCloseAll, L"Close all");
+    SetUiState(true);
+    MessageBoxW(g_hGui,
+                L"At least one client browser could not receive the close "
+                L"request. It remains open; try closing it manually.",
+                L"Close all clients", MB_OK | MB_ICONWARNING);
+    return;
+  }
+  if (!SetTimer(g_hGui, kCloseAllCheckTimer, kBrowserShutdownGraceMs,
+                nullptr)) {
+    g_bCloseAllClientsPending = false;
+    SetWindowTextW(g_hBtnCloseAll, L"Close all");
+    SetUiState(true);
+  }
+}
+
 static bool RequestSessionClose(DWORD pid) {
   EnumData data{pid};
   EnumWindows(EnumWindowsCallback, (LPARAM)&data);
@@ -20860,6 +21251,7 @@ static void OnSessionStarted(DWORD pid, const std::wstring &name) {
     }
   }
   g_sessions.push_back({name, browser, pid});
+  UpdateCloseAllButtonState();
   BuildSessionTabRects(g_hGui, nullptr);
   SelectSessionTab((int)g_sessions.size(), false);
 }
@@ -20872,12 +21264,22 @@ static void OnSessionEnded(DWORD pid) {
       iRemovedTab = i + 1;
       removedName = g_sessions[i].clientName;
       g_sessions.erase(g_sessions.begin() + i);
+      UpdateCloseAllButtonState();
       break;
     }
   }
 
   if (iRemovedTab < 0)
     return;
+
+  if (g_bCloseAllClientsPending &&
+      !std::ranges::any_of(g_sessions, IsStandardClientSession)) {
+    KillTimer(g_hGui, kCloseAllCheckTimer);
+    g_bCloseAllClientsPending = false;
+    SetWindowTextW(g_hBtnCloseAll, L"Close all");
+    SetUiState(true);
+  }
+  UpdateCloseAllButtonState();
 
   const bool removedSelected = g_iSelectedSessionTab == iRemovedTab;
   if (removedSelected) {

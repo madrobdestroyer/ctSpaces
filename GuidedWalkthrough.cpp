@@ -18,6 +18,7 @@ constexpr unsigned kCreateShortcutCommand = 41015;
 constexpr unsigned kClientTitleFirstCommand = 41016;
 constexpr unsigned kCleanupInactiveCommand = 41120;
 constexpr unsigned kFirefoxCommand = 42004;
+constexpr unsigned kClientNotesCommand = 41020;
 
 const std::vector<Topic> kTopics = {
     {L"welcome", 1, L"Your client spaces", L"Main window",
@@ -38,9 +39,9 @@ const std::vector<Topic> kTopics = {
      L"a new client name. Create makes that client's browser slot and opens it "
      L"immediately. For an existing client, the button says Open. Pressing Enter "
      L"in the client field performs the same primary action.\r\n\r\n"
-     L"ctSpaces rejects reserved, invalid, empty, and overlong names. Watch the "
-     L"text in the field: validation and sanitizing may change what you typed "
-     L"before a client can be created. For an existing client, click the client "
+     L"ctSpaces rejects reserved, invalid, empty, and overlong names. Check the "
+     L"field before creating a client: validation may reject a name or adjust "
+     L"characters that Windows cannot use. For an existing client, click the client "
      L"icon at the left of the CLIENT field. File Explorer opens the client "
      L"folder containing all of its browser slots. This is not the Temporary "
      L"button. Do not edit or delete profile files while a client browser is "
@@ -77,7 +78,11 @@ const std::vector<Topic> kTopics = {
      L"browsers can produce tabs with the same client name; ctSpaces tracks the "
      L"browser processes separately. Select a tab or use Show to bring its "
      L"window forward. Drag tabs to reorder them.\r\n\r\n"
-     L"The x asks that browser session to close normally. Closing ctSpaces "
+     L"The x asks that browser session to close normally. Close all asks every "
+     L"tracked client browser to close and leaves the launcher open. It asks "
+     L"for confirmation first. Temporary and Default editor windows stay "
+     L"open. A browser that refuses to close remains visible as a session. "
+     L"Closing ctSpaces "
      L"while client browsers remain open requires confirmation so tracked "
      L"windows are not abandoned accidentally. Extra tabs move into the "
      L"overflow menu. Its first section lists client labels; choose one to show "
@@ -235,20 +240,57 @@ const std::vector<Topic> kTopics = {
      L"A dot and (New) identify unread additions or improvements. Next or Done "
      L"marks only the current page as read; Skip, Close, Escape, and the window "
      L"X leave it unread. Reopen the guide from Options or with F1.\r\n\r\n"
-     L"The optional 20-step Quick tour highlights real controls and includes "
-     L"twelve inert illustrations. Back, Next, Skip, Done, Escape, and close "
+     L"The optional 23 step Quick tour highlights real controls and includes "
+     L"thirteen inert illustrations. Back, Next, Skip, Done, Escape, and close "
      L"only navigate or exit the tour. Neither help experience performs the "
      L"client or browser actions it describes.",
      kGuidedWalkthroughCommand, true, L"Guides & visual tour",
      L"Press F1 or choose Guided walkthrough to open optional, read-only help "
-     L"that can be skipped and reopened at any time. The 20-step Quick tour "
-     L"highlights real launcher controls and contains twelve inert illustrations; "
+     L"that can be skipped and reopened at any time. The 23 step Quick tour "
+     L"highlights real launcher controls and contains thirteen inert illustrations; "
      L"it never clicks controls, creates clients, launches browsers, reads the "
      L"clipboard, deletes data, or changes preferences. What's new presents "
      L"short summaries of unread additions and improvements. Next or Done marks "
      L"only the current topic as read, while Skip, Close, Escape, and the window "
      L"X leave it unread. New dots do not mean that every older feature described "
      L"elsewhere in the full guide is new."},
+    {L"client_filter", 1, L"Find a client while typing", L"CLIENT field",
+     L"Type part of an existing client name in the CLIENT field to narrow "
+     L"the choices. The text you typed stays in the field while you browse "
+     L"the matches. Choose a match to select it; dismiss the list to keep "
+     L"typing or create a new client from the full name you enter. This "
+     L"walkthrough does not change the field or select a client.",
+     0, true, L"Find clients by part of a name",
+     L"The CLIENT picker now narrows existing clients as you type part of a "
+     L"name. Browsing results keeps your typed text until you choose a "
+     L"match, so you can continue entering a new name without losing it."},
+    {L"close_all", 1, L"Close all browser sessions",
+     L"Close all beside the open-session tabs",
+     L"Close all asks for confirmation, then asks each tracked client browser "
+     L"to close normally and keeps ctSpaces open. It leaves Temporary and "
+     L"Default editor windows open. Sessions disappear as browsers close. If "
+     L"one browser does not respond or refuses to close, its session remains "
+     L"available. The tour only highlights the button; it never presses it.",
+     0, true, L"Close all browser windows",
+     L"Use Close all to ask every tracked client browser to close while the "
+     L"launcher stays open. After confirmation, each browser receives a "
+     L"normal close request. Temporary and Default editor windows stay open; "
+     L"any session that remains open stays in the launcher."},
+    {L"client_notes", 1, L"Keep notes for a client",
+     L"Selected client's Settings or pinned client menu",
+     L"Select an existing client, then open Client Notes from Settings or "
+     L"open the menu for that client's pin. Notes are local to this client and can "
+     L"use the current light or dark theme. Save keeps the edited text. "
+     L"When you leave with unsaved changes, choose whether to save, discard, "
+     L"or continue editing. Notes are ordinary local text and are not "
+     L"encrypted, so avoid putting secrets in them. Notes travel with the "
+     L"client when it is renamed, archived, restored, backed up, or restored "
+     L"from backup. Deleting the client removes its notes too.",
+     kClientNotesCommand, true, L"Client Notes",
+     L"Selected existing clients now have local Client Notes, available from "
+     L"Settings or a pinned client's menu. The editor follows the current "
+     L"theme. Save keeps your changes; leaving with unsaved changes offers "
+     L"Save, Discard, and Cancel choices."},
 };
 
 bool IsMissingPathError(DWORD error) {

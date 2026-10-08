@@ -1,6 +1,6 @@
 # ctSpaces Feature Reference
 
-Applies to ctSpaces 6.0.4.0.
+Applies to ctSpaces 6.1.0.0.
 
 ## Core Purpose
 
@@ -39,9 +39,10 @@ Each new client root carries the v2 client marker and can hold separate `edge`, 
 | Client tab | Displays only the client name for an open client/browser pair, changes the main action to `Show`, and can be dragged to reorder open sessions for the current launcher session. |
 | Client tab close icon | Requests a normal close of that client's browser window. |
 | Overflow button | Lists hidden client tabs and provides separate show and close commands. |
-| Pinned client shortcut | Left-click opens the client or switches to its existing tab. Dragging reorders visible pins and saves the order. Right-click offers Select, Open, Open copied link, Restore tabs, and Create desktop shortcut. |
+| Pinned client shortcut | Clicking opens the client or switches to its existing tab. Dragging reorders visible pins and saves the order. The context menu offers Select, Open, Open copied link, Restore tabs, Create desktop shortcut, and Client Notes. |
 | Pinned overflow | Lists pinned clients beyond the four compact visible shortcuts. Right-click selects a hidden favorite for editing without opening it. |
-| Client combo | Accepts a new typed name or an existing client selection. Pressing Enter runs the current primary action. |
+| Client combo | Filters existing names by a case insensitive substring without completing or replacing typed text. Explicitly selecting a match fills its full name. Enter runs the primary action for the exact current name. |
+| Close all | Requests normal closure of tracked client browsers while keeping the launcher open. Delayed or refused closes remain tracked and are not silently forced. |
 | Integrated client logo | Displays the selected client's `client.ico` inside the editable selector; clicking the logo opens the profile folder. |
 | Pushpin toggle | Adds or removes an existing client from the Pinned row and is disabled for a new client name. |
 | `Create` | Creates and launches a new client. |
@@ -52,7 +53,7 @@ Each new client root carries the v2 client marker and can hold separate `edge`, 
 | Settings icon | Opens the full configuration and profile-tools menu. |
 | Browser selector | Displays and directly changes the default browser for the next launch. Choosing another browser selects that client's independent slot. |
 
-`Options > Quick tour` opens a manually replayable 20-step overlay with 12
+`Options > Quick tour` opens a manually replayable 23 step overlay with 13
 inert workflow illustrations that
 highlights these real controls and illustrates existing workflows without operating them. Its owned themed callout
 supports Back, Next, Skip, Done, Escape, and close while the launcher is
@@ -84,6 +85,7 @@ Dropping a visible pinned client on the Windows Desktop creates one `.lnk` launc
 | Set Profile Icon | Yes | Yes | Copies an ICO or converts another supported image into `client.ico`. |
 | Remove Custom Icon | Yes | Yes | Deletes the custom client icon. |
 | Create Desktop Shortcut | Existing client | Yes | Creates or updates the client-named Desktop link for the browser currently selected, using the customer icon when available. |
+| Client Notes | Existing client | Yes | Opens a separate themed local notes editor. Save retains reminders with the client, including through rename, archive, and full backup. Whole client deletion removes notes. |
 | Rename Client | Existing client | No | Renames the complete client container and migrates its pinned entry, browser-specific Restore tabs choices, shared icon, and ctSpaces-managed client shortcut. |
 | Archive Client | Existing client | No | Hides the client from the normal list without removing profile data. |
 | Archived Clients | No | Yes | Restores a hidden client to the normal list. |
@@ -253,7 +255,7 @@ ctSpaces includes:
 
 - Per-user install under `%LOCALAPPDATA%`; administrator rights are not required for the normal path.
 - Optional Start Menu, Desktop, and current-user startup entries.
-- A short user-facing release label such as `6.0`, backed by the current four-part Windows version `6.0.4.0`.
+- A short release label such as `6.1`, backed by the current four part Windows version `6.1.0.0`.
 - Newer, same-version, and older external copies have distinct prompts.
 - Updates stage the new executable beside the installed copy and retry replacement.
 - Relaunch waits for the updater process to exit before acquiring the single-instance mutex.

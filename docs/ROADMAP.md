@@ -2,6 +2,68 @@
 
 The first section records recently completed work. The remaining items are proposed improvements ordered to improve reliability first and keep the main launcher compact.
 
+## Current Planning Priorities
+
+Recorded October 6, 2026. Filtering, Client Notes, and Close All Clients were
+implemented in 6.1 on October 8. The other five accepted
+items remain future work.
+
+1. **Direct support reporting to GitHub.** Add a themed report window inside
+   ctSpaces with a description, technical information preview, Send report,
+   and submission confirmation. Reports go through a Cloudflare Worker and
+   become GitHub issues without requiring colleagues to sign into GitHub.
+   Use the existing Cloudflare domain and stay within free Cloudflare
+   services. Store GitHub credentials with the Worker. Exclude client names,
+   browsing data, and contact information from public issue content.
+   The exact domain and reporting setup remain to be configured.
+2. **Filter clients while typing.** Narrow the existing client list as the
+   user types any part of a name. Preserve deliberate creation of new clients
+   and make existing matches clear. Keep the launcher compact and follow
+   the selected theme.
+3. **Small client notes.** Add a separate themed notes window accessible
+   from the client's context menu. Store local reminders with that client,
+   preserve them through rename and archive, and remove them with whole
+   client deletion. Keep the main launcher compact.
+4. **Close All Clients.** Request a normal close of every open client browser
+   while leaving ctSpaces open. Show progress and handle browsers that
+   refuse or delay closing without losing tracking of their open profiles.
+5. **Open copied links in an already open client.** Investigate the reported
+   behavior where this action works only while the client is closed. Each
+   invocation should open the copied URL in a new tab of the intended
+   client and browser, including several links copied and opened in succession.
+   Preserve the normal launch behavior when the client is closed and the
+   isolation between client and browser profiles. Current source already
+   attempts this handoff for Chromium browsers but explicitly rejects it
+   for an active isolated Firefox profile. Confirm the reported browser and
+   test the running client paths before implementing a reliable solution.
+6. **Client nicknames.** Let users assign optional alternate names to an
+   existing client from its context menu. The typing filter matches both
+   the real name and nicknames, then opens the same existing client.
+   Display the real client name in results and require a clear selection
+   when matches are ambiguous. Nicknames are local metadata and do not
+   create or rename browser profiles. Preserve them through client rename
+   and archive, include them in client backups, and delete them with the
+   client.
+7. **Share Client Setup.** Export a selected client's setup metadata for
+   another colleague to import: real name, nicknames, icon, notes, and saved
+   links when that feature exists. Let the sender review what is included.
+   The recipient receives a prepared client with fresh browser profiles for
+   their own sign ins. Browser cookies, credentials, history, and live
+   session data are not part of this setup export. Handle an existing client
+   name through explicit import choices and preserve the normal application
+   ZIP distribution.
+8. **Separate downloads for each client.** Offer a client specific download
+   destination for its browser slots and an Open Downloads action in the
+   client menu. Make the destination visible and keep existing files in
+   their current locations unless the user explicitly requests a move.
+   Before implementation, settle whether downloads are stored inside the
+   client container and included in its backup/deletion rules or retained
+   in a separate user folder. Explain that choice clearly in the interface.
+
+Items 2, 3, and 4 are implemented in 6.1. The other items are
+accepted plans for future implementation. The additional proposals
+below remain ideas for consideration.
+
 ## Implemented In 5.3 (Historical)
 
 These items were present in the validated `5.3.0.3` project-local candidate.

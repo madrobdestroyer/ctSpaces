@@ -2,11 +2,11 @@
 
 ctSpaces is a small Windows launcher for opening client-specific browser spaces. Each client can have an independent Microsoft Edge, Google Chrome, Brave, and Mozilla Firefox profile, so browser data stays separated both between clients and between browsers for the same client.
 
-The initial 6.0.0.0 milestone consolidated the previously shipped 5.2 and 5.3 work. The current 6.0.4.0 release moves intensive cleanup discovery off the main window and adds themed progress with Cancel while preserving deletion safety checks. It does not change client or browser profile layout.
+The initial 6.0.0.0 milestone consolidated the previously shipped 5.2 and 5.3 work. The current 6.1.0.0 release adds client filtering without autocomplete replacement, local client notes, and Close All Clients while keeping the launcher open. The responsive cleanup discovery and deletion safety checks remain in place.
 
-See [release notes](RELEASE_NOTES_6.0.4.0.md),
+See [release notes](RELEASE_NOTES_6.1.0.0.md),
 [guide help](docs/GUIDED_WALKTHROUGH.md), and the
-[current release validation](docs/RELEASE_VALIDATION_6.0.4.0.md). The
+[current release validation](docs/RELEASE_VALIDATION_6.1.0.0.md). The
 [6.0.0.0 release notes](RELEASE_NOTES_6.0.0.0.md) and
 [validation report](docs/RELEASE_VALIDATION_6.0.0.0.md) remain available as
 historical records.
@@ -18,8 +18,8 @@ original project.
 
 ## Download
 
-Download the app-only [`ctSpaces6.0.4.0.zip`](https://github.com/madrobdestroyer/ctSpaces/releases/download/v6.0.4.0/ctSpaces6.0.4.0.zip)
-from [ctSpaces 6.0 / tag v6.0.4.0](https://github.com/madrobdestroyer/ctSpaces/releases/tag/v6.0.4.0),
+Download the application ZIP [`ctSpaces6.1.0.0.zip`](https://github.com/madrobdestroyer/ctSpaces/releases/download/v6.1.0.0/ctSpaces6.1.0.0.zip)
+from [ctSpaces 6.1 / tag v6.1.0.0](https://github.com/madrobdestroyer/ctSpaces/releases/tag/v6.1.0.0),
 extract it to a folder, and run `ctSpaces.exe`. The runtime ZIP contains only
 `ctSpaces.exe`; documentation, release history, source, and license notices
 remain available in this GitHub repository.
@@ -46,8 +46,11 @@ The app itself installs and stores shared settings under:
 
 ## Features
 
-- Optional first-run walkthrough, replayable from Options or F1, with direct topic selection and independently tracked new-feature guidance. A separate manually started 20-step Quick tour highlights real launcher controls and existing workflows without clicking them or changing state. Twelve inert illustration panels explain menu, drag, cleanup, deletion, rename/archive, titles, Default, and browser-slot actions without performing them.
+- Optional welcome walkthrough, replayable from Options or F1, with direct topic selection and independently tracked new feature guidance. A separate manually started 23 step Quick tour highlights real launcher controls without clicking them or changing state. Thirteen inert illustration panels explain menu, drag, cleanup, deletion, rename/archive, titles, Default, notes, and browser slot actions without performing them. Filtering, Close All Clients, and notes also have dedicated guidance.
 - Client profile launcher with separate data for every client/browser pair.
+- Filter the existing client list by typing any part of a name, without replacing the text you type or preventing overlapping new client names.
+- Local client notes in a separate themed window, retained through rename, archive, and full client backup and removed with whole client deletion.
+- Close All Clients requests normal closure of tracked client browsers while keeping ctSpaces open.
 - Persistent sign-ins, cookies, bookmarks, history, site data, and sessions for each saved client.
 - Per-client/browser `Restore tabs` switch. Leave it on to reopen that browser slot's previous tabs, or turn it off to start that slot on a normal new tab while keeping sign-ins and other profile data.
 - Browser selector for Microsoft Edge, Google Chrome, Brave, and Mozilla Firefox. Choosing another browser opens that client's independent slot rather than reusing another browser's data.

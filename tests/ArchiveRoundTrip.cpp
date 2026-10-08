@@ -1,4 +1,5 @@
 #include "../BackupEngine.h"
+#include "../ClientNotes.h"
 #include "../InProc7z.h"
 #include "../version.h"
 
@@ -388,7 +389,10 @@ int wmain(int argc, wchar_t **argv) {
     fs::create_directories(alphaProfile);
     fs::create_directories(betaProfile / L"empty");
     const fs::path hiddenPath = alphaProfile / L"hidden-state.bin";
+    const std::vector<unsigned char> notesData = {
+        'C', 'a', 'f', 0xc3, 0xa9, '\r', '\n', 'R', 'e', 'm', 'i', 'n', 'd', 'e', 'r'};
     if (!WriteBytes(alphaProfile / L"state.bin", binaryData) ||
+        !WriteBytes(backupSites / L"Alpha" / client_notes::kFileName, notesData) ||
         !WriteBytes(alphaProfile / L"unicode-\x00E9.txt", rootData) ||
         !WriteBytes(hiddenPath, rootData) ||
         !WriteBytes(betaProfile / L"bookmarks.bin", rootData) ||
@@ -619,6 +623,8 @@ int wmain(int argc, wchar_t **argv) {
         (replacementState.error != ERROR_SHARING_VIOLATION &&
          replacementState.error != ERROR_ACCESS_DENIED) ||
         ReadBytes(stagedAlpha / L"state.bin") != binaryData ||
+        ReadBytes(stagedRestore.payloadDir / L"Alpha" /
+                  client_notes::kFileName) != notesData ||
         ReadBytes(stagedAlpha / L"unicode-\x00E9.txt") != rootData ||
         (GetFileAttributesW((stagedAlpha / L"hidden-state.bin").c_str()) &
          FILE_ATTRIBUTE_HIDDEN) == 0 ||
@@ -640,6 +646,7 @@ int wmain(int argc, wchar_t **argv) {
     if (!commitResult.ok() ||
         ReadBytes(liveSites / L"Alpha" / L"Default" / L"state.bin") !=
             binaryData ||
+        ReadBytes(liveSites / L"Alpha" / client_notes::kFileName) != notesData ||
         ReadBytes(recovery / L"OldClient" / L"old.bin") != rootData ||
         fs::exists(restoreStage)) {
       std::wcerr << L"Transactional restore commit failed: "
