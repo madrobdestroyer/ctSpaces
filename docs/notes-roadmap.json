@@ -1,0 +1,36 @@
+{
+  "version": "6.3.0.0",
+  "deferred": [
+    "Images",
+    "Attachments",
+    "Tables",
+    "Reminders",
+    "Cloud sync",
+    "Collaboration",
+    "Password storage"
+  ],
+  "approved": [
+    "Close/reopen tabs and All notes",
+    "Archive and recoverable deletion",
+    "Empty state and discard untouched blank tabs",
+    "Tab menu, drag ordering and pinning",
+    "Per-tab undo, active note, cursor and scroll persistence",
+    "Find, replace and client-wide search",
+    "Overflow navigation",
+    "Independent notes window and client-operation coordination",
+    "Crash drafts, revision history and conflict recovery",
+    "Actionable save errors without a footer",
+    "Link insert/edit/remove/copy",
+    "List and checklist keyboard behavior",
+    "Formatting states and highlight swatches",
+    "Strikethrough, zoom, code style and timestamps",
+    "Plain-text paste and keyboard accessibility",
+    "Duplicate and templates",
+    "Created/modified dates and ticket metadata",
+    "Text/RTF import and export; notebook export",
+    "Copy whole note",
+    "Move/copy between clients",
+    "Optional checklist progress and always-on-top"
+  ],
+  "status": "implemented in 6.3.0.0; deferred features retained for later"
+}

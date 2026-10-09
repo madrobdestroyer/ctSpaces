@@ -134,7 +134,7 @@ void TestRevisionProgressContract() {
       {L"identity", 4},         {L"organize", 3},
       {L"cleanup", 3},          {L"backup_restore", 1},
       {L"appearance", 3},       {L"updates", 4},
-      {L"client_filter", 1}, {L"close_all", 1}, {L"client_notes", 2}};
+      {L"client_filter", 1}, {L"close_all", 1}, {L"client_notes", 3}};
   Expect(expectedRevisions.size() == topics.size(),
           "revision contract does not cover the catalog");
   for (const auto &topic : topics) {

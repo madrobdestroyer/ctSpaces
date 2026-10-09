@@ -276,7 +276,7 @@ const std::vector<Topic> kTopics = {
      L"launcher stays open. After confirmation, each browser receives a "
      L"normal close request. Temporary and Default editor windows stay open; "
      L"any session that remains open stays in the launcher."},
-    {L"client_notes", 2, L"Keep notes for a client",
+    {L"client_notes", 3, L"Keep notes for a client",
      L"Selected client's Settings or pinned client menu",
      L"Select an existing client, then open Client Notes from Settings or "
      L"open the menu for that client's pin. Notes are local to this client and can "
@@ -292,9 +292,11 @@ const std::vector<Topic> kTopics = {
      L"client when it is renamed, archived, restored, backed up, or restored "
      L"from backup. Deleting the client removes its notes too.",
      kClientNotesCommand, true, L"Client Notes",
-     L"Client Notes now supports formatted text and named ticket tabs. Existing "
-     L"notes stay in Notes; use + for separate work and double-click a tab to "
-     L"change a name. Edits save automatically. The editor remembers its size and closes with the top-right X."},
+     L"Client Notes now lets you close and reopen tabs without losing notes. "
+     L"All notes searches current, archived and recently deleted notes. "
+     L"Use More for templates, history, import/export and draft recovery. "
+     L"Edits autosave, undo survives tab switches, and the theme-based editor "
+     L"remembers its size without a footer."},
 };
 
 bool IsMissingPathError(DWORD error) {

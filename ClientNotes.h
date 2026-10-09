@@ -447,12 +447,46 @@ inline bool WriteDocument(const std::filesystem::path &root,
   return false;
 }
 
+struct Revision {
+  uint64_t time = 0;
+  std::string rtf;
+};
+inline uint64_t Now() {
+  FILETIME time{}; GetSystemTimeAsFileTime(&time);
+  return (static_cast<uint64_t>(time.dwHighDateTime) << 32) | time.dwLowDateTime;
+}
 struct NotePage {
   std::wstring name;
   bool rich = false; // False is used only for an unsaved legacy TXT page.
   std::string rtf;
   std::wstring text;
+  uint64_t id = 0, created = 0, modified = 0;
+  bool open = true, archived = false, deleted = false, pinned = false, active = false;
+  bool pristine = false;
+  uint32_t cursor = 0, scroll = 0, zoom = 100;
+  std::wstring ticket, ticketUrl;
+  std::vector<std::pair<std::wstring,std::wstring>> links;
+  std::vector<Revision> history;
 };
+
+inline uint64_t NextId(const std::vector<NotePage> &pages) {
+  uint64_t id = Now();
+  if (!id) id=1;
+  while (std::any_of(pages.begin(),pages.end(),[&](const auto &p){return p.id==id;}))
+    if (++id==0) id=1;
+  return id;
+}
+inline void RememberRevision(NotePage &page, const std::string &previous, bool force = false) {
+  const uint64_t now = Now();
+  if (previous.empty() || previous == page.rtf || !ValidRichText(previous)) return;
+  if (!page.history.empty() && (page.history.back().rtf == previous ||
+      (!force && now - page.history.back().time < 60ULL * 10000000))) return;
+  page.history.push_back({now, previous});
+  size_t bytes = 0; for (const auto &item : page.history) bytes += item.rtf.size();
+  while (page.history.size() > 20 || bytes > 32 * 1024 * 1024) {
+    bytes -= page.history.front().rtf.size(); page.history.erase(page.history.begin());
+  }
+}
 
 struct NotebookResult {
   ReadStatus status = ReadStatus::Error;
@@ -520,73 +554,128 @@ inline bool ReadU32(std::string_view bytes, size_t &offset, uint32_t &value) {
   return true;
 }
 
-// CTNBOOK1, a little-endian version and count, then length-prefixed UTF-8
-// name and RTF for each page. Length checks precede all page allocations.
-inline bool SerializeNotebook(const std::vector<NotePage> &pages,
-                              std::string &bytes) {
-  bytes.clear();
-  if (pages.empty() || pages.size() > kMaxPages)
-    return false;
-  bytes.assign("CTNBOOK1", 8);
-  AppendU32(bytes, 1);
-  AppendU32(bytes, static_cast<uint32_t>(pages.size()));
+inline void AppendU64(std::string &bytes, uint64_t n) {
+  AppendU32(bytes, static_cast<uint32_t>(n)); AppendU32(bytes, static_cast<uint32_t>(n >> 32));
+}
+inline bool ReadU64(std::string_view bytes, size_t &pos, uint64_t &n) {
+  uint32_t lo, hi;
+  if (!ReadU32(bytes, pos, lo) || !ReadU32(bytes, pos, hi)) return false;
+  n = lo | (static_cast<uint64_t>(hi) << 32); return true;
+}
+inline bool AppendText(std::string &bytes, const std::wstring &value, size_t limit) {
+  std::string utf8;
+  if (value.size() > limit || !EncodeUtf8(value, utf8)) return false;
+  AppendU32(bytes, static_cast<uint32_t>(utf8.size())); bytes += utf8; return true;
+}
+inline bool ReadText(std::string_view bytes, size_t &pos, std::wstring &value, size_t limit) {
+  uint32_t size;
+  if (!ReadU32(bytes, pos, size) || size > limit * 4 || size > bytes.size() - pos) return false;
+  const bool ok = DecodeUtf8(std::string(bytes.substr(pos, size)), value) && value.size() <= limit;
+  pos += size; return ok;
+}
+
+// Version 2 adds stable identities, lifecycle, view state and bounded revisions.
+// Version 1 and legacy TXT/RTF remain readable. Older releases reject v2 safely.
+inline bool SerializeNotebook(const std::vector<NotePage> &pages, std::string &bytes) {
+  bytes = "CTNBOOK1";
+  if (pages.size() > kMaxPages) return false;
+  AppendU32(bytes, 2); AppendU32(bytes, static_cast<uint32_t>(pages.size()));
   for (size_t i = 0; i < pages.size(); ++i) {
-    const auto &page = pages[i];
-    std::string name;
-    if (!page.rich || !page.text.empty() || !ValidPageName(page.name) ||
-        !EncodeUtf8(page.name, name) || !ValidRichText(page.rtf))
-      return false;
+    const auto &p = pages[i]; std::string name;
+    if (!p.rich || !p.text.empty() || !ValidPageName(p.name) || !EncodeUtf8(p.name, name) ||
+        !ValidRichText(p.rtf) || p.history.size() > 20 || p.zoom < 25 || p.zoom > 400) return false;
+    const uint64_t id = p.id ? p.id : i + 1;
     for (size_t j = 0; j < i; ++j)
-      if (SamePageName(page.name, pages[j].name))
-        return false;
-    const size_t needed = 8 + name.size() + page.rtf.size();
-    if (needed > kMaxNotebookBytes - bytes.size())
-      return false;
+      if (SamePageName(p.name, pages[j].name) || id == (pages[j].id ? pages[j].id : j + 1)) return false;
     AppendU32(bytes, static_cast<uint32_t>(name.size()));
-    AppendU32(bytes, static_cast<uint32_t>(page.rtf.size()));
-    bytes.append(name);
-    bytes.append(page.rtf);
+    AppendU32(bytes, static_cast<uint32_t>(p.rtf.size())); bytes += name; bytes += p.rtf;
+    AppendU64(bytes, id); AppendU64(bytes, p.created); AppendU64(bytes, p.modified);
+    AppendU32(bytes, (p.open ? 1 : 0) | (p.archived ? 2 : 0) | (p.deleted ? 4 : 0) |
+        (p.pinned ? 8 : 0) | (p.active ? 16 : 0) | (p.pristine ? 32 : 0));
+    AppendU32(bytes, p.cursor); AppendU32(bytes, p.scroll); AppendU32(bytes, p.zoom);
+    if (!AppendText(bytes, p.ticket, 128) || !AppendText(bytes, p.ticketUrl, 2048)) return false;
+    if (p.links.size() > 256) return false;
+    AppendU32(bytes,static_cast<uint32_t>(p.links.size()));
+    for (const auto &[label,url] : p.links)
+      if (!AppendText(bytes,label,2048) || !AppendText(bytes,url,2048)) return false;
+    AppendU32(bytes, static_cast<uint32_t>(p.history.size()));
+    size_t historyBytes = 0;
+    for (const auto &rev : p.history) {
+      if (!ValidRichText(rev.rtf) || (historyBytes += rev.rtf.size()) > 32 * 1024 * 1024) return false;
+      AppendU64(bytes, rev.time); AppendU32(bytes, static_cast<uint32_t>(rev.rtf.size())); bytes += rev.rtf;
+    }
+    if (bytes.size() > kMaxNotebookBytes) return false;
   }
   return true;
 }
-
-inline bool ParseNotebook(std::string_view bytes,
-                          std::vector<NotePage> &pages) {
+inline bool ParseNotebook(std::string_view bytes, std::vector<NotePage> &pages) {
   pages.clear();
-  if (bytes.size() < 16 || bytes.size() > kMaxNotebookBytes ||
-      bytes.substr(0, 8) != "CTNBOOK1")
-    return false;
-  size_t offset = 8;
-  uint32_t version = 0, count = 0;
-  if (!ReadU32(bytes, offset, version) || version != 1 ||
-      !ReadU32(bytes, offset, count) || count == 0 || count > kMaxPages)
-    return false;
-  pages.reserve(count);
+  if (bytes.size() < 16 || bytes.size() > kMaxNotebookBytes || bytes.substr(0,8) != "CTNBOOK1") return false;
+  size_t pos = 8; uint32_t version, count;
+  if (!ReadU32(bytes,pos,version) || (version != 1 && version != 2) || !ReadU32(bytes,pos,count) ||
+      count > kMaxPages || (!count && version == 1)) return false;
+  std::vector<NotePage> parsed;
   for (uint32_t i = 0; i < count; ++i) {
-    uint32_t nameSize = 0, rtfSize = 0;
-    if (!ReadU32(bytes, offset, nameSize) ||
-        !ReadU32(bytes, offset, rtfSize) || nameSize == 0 ||
-        nameSize > 256 || rtfSize > kMaxRichBytes ||
-        offset > bytes.size() ||
-        static_cast<size_t>(nameSize) + rtfSize > bytes.size() - offset)
-      return false;
-    std::wstring name;
-    if (!DecodeUtf8(std::string(bytes.substr(offset, nameSize)), name) ||
-        !ValidPageName(name))
-      return false;
-    offset += nameSize;
-    const std::string_view rtf = bytes.substr(offset, rtfSize);
-    if (!ValidRichText(rtf))
-      return false;
-    offset += rtfSize;
-    for (const auto &prior : pages)
-      if (SamePageName(name, prior.name))
-        return false;
-    pages.push_back({std::move(name), true, std::string(rtf), {}});
+    uint32_t n, r;
+    if (!ReadU32(bytes,pos,n) || !ReadU32(bytes,pos,r) || !n || n > 256 || r > kMaxRichBytes ||
+        static_cast<size_t>(n) + r > bytes.size() - pos) return false;
+    NotePage p;
+    if (!DecodeUtf8(std::string(bytes.substr(pos,n)),p.name) || !ValidPageName(p.name)) return false;
+    pos += n; p.rtf = bytes.substr(pos,r); pos += r; p.rich = true;
+    if (!ValidRichText(p.rtf)) return false;
+    p.id = i + 1;
+    if (version == 2) {
+      uint32_t flags, revisions;
+      if (!ReadU64(bytes,pos,p.id) || !p.id || !ReadU64(bytes,pos,p.created) || !ReadU64(bytes,pos,p.modified) ||
+          !ReadU32(bytes,pos,flags) || flags > 63 || !ReadU32(bytes,pos,p.cursor) ||
+          !ReadU32(bytes,pos,p.scroll) || !ReadU32(bytes,pos,p.zoom) || p.zoom < 25 || p.zoom > 400 ||
+          !ReadText(bytes,pos,p.ticket,128) || !ReadText(bytes,pos,p.ticketUrl,2048)) return false;
+      uint32_t linkCount;
+      if (!ReadU32(bytes,pos,linkCount) || linkCount > 256) return false;
+      for (uint32_t j=0;j<linkCount;++j) {
+        std::wstring label,url;
+        if (!ReadText(bytes,pos,label,2048) || !ReadText(bytes,pos,url,2048)) return false;
+        p.links.emplace_back(std::move(label),std::move(url));
+      }
+      if (!ReadU32(bytes,pos,revisions) || revisions > 20) return false;
+      p.open = (flags & 1) != 0; p.archived = (flags & 2) != 0; p.deleted = (flags & 4) != 0;
+      p.pinned = (flags & 8) != 0; p.active = (flags & 16) != 0; p.pristine = (flags & 32) != 0;
+      size_t historyBytes = 0;
+      for (uint32_t j = 0; j < revisions; ++j) {
+        Revision rev;
+        if (!ReadU64(bytes,pos,rev.time) || !ReadU32(bytes,pos,r) || r > bytes.size() - pos ||
+            (historyBytes += r) > 32 * 1024 * 1024) return false;
+        rev.rtf = bytes.substr(pos,r); pos += r;
+        if (!ValidRichText(rev.rtf)) return false;
+        p.history.push_back(std::move(rev));
+      }
+    }
+    for (const auto &prior : parsed) if (SamePageName(p.name,prior.name) || p.id == prior.id) return false;
+    parsed.push_back(std::move(p));
   }
-  return offset == bytes.size();
+  if (pos != bytes.size()) return false;
+  pages = std::move(parsed); return true;
 }
 
+// Atomic auxiliary snapshots are used for crash drafts. Never follow a link or
+// replace a file whose identity/content changed while staging the write.
+inline bool WriteAuxiliary(const std::filesystem::path &root, const std::wstring &name,
+                           const std::string &bytes) {
+  if (!SafeDirectory(root) || bytes.size() > kMaxNotebookBytes || name.find_first_of(L"/\\:") != std::wstring::npos) return false;
+  const auto expected = ReadFileSnapshot(root, name.c_str(), kMaxNotebookBytes);
+  if (expected.status == ReadStatus::Error) return false;
+  const auto stage = root / (name + L".stage-" + std::to_wstring(GetCurrentProcessId()));
+  HANDLE h = CreateFileW(stage.c_str(),GENERIC_WRITE,0,nullptr,CREATE_NEW,FILE_ATTRIBUTE_NORMAL | FILE_FLAG_WRITE_THROUGH,nullptr);
+  if (h == INVALID_HANDLE_VALUE) return false;
+  DWORD written = 0;
+  bool ok = WriteFile(h,bytes.data(),static_cast<DWORD>(bytes.size()),&written,nullptr) && written == bytes.size() && FlushFileBuffers(h);
+  ok = CloseHandle(h) && ok;
+  ok = ok && SafeDirectory(root) && SameSnapshot(expected,ReadFileSnapshot(root,name.c_str(),kMaxNotebookBytes));
+  if (ok) ok = MoveFileExW(stage.c_str(),(root/name).c_str(),MOVEFILE_WRITE_THROUGH |
+      (expected.status == ReadStatus::Missing ? 0 : MOVEFILE_REPLACE_EXISTING)) != FALSE;
+  if (!ok) DeleteFileW(stage.c_str());
+  return ok;
+}
 inline NotebookResult ReadNotebook(const std::filesystem::path &root) {
   NotebookResult result;
   result.plain_snapshot = ReadFileSnapshot(root, kFileName, kMaxBytes);
@@ -604,6 +693,7 @@ inline NotebookResult ReadNotebook(const std::filesystem::path &root) {
   }
   NotePage initial;
   initial.name = L"Notes";
+  initial.id = 1;
   if (result.rich_snapshot.status == ReadStatus::Ok) {
     if (!ValidRichText(result.rich_snapshot.bytes))
       return result;

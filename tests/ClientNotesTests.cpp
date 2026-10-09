@@ -24,6 +24,43 @@ static void PutBytes(const fs::path &path, const std::string &bytes) {
   Check(file.good(), "Write byte fixture");
 }
 
+static void TestWorkspaceStorage(const fs::path &base) {
+  using namespace client_notes;
+  NotePage note{L"Ticket",true,"{\\rtf1 Current}",{}};
+  note.id=987654; note.created=Now(); note.modified=note.created+1;
+  note.open=false; note.archived=true; note.pinned=true; note.pristine=true;
+  note.cursor=41; note.scroll=99; note.zoom=140; note.ticket=L"CASE-42";
+  note.ticketUrl=L"https://example.com/tickets/42";
+  note.links={{L"Support",L"https://example.com/support"}};
+  RememberRevision(note,"{\\rtf1 Earlier}",true);
+  std::string bytes; std::vector<NotePage> parsed;
+  Check(SerializeNotebook({note},bytes) && ParseNotebook(bytes,parsed),"V2 notebook metadata round trip");
+  const auto &copy=parsed.front();
+  Check(copy.id==note.id && copy.created==note.created && copy.modified==note.modified &&
+    !copy.open && copy.archived && copy.pinned && copy.pristine && copy.cursor==41 &&
+    copy.scroll==99 && copy.zoom==140 && copy.ticket==note.ticket && copy.ticketUrl==note.ticketUrl &&
+    copy.links==note.links && copy.history.size()==1 && copy.history[0].rtf=="{\\rtf1 Earlier}","Lifecycle, view, links, ticket and revision values preserved");
+  for (size_t size=0;size<bytes.size();++size)
+    Check(!ParseNotebook(std::string_view(bytes).substr(0,size),parsed),"Every truncated v2 snapshot is rejected");
+  Check(!ParseNotebook(bytes+"extra",parsed),"V2 trailing bytes rejected");
+  auto duplicate=note; duplicate.name=L"Different";
+  Check(!SerializeNotebook({note,duplicate},bytes),"Duplicate stable identities rejected");
+  Check(SerializeNotebook({},bytes) && ParseNotebook(bytes,parsed) && parsed.empty(),"Empty notebook persists without fabricated note");
+  bytes="CTNBOOK1"; AppendU32(bytes,1); AppendU32(bytes,1);
+  AppendU32(bytes,6); AppendU32(bytes,static_cast<uint32_t>(note.rtf.size())); bytes+="Ticket"; bytes+=note.rtf;
+  Check(ParseNotebook(bytes,parsed) && parsed.size()==1 && parsed[0].open && parsed[0].id==1 && parsed[0].zoom==100,"Existing v1 notebook migrates with open tab and stable identity");
+  for (int i=0;i<25;++i) RememberRevision(note,"{\\rtf1 Version "+std::to_string(i)+"}",true);
+  Check(note.history.size()==20 && note.history.front().rtf=="{\\rtf1 Version 5}","Revision history evicts oldest beyond twenty");
+  const fs::path root=base/L"Recovery"; fs::create_directory(root);
+  Check(WriteAuxiliary(root,L"draft.ctn","first") && WriteAuxiliary(root,L"draft.ctn","second"),"Recovery file uses atomic replacement");
+  Check(ReadFileSnapshot(root,L"draft.ctn",1024).bytes=="second","Replacement recovery bytes round trip");
+  Check(!WriteAuxiliary(root,L"../escape.ctn","bad"),"Recovery cannot escape selected folder");
+  Check(CreateHardLinkW((root/L"linked.ctn").c_str(),(root/L"draft.ctn").c_str(),nullptr)!=FALSE,"Auxiliary hardlink fixture");
+  Check(!WriteAuxiliary(root,L"linked.ctn","bad"),"Recovery refuses hardlinked destination");
+  DeleteFileW((root/L"linked.ctn").c_str());
+  Check(ReadFileSnapshot(root,L"draft.ctn",1024).bytes=="second","Unsafe auxiliary write preserves original bytes");
+}
+
 static void TestNotebook(const fs::path &base) {
   using client_notes::NotePage;
   const std::string rtf = "{\\rtf1\\ansi A \\b note\\b0}";
@@ -110,7 +147,7 @@ static void TestNotebook(const fs::path &base) {
            goodBytes.substr(0, goodBytes.size() - 1),
            goodBytes + "x",
            std::string("badmagic") + goodBytes.substr(8),
-           goodBytes.substr(0, 8) + std::string("\2\0\0\0", 4) +
+           goodBytes.substr(0, 8) + std::string("\3\0\0\0", 4) +
                goodBytes.substr(12),
            std::string("CTNBOOK1\1\0\0\0\xff\xff\xff\xff", 16)}) {
     PutBytes(path, bad);
@@ -317,6 +354,7 @@ int main() {
           client_notes::Read(client).text == L"More recent",
           "Failed root revalidation preserves prior contents");
 
+    TestWorkspaceStorage(base);
     TestNotebook(base);
 
     const fs::path richClient = base / L"Sites" / L"Rich";

@@ -354,6 +354,9 @@ static int g_iSelectedSessionTab = 0; // 0 = New, 1..n = open client
 static bool g_bUiEnabled = true;
 static bool g_bDefaultProfileUiBusy = false;
 static std::atomic_bool g_bClientNotesBusy = false;
+static HWND g_hNotesWindow = nullptr;
+static bool NotesTranslateKey(MSG &message);
+static bool PrepareNotesForClientChange(const std::wstring &client = {});
 static std::vector<std::unique_ptr<ProfileExitPayload>> g_notesDeferredExits;
 static bool g_bSyncingClientInput = false;
 static bool g_bFilteringClientList = false;
@@ -1952,9 +1955,13 @@ static void UpdateTooltipColors() {
 static std::mutex g_themedPopupsMutex;
 static std::vector<HWND> g_themedPopups;
 
+static void RefreshNotesLibraryForTheme(HWND window);
+
 static void RefreshThemeWindow(HWND hWnd, bool bUpdateWindowChrome) {
+  if (hWnd == g_hNotesWindow) return; // Notes maintains its own frame and editor palette.
   if (!hWnd || !IsWindow(hWnd))
     return;
+  if (GetDlgItem(hWnd,IDC_NOTES_PREVIEW)) RefreshNotesLibraryForTheme(hWnd);
   // The walkthrough remains visible while the Themes dialog previews a
   // palette. Keep its non-client caption in sync with its already-live client
   // colors; other windows retain the established apply/cancel chrome behavior.
@@ -1974,7 +1981,10 @@ static void RefreshThemeWindow(HWND hWnd, bool bUpdateWindowChrome) {
                RDW_INVALIDATE | RDW_ERASE | RDW_FRAME | RDW_ALLCHILDREN);
 }
 
+static void RefreshNotesForTheme();
+
 static void InvalidateThemeWindows(bool bUpdateWindowChrome) {
+  RefreshNotesForTheme();
   RefreshThemeWindow(g_hGui, bUpdateWindowChrome);
 
   HWND hThemeDialog =
@@ -4768,6 +4778,11 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE,
         IsDialogMessageW(g_hQuickTourDialog, &msg)) {
       continue;
     }
+    if (g_hNotesWindow && IsWindow(g_hNotesWindow) &&
+        (msg.hwnd == g_hNotesWindow || IsChild(g_hNotesWindow,msg.hwnd))) {
+      if (NotesTranslateKey(msg)) continue;
+      if (IsDialogMessageW(g_hNotesWindow,&msg)) continue;
+    }
     // intercept Enter when focus is in the combo or its edit
     if (msg.message == WM_KEYDOWN && msg.wParam == VK_RETURN) {
       HWND hFocus = GetFocus();
@@ -5786,6 +5801,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam,
     }
     break;
   case WM_CLOSE: {
+    if (!PrepareNotesForClientChange()) return 0;
     if (g_bClientNotesBusy.load() || g_bCloseAllClientsPending) {
       MessageBeep(MB_ICONINFORMATION);
       return 0;
@@ -5840,6 +5856,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam,
     return 0;
   }
   case WM_QUERYENDSESSION:
+    if (!PrepareNotesForClientChange()) return FALSE;
     if (g_bCleanupBusy.load() || g_bClientNotesBusy.load()) {
       if (g_hCleanupScanDialog && IsWindow(g_hCleanupScanDialog))
         PostMessageW(g_hCleanupScanDialog, WM_CLOSE, 0, 0);
@@ -7277,6 +7294,7 @@ void GuiProfExportAll() {
 }
 
 void GuiProfRestoreAll() {
+  if (!PrepareNotesForClientChange()) return;
   SetUiState(false);
 
   std::wstring profileUseError;
@@ -9302,7 +9320,7 @@ static bool OpenWebUrlForClient(const std::wstring &clientName,
   fs::path clientRoot;
   if (!TryGetSafeClientProfilePath(clientName, clientRoot))
     return false;
-  if (fromNotes && (!g_bClientNotesBusy.load() || g_isLaunchInFlight.load()))
+  if (fromNotes && (!g_hNotesWindow || g_isLaunchInFlight.load()))
     return false;
 
   const auto active = GetActiveProfile(clientName, browser);
@@ -10631,6 +10649,7 @@ static bool RenameClientProfile(const std::wstring &oldName,
                                 const std::wstring &newName,
                                 std::wstring &errorMessage) {
   errorMessage.clear();
+  if (!PrepareNotesForClientChange(oldName)) { errorMessage = L"Save or recover the open notes before renaming this client."; return false; }
   if (!IsExistingClientProfile(oldName)) {
     errorMessage = L"Select an existing client first.";
     return false;
@@ -11222,6 +11241,7 @@ static void GuiRenameClient() {
 static bool ArchiveClientProfile(const std::wstring &clientName,
                                  std::wstring &errorMessage) {
   errorMessage.clear();
+  if (!PrepareNotesForClientChange(clientName)) { errorMessage = L"Save or recover the open notes before archiving this client."; return false; }
   if (!IsExistingClientProfile(clientName)) {
     errorMessage = L"Select an existing client first.";
     return false;
@@ -15437,6 +15457,7 @@ static bool DeleteEntireClient(
     const std::wstring &clientName, bool preconfirmed,
     const std::optional<client_activity::Record> &expectedActivity,
     std::wstring &outcome) {
+  if (!PrepareNotesForClientChange(clientName)) { outcome = L"Open notes could not be saved."; return false; }
   const auto report = [&](HWND owner, const wchar_t *text,
                            const wchar_t *title, UINT flags) {
     outcome = text;
@@ -15819,7 +15840,8 @@ static void ApplyCleanupDialogTheme(HWND dialog) {
   }
   for (const int id : {IDC_INACTIVE_LIST, IDC_CLEANUP_RESULT_TEXT,
                        IDC_GUIDE_TOPICS, IDC_GUIDE_BODY,
-                       IDC_CLIENT_NOTES_TEXT}) {
+                       IDC_CLIENT_NOTES_TEXT, IDC_NOTES_RESULTS, IDC_NOTES_PREVIEW, IDC_NOTES_QUERY,
+                       IDC_NOTES_INPUT1, IDC_NOTES_INPUT2}) {
     HWND control = GetDlgItem(dialog, id);
     if (!control)
       continue;
@@ -15873,7 +15895,8 @@ static std::optional<INT_PTR> HandleCleanupDialogTheme(
     FillRect(reinterpret_cast<HDC>(wParam), &rect, g_hbrThemeWindow);
     for (const int id : {IDC_INACTIVE_LIST, IDC_CLEANUP_RESULT_TEXT,
                          IDC_GUIDE_TOPICS, IDC_GUIDE_BODY,
-                         IDC_CLIENT_NOTES_TEXT}) {
+                         IDC_CLIENT_NOTES_TEXT, IDC_NOTES_RESULTS, IDC_NOTES_PREVIEW, IDC_NOTES_QUERY,
+                       IDC_NOTES_INPUT1, IDC_NOTES_INPUT2}) {
       HWND control = GetDlgItem(dialog, id);
       RECT border{};
       if (!control || !GetWindowRect(control, &border))
@@ -15887,7 +15910,7 @@ static std::optional<INT_PTR> HandleCleanupDialogTheme(
   case WM_MEASUREITEM: {
     auto *measure = reinterpret_cast<MEASUREITEMSTRUCT *>(lParam);
     if (measure && measure->CtlType == ODT_LISTBOX &&
-        measure->CtlID == IDC_INACTIVE_LIST) {
+        (measure->CtlID == IDC_INACTIVE_LIST || measure->CtlID == IDC_NOTES_RESULTS)) {
       measure->itemHeight = ScaleByDpi(22, GetDpiForWindow(dialog));
       return TRUE;
     }
@@ -15897,7 +15920,7 @@ static std::optional<INT_PTR> HandleCleanupDialogTheme(
     const auto *draw = reinterpret_cast<const DRAWITEMSTRUCT *>(lParam);
     if (!draw)
       break;
-    if (draw->CtlType == ODT_LISTBOX && draw->CtlID == IDC_INACTIVE_LIST) {
+    if (draw->CtlType == ODT_LISTBOX && (draw->CtlID == IDC_INACTIVE_LIST || draw->CtlID == IDC_NOTES_RESULTS)) {
       const bool selected = (draw->itemState & ODS_SELECTED) != 0;
       const COLORREF background = selected ? g_themeColors.crAccent
                                             : g_themeColors.crControl;
@@ -16025,6 +16048,17 @@ struct ClientNotesDialogState {
   std::vector<client_notes::NotePage> pages;
   std::vector<std::string> baselines;
   size_t activePage = 0;
+  bool metadataChanged = false, findVisible = false, topmost = false, showProgress = false;
+  std::vector<size_t> visiblePages;
+  std::vector<uint64_t> closedPages;
+  std::map<uint64_t, HWND> editors;
+    HMODULE richEditModule = nullptr;
+  HWND attachedEditor = nullptr;
+  int dragTab = -1;
+  POINT dragStart{};
+  bool dragging = false, highlightPalette = false;
+  std::wstring findText;
+  std::wstring draftName;
   bool loading = false;
   bool formattingChanged = false;
   bool updatingToolbar = false;
@@ -16037,10 +16071,25 @@ struct ClientNotesDialogState {
   ~ClientNotesDialogState() {
     if (toolbarTooltip && IsWindow(toolbarTooltip))
       DestroyWindow(toolbarTooltip);
+    if (richEditModule) FreeLibrary(richEditModule);
     for (HFONT font : {uiFont, tabFont})
       if (font) DeleteObject(font);
   }
 };
+
+static bool HasActiveNote(const ClientNotesDialogState &s) {
+  return s.activePage < s.pages.size() && s.pages[s.activePage].open &&
+      !s.pages[s.activePage].archived && !s.pages[s.activePage].deleted;
+}
+static bool NotesWorkspaceCommand(HWND dialog, ClientNotesDialogState &state, UINT command);
+static void NotesCharacterFormat(HWND dialog, ClientNotesDialogState &state, DWORD mask,
+    DWORD effect, COLORREF color = 0, LONG height = 0);
+static bool NotesListKey(HWND edit, UINT message, WPARAM key);
+static void RefreshNotesTabs(HWND dialog, ClientNotesDialogState &state);
+static bool LoadNotesPage(HWND dialog, ClientNotesDialogState &state);
+static void LayoutClientNotes(HWND dialog, UINT dpi);
+static void NotesRememberView(HWND dialog, ClientNotesDialogState &state);
+static void NotesWriteRecovery(HWND dialog, ClientNotesDialogState &state);
 
 static bool SaveClientNotesDraft(HWND dialog, ClientNotesDialogState &state,
                                  bool reportFailure = false);
@@ -16141,7 +16190,7 @@ static bool StreamClientNotesOut(HWND edit, std::string &rtf) {
 }
 
 static bool NotesOtherPagesChanged(const ClientNotesDialogState &state) {
-  if (state.pages.size() != state.original.pages.size())
+  if (state.metadataChanged || state.pages.size() != state.original.pages.size())
     return true;
   for (size_t i = 0; i < state.pages.size(); ++i)
     if (state.pages[i].name != state.original.pages[i].name ||
@@ -16167,6 +16216,7 @@ static void SetNotesStatus(HWND dialog, ClientNotesDialogState &state) {
 
 static bool NotesDraftMatchesBaseline(HWND dialog,
                                        ClientNotesDialogState &state) {
+  if (!HasActiveNote(state)) return true;
   if (state.baselines[state.activePage].empty())
     return false;
   std::string current;
@@ -16194,11 +16244,13 @@ static bool NotesPlainTextWithinLimit(HWND edit) {
 }
 
 static void MarkNotesChanged(HWND dialog, ClientNotesDialogState &state) {
-  if (state.loading)
+  if (state.loading || !HasActiveNote(state))
     return;
+  state.pages[state.activePage].pristine = false;
   state.formattingChanged = true;
   SetDlgItemTextW(dialog, IDC_NOTES_STATUS, L"Saving...");
-  SetTimer(dialog, 1, 250, nullptr);
+  SetTimer(dialog, 2, 150, nullptr);
+  SetTimer(dialog, 1, 500, nullptr);
 }
 
 static void NotesSelection(HWND edit, CHARRANGE &range) {
@@ -16209,6 +16261,10 @@ static void UpdateNotesToolbar(HWND dialog, ClientNotesDialogState &state) {
   if (state.loading || state.updatingToolbar)
     return;
   HWND edit = GetDlgItem(dialog, IDC_CLIENT_NOTES_TEXT);
+  for (int id = IDC_NOTES_STYLE; id <= IDC_NOTES_CLEAR; ++id)
+    EnableWindow(GetDlgItem(dialog, id), HasActiveNote(state));
+  EnableWindow(GetDlgItem(dialog, IDC_NOTES_HIGHLIGHT_COLOR), HasActiveNote(state));
+  if (!HasActiveNote(state)) return;
   state.updatingToolbar = true;
   CHARFORMAT2W format{};
   format.cbSize = sizeof(format);
@@ -16227,7 +16283,7 @@ static void UpdateNotesToolbar(HWND dialog, ClientNotesDialogState &state) {
     }
   }
   SendDlgItemMessageW(dialog, IDC_NOTES_SIZE, CB_SETCURSEL, sizeIndex, 0);
-  const int style = !(format.dwMask & CFM_SIZE) ? 0 :
+  const int style = (format.dwMask & CFM_FACE) && _wcsicmp(format.szFaceName,L"Consolas")==0 ? 3 : !(format.dwMask & CFM_SIZE) ? 0 :
                     format.yHeight >= 480 ? 1 : format.yHeight >= 320 ? 2 : 0;
   SendDlgItemMessageW(dialog, IDC_NOTES_STYLE, CB_SETCURSEL, style, 0);
   EnableWindow(GetDlgItem(dialog, IDC_NOTES_UNDO), SendMessageW(edit, EM_CANUNDO, 0, 0) != 0);
@@ -16389,8 +16445,34 @@ static void DrawNotesChecklistMarkers(HWND edit, HDC dc) {
   RestoreDC(dc, savedDc);
 }
 
+static UINT TrackThemedNotesMenu(HMENU menu,UINT flags,int x,int y,HWND owner) {
+  const int count=GetMenuItemCount(menu);
+  std::vector<MenuItemData> items(static_cast<size_t>((std::max)(count,0)));
+  MENUINFO info{sizeof(info)}; info.fMask=MIM_BACKGROUND; info.hbrBack=g_hbrThemeMenu; SetMenuInfo(menu,&info);
+  for (int i=0;i<count;++i) {
+    wchar_t label[256]{}; MENUITEMINFOW entry{sizeof(entry)};
+    entry.fMask=MIIM_STRING|MIIM_FTYPE; entry.dwTypeData=label; entry.cch=static_cast<UINT>(std::size(label));
+    GetMenuItemInfoW(menu,i,TRUE,&entry);
+    items[i]={label,nullptr,(entry.fType&MFT_SEPARATOR)!=0};
+    const auto shortcut=items[i].text.find(L'\t');
+    if (shortcut!=std::wstring::npos) { items[i].text.replace(shortcut,1,L"    ("); items[i].text+=L")"; }
+    entry.fMask=MIIM_FTYPE|MIIM_DATA; entry.fType|=MFT_OWNERDRAW;
+    entry.dwItemData=reinterpret_cast<ULONG_PTR>(&items[i]); SetMenuItemInfoW(menu,i,TRUE,&entry);
+  }
+  return TrackPopupMenuEx(menu,flags,x,y,owner,nullptr);
+}
+
 static LRESULT CALLBACK NotesEditSubclass(HWND edit, UINT message,
     WPARAM wParam, LPARAM lParam, UINT_PTR id, DWORD_PTR) {
+  if ((message==WM_CHAR && wParam==VK_RETURN) || (message==WM_KEYDOWN && wParam==VK_TAB))
+    if (NotesListKey(edit,message,wParam)) {
+      auto *state=reinterpret_cast<ClientNotesDialogState *>(GetWindowLongPtrW(GetParent(edit),DWLP_USER));
+      if (state) MarkNotesChanged(GetParent(edit),*state);
+      return 0;
+    }
+  if (message==WM_MOUSEWHEEL && (GetKeyState(VK_CONTROL)&0x8000)) {
+    SendMessageW(GetParent(edit),WM_COMMAND,GET_WHEEL_DELTA_WPARAM(wParam)>0 ? IDC_NOTES_ZOOM_IN : IDC_NOTES_ZOOM_OUT,0); return 0;
+  }
   // The dialog manager sends its UI font again on DPI changes. RichEdit
   // treats that as document formatting; preserve the user's character runs.
   if (message == WM_SETFONT)
@@ -16449,8 +16531,8 @@ static LRESULT CALLBACK NotesEditSubclass(HWND edit, UINT message,
       GetCaretPos(&point);
       ClientToScreen(edit, &point);
     }
-    const int action = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON,
-                                      point.x, point.y, 0, edit, nullptr);
+    const int action = TrackThemedNotesMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON,
+                                      point.x, point.y, GetParent(edit));
     DestroyMenu(menu);
     const UINT messages[] = {0, EM_UNDO, EM_REDO, WM_CUT, WM_COPY, WM_PASTE,
                              EM_SETSEL};
@@ -16494,6 +16576,7 @@ static LRESULT CALLBACK NotesEditSubclass(HWND edit, UINT message,
 
 static bool CaptureNotesPage(HWND dialog, ClientNotesDialogState &state,
                               bool reportFailure = true) {
+  if (!HasActiveNote(state)) return true;
   HWND edit = GetDlgItem(dialog, IDC_CLIENT_NOTES_TEXT);
   if (!NotesPlainTextWithinLimit(edit)) {
     if (reportFailure) MessageBoxW(dialog, L"The document exceeds the 32 MiB text limit. Shorten it and try again.",
@@ -16507,15 +16590,20 @@ static bool CaptureNotesPage(HWND dialog, ClientNotesDialogState &state,
     return false;
   }
   auto &page = state.pages[state.activePage];
-  page.rich = true;
-  page.rtf = std::move(rtf);
-  page.text.clear();
+  const std::string previous = page.rtf;
+  page.rich = true; page.rtf = std::move(rtf); page.text.clear();
+  if (page.rtf != previous && (state.formattingChanged || SendMessageW(edit, EM_GETMODIFY, 0, 0))) {
+    client_notes::RememberRevision(page, previous);
+    page.modified = client_notes::Now();
+    if (!page.created) page.created = page.modified;
+  }
   return true;
 }
 
 static bool SaveClientNotesDraft(HWND dialog, ClientNotesDialogState &state,
                                  bool reportFailure) {
   KillTimer(dialog, 1);
+  NotesRememberView(dialog, state);
   if (!CaptureNotesPage(dialog, state, reportFailure)) {
     SetNotesSaveFailure(dialog, state, true);
     SetDlgItemTextW(dialog, IDC_NOTES_STATUS, L"Could not save: shorten this note");
@@ -16536,6 +16624,7 @@ static bool SaveClientNotesDraft(HWND dialog, ClientNotesDialogState &state,
   };
   if (!safeClient() ||
       !client_notes::WriteNotebook(state.clientRoot, state.pages, state.original, safeClient)) {
+    NotesWriteRecovery(dialog, state);
     SetNotesSaveFailure(dialog, state, true);
     SetDlgItemTextW(dialog, IDC_NOTES_STATUS, L"Could not save - drafts are still open");
     if (reportFailure) MessageBoxW(dialog,
@@ -16547,6 +16636,8 @@ static bool SaveClientNotesDraft(HWND dialog, ClientNotesDialogState &state,
   }
   // Keep the exact committed bytes as the next expected snapshot. Reading
   // again here could accidentally accept a concurrent writer's later version.
+  state.metadataChanged = false;
+  DeleteFileW((state.clientRoot / state.draftName).c_str());
   state.original.status = client_notes::ReadStatus::Ok;
   state.original.pages = state.pages;
   state.original.notebook_snapshot.status = client_notes::ReadStatus::Ok;
@@ -16600,7 +16691,7 @@ static void CloseClientNotesDialog(HWND dialog,
                                    ClientNotesDialogState &state) {
   if (SaveClientNotesDraft(dialog, state, true)) {
     RememberNotesWindowSize(dialog);
-    EndDialog(dialog, IDCANCEL);
+    DestroyWindow(dialog);
   }
 }
 
@@ -16647,7 +16738,7 @@ static void LayoutClientNotes(HWND dialog, UINT dpi) {
     state->uiFont = CreateFontW(-MulDiv(12, dpi, 72), 0, 0, 0, FW_NORMAL,
         FALSE, FALSE, FALSE, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, L"Segoe UI");
     EnumChildWindows(dialog, [](HWND control, LPARAM font) -> BOOL {
-      if (GetDlgCtrlID(control) != IDC_CLIENT_NOTES_TEXT)
+      if (GetDlgCtrlID(control) != IDC_CLIENT_NOTES_TEXT && GetDlgCtrlID(control) != 0)
         SendMessageW(control, WM_SETFONT, font, TRUE);
       return TRUE;
     }, reinterpret_cast<LPARAM>(state->uiFont));
@@ -16662,6 +16753,7 @@ static void LayoutClientNotes(HWND dialog, UINT dpi) {
   HDWP layout = BeginDeferWindowPos(24);
   auto place = [&](int id, int x, int y, int width, int h = -1) {
     HWND control = GetDlgItem(dialog, id);
+    if (!control) return;
     RECT old{}; GetWindowRect(control, &old);
     MapWindowPoints(nullptr, dialog, reinterpret_cast<POINT *>(&old), 2);
     const bool combo = id == IDC_NOTES_STYLE || id == IDC_NOTES_SIZE;
@@ -16676,7 +16768,9 @@ static void LayoutClientNotes(HWND dialog, UINT dpi) {
         flags);
   };
   place(IDC_NOTES_CLIENT_HEADING, ScaleByDpi(20, dpi), ScaleByDpi(10, dpi),
-        area.right - ScaleByDpi(80, dpi), ScaleByDpi(26, dpi));
+        area.right - ScaleByDpi(290, dpi), ScaleByDpi(26, dpi));
+  place(IDC_NOTES_LIBRARY, area.right - ScaleByDpi(250,dpi), ScaleByDpi(5,dpi), ScaleByDpi(112,dpi), ScaleByDpi(30,dpi));
+  place(IDC_NOTES_MORE, area.right - ScaleByDpi(130,dpi), ScaleByDpi(5,dpi), ScaleByDpi(75,dpi), ScaleByDpi(30,dpi));
   place(IDCANCEL, area.right - ScaleByDpi(44, dpi), ScaleByDpi(2, dpi),
         ScaleByDpi(36, dpi), ScaleByDpi(36, dpi));
   ShowWindow(GetDlgItem(dialog, IDC_NOTES_CLIENT_HEADING), SW_SHOW);
@@ -16719,7 +16813,16 @@ static void LayoutClientNotes(HWND dialog, UINT dpi) {
           combo ? ScaleByDpi(210, dpi) : -1);
     x += ScaleByDpi(width, dpi) + toolGap;
   }
-  const int editorTop = ScaleByDpi(144, dpi);
+  int findX = margin;
+  for (const auto [id, width] : {std::pair{IDC_NOTES_FIND, 300}, {IDC_NOTES_FIND_PREV, 80},
+      {IDC_NOTES_FIND_NEXT,60}, {IDC_NOTES_REPLACE,100}, {IDC_NOTES_FIND_CLOSE,120}}) {
+    place(id,findX,ScaleByDpi(143,dpi),ScaleByDpi(width,dpi),ScaleByDpi(30,dpi));
+    ShowWindow(GetDlgItem(dialog,id),state->findVisible ? SW_SHOW : SW_HIDE);
+    findX += ScaleByDpi(width+6,dpi);
+  }
+  const int editorTop = ScaleByDpi(state->findVisible ? 184 : 144, dpi);
+  place(IDC_NOTES_EMPTY, margin, editorTop + ScaleByDpi(80,dpi),area.right-margin*2,ScaleByDpi(60,dpi));
+  ShowWindow(GetDlgItem(dialog,IDC_NOTES_EMPTY),HasActiveNote(*state) ? SW_HIDE : SW_SHOW);
   place(IDC_CLIENT_NOTES_TEXT, margin + ScaleByDpi(4, dpi), editorTop,
         (std::max)(0, static_cast<int>(area.right) - margin * 2 - ScaleByDpi(8, dpi)),
         (std::max)(0, static_cast<int>(area.bottom) - margin - editorTop));
@@ -16744,6 +16847,9 @@ static void ApplyNotesEditorTheme(HWND dialog, ClientNotesDialogState &state) {
   HWND edit = GetDlgItem(dialog, IDC_CLIENT_NOTES_TEXT);
   SetWindowTheme(edit, g_bThemeIsDark ? L"DarkMode_Explorer" : L"Explorer", nullptr);
   SendMessageW(edit, EM_SETBKGNDCOLOR, 0, g_themeColors.crControl);
+  for (const auto &[id,window] : state.editors) {
+    SendMessageW(window,EM_SETBKGNDCOLOR,0,g_themeColors.crControl);
+  }
   // Character colors are set when loading a page. Reapplying the window
   // theme for DPI changes must not rewrite formatting or add undo records.
   RedrawWindow(edit, nullptr, nullptr, RDW_INVALIDATE | RDW_ERASE);
@@ -16816,7 +16922,7 @@ static LRESULT CALLBACK NotesComboSubclass(HWND combo, UINT message,
 
 static bool DrawNotesComboItem(const DRAWITEMSTRUCT &draw) {
   if (draw.CtlType != ODT_COMBOBOX ||
-      (draw.CtlID != IDC_NOTES_STYLE && draw.CtlID != IDC_NOTES_SIZE)) return false;
+      (draw.CtlID != IDC_NOTES_STYLE && draw.CtlID != IDC_NOTES_SIZE && draw.CtlID != IDC_NOTES_FILTER)) return false;
   const bool selected = (draw.itemState & ODS_SELECTED) != 0;
   HBRUSH background = CreateSolidBrush(selected ? g_themeColors.crAccent : g_themeColors.crControl);
   FillRect(draw.hDC, &draw.rcItem, background); DeleteObject(background);
@@ -16883,8 +16989,62 @@ static void ApplyNotesTextColors(HWND edit) {
   document->Release();
 }
 
+static void RefreshNotesForTheme() {
+  if (!g_hNotesWindow) return;
+  auto *state=reinterpret_cast<ClientNotesDialogState *>(GetWindowLongPtrW(g_hNotesWindow,DWLP_USER));
+  if (!state || state->loading) return;
+  state->loading=true;
+  ApplyNotesEditorTheme(g_hNotesWindow,*state);
+  for (const auto &[id,edit] : state->editors) {
+    IUnknown *ole=nullptr; ITextDocument *document=nullptr;
+    SendMessageW(edit,EM_GETOLEINTERFACE,0,reinterpret_cast<LPARAM>(&ole));
+    if (ole) { ole->QueryInterface(__uuidof(ITextDocument),reinterpret_cast<void **>(&document)); ole->Release(); }
+    const LRESULT modified=SendMessageW(edit,EM_GETMODIFY,0,0);
+    if (document) document->Undo(tomSuspend,nullptr);
+    ApplyNotesTextColors(edit);
+    if (document) { document->Undo(tomResume,nullptr); document->Release(); }
+    SendMessageW(edit,EM_SETMODIFY,modified,0);
+    RedrawWindow(edit,nullptr,nullptr,RDW_INVALIDATE);
+  }
+  state->loading=false;
+  UpdateNotesToolbar(g_hNotesWindow,*state);
+  RedrawWindow(g_hNotesWindow,nullptr,nullptr,RDW_INVALIDATE|RDW_ERASE|RDW_ALLCHILDREN);
+}
+
 static bool LoadNotesPage(HWND dialog, ClientNotesDialogState &state) {
+  if (state.attachedEditor) {
+    ShowWindow(state.attachedEditor, SW_HIDE);
+    SetWindowLongPtrW(state.attachedEditor, GWLP_ID, 0);
+    state.attachedEditor = nullptr;
+  }
+  if (!HasActiveNote(state)) {
+    ShowWindow(GetDlgItem(dialog, IDC_CLIENT_NOTES_TEXT), SW_HIDE);
+    ShowWindow(GetDlgItem(dialog, IDC_NOTES_EMPTY), SW_SHOW);
+    UpdateNotesToolbar(dialog, state); return true;
+  }
+  ShowWindow(GetDlgItem(dialog, IDC_NOTES_EMPTY), SW_HIDE);
+  const auto id = state.pages[state.activePage].id;
+  auto found = state.editors.find(id);
+  if (found != state.editors.end()) {
+    state.attachedEditor = found->second;
+    SetWindowLongPtrW(found->second, GWLP_ID, IDC_CLIENT_NOTES_TEXT);
+    ShowWindow(found->second, SW_SHOW);
+    LayoutClientNotes(dialog, GetDpiForWindow(dialog));
+    UpdateNotesToolbar(dialog, state); SetFocus(found->second); return true;
+  }
   HWND edit = GetDlgItem(dialog, IDC_CLIENT_NOTES_TEXT);
+  if (!edit) edit = CreateWindowExW(0, L"RICHEDIT50W", L"",
+      WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_VSCROLL | ES_MULTILINE | ES_AUTOVSCROLL | ES_WANTRETURN,
+      0,0,100,100,dialog,reinterpret_cast<HMENU>(IDC_CLIENT_NOTES_TEXT),g_hInst,nullptr);
+  if (!edit) return false;
+  state.attachedEditor = edit; state.editors[id] = edit;
+  ShowWindow(edit, SW_SHOW);
+  SetWindowSubclass(edit, NotesEditSubclass, 1, 0);
+  SendMessageW(edit, EM_SETOLECALLBACK, 0, reinterpret_cast<LPARAM>(&g_notesOleCallback));
+  SendMessageW(edit, EM_EXLIMITTEXT, 0, client_notes::kMaxRichBytes);
+  SendMessageW(edit, EM_SETEVENTMASK, 0, ENM_CHANGE | ENM_SELCHANGE | ENM_LINK);
+  SendMessageW(edit, EM_AUTOURLDETECT, AURL_ENABLEURL, 0);
+  SendMessageW(edit, EM_SETBKGNDCOLOR, 0, g_themeColors.crControl);
   auto &page = state.pages[state.activePage];
   state.loading = true;
   // Restore a predictable default for a new page, independently of the prior tab.
@@ -16937,15 +17097,63 @@ static bool LoadNotesPage(HWND dialog, ClientNotesDialogState &state) {
     SendMessageW(edit, EM_SETMODIFY, FALSE, 0);
     state.formattingChanged = false;
   }
+  CHARRANGE caret{static_cast<LONG>(page.cursor), static_cast<LONG>(page.cursor)};
+  SendMessageW(edit, EM_EXSETSEL, 0, reinterpret_cast<LPARAM>(&caret));
+  SendMessageW(edit, EM_SETZOOM, page.zoom, 100);
+  POINT scroll{0,static_cast<LONG>(page.scroll)};
+  SendMessageW(edit, EM_SETSCROLLPOS, 0, reinterpret_cast<LPARAM>(&scroll));
   state.loading = false;
-  UpdateNotesToolbar(dialog, state);
-  SetNotesStatus(dialog, state);
-  SetFocus(edit);
+  LayoutClientNotes(dialog, GetDpiForWindow(dialog));
+  UpdateNotesToolbar(dialog, state); SetNotesStatus(dialog, state); SetFocus(edit);
   return ok;
 }
 
 static LRESULT CALLBACK NotesTabsSubclass(HWND tabs, UINT message,
     WPARAM wParam, LPARAM lParam, UINT_PTR id, DWORD_PTR) {
+  HWND dialog=GetParent(tabs);
+  auto *workspace=reinterpret_cast<ClientNotesDialogState *>(GetWindowLongPtrW(dialog,DWLP_USER));
+  if (workspace && message==WM_LBUTTONDOWN) {
+    TCHITTESTINFO hit{{GET_X_LPARAM(lParam),GET_Y_LPARAM(lParam)},0};
+    const int tab=TabCtrl_HitTest(tabs,&hit);
+    workspace->dragTab=tab; workspace->dragStart=hit.pt;
+    if (tab>=0 && static_cast<size_t>(tab)<workspace->visiblePages.size()) {
+      RECT rect{}; TabCtrl_GetItemRect(tabs,tab,&rect);
+      if (hit.pt.x>=rect.right-ScaleByDpi(25,GetDpiForWindow(tabs))) {
+        if (!SaveClientNotesDraft(dialog,*workspace,true)) return 0;
+        workspace->activePage=workspace->visiblePages[tab]; LoadNotesPage(dialog,*workspace);
+        NotesWorkspaceCommand(dialog,*workspace,IDC_NOTES_CLOSE_TAB); workspace->dragTab=-1; return 0;
+      }
+    }
+  }
+  if (workspace && message==WM_MOUSEMOVE && (wParam&MK_LBUTTON) && workspace->dragTab>=0 &&
+      abs(GET_X_LPARAM(lParam)-workspace->dragStart.x)>GetSystemMetrics(SM_CXDRAG)) {
+    workspace->dragging=true; SetCapture(tabs);
+  }
+  if (workspace && message==WM_LBUTTONUP && workspace->dragging) {
+    const int source=workspace->dragTab;
+    workspace->dragging=false; ReleaseCapture();
+    TCHITTESTINFO hit{{GET_X_LPARAM(lParam),GET_Y_LPARAM(lParam)},0}; const int target=TabCtrl_HitTest(tabs,&hit);
+    workspace->dragTab=-1;
+    if (source>=0 && target>=0 && source!=target && static_cast<size_t>(source)<workspace->visiblePages.size() && static_cast<size_t>(target)<workspace->visiblePages.size() && SaveClientNotesDraft(dialog,*workspace,true)) {
+      size_t from=workspace->visiblePages[source], to=workspace->visiblePages[target];
+      if (workspace->pages[from].pinned!=workspace->pages[to].pinned) return 0;
+      const uint64_t active=workspace->pages[workspace->activePage].id;
+      auto page=std::move(workspace->pages[from]); auto baseline=std::move(workspace->baselines[from]);
+      workspace->pages.erase(workspace->pages.begin()+from); workspace->baselines.erase(workspace->baselines.begin()+from);
+      workspace->pages.insert(workspace->pages.begin()+to,std::move(page)); workspace->baselines.insert(workspace->baselines.begin()+to,std::move(baseline));
+      for (size_t i=0;i<workspace->pages.size();++i) if (workspace->pages[i].id==active) workspace->activePage=i;
+      workspace->metadataChanged=true; RefreshNotesTabs(dialog,*workspace); SaveClientNotesDraft(dialog,*workspace,true);
+    }
+    return 0;
+  }
+  if (workspace && message==WM_LBUTTONUP) workspace->dragTab=-1;
+  if (workspace && message==WM_CAPTURECHANGED) { workspace->dragging=false; workspace->dragTab=-1; }
+  if (workspace && message==WM_MOUSEWHEEL && !workspace->visiblePages.empty()) {
+    if (!SaveClientNotesDraft(dialog,*workspace,true)) return 0;
+    int selected=TabCtrl_GetCurSel(tabs)+(GET_WHEEL_DELTA_WPARAM(wParam)<0 ? 1 : -1);
+    selected=std::clamp(selected,0,static_cast<int>(workspace->visiblePages.size())-1);
+    workspace->activePage=workspace->visiblePages[selected]; RefreshNotesTabs(dialog,*workspace); LoadNotesPage(dialog,*workspace); return 0;
+  }
   if (message == WM_NCDESTROY)
     RemoveWindowSubclass(tabs, NotesTabsSubclass, id);
   if (message == WM_LBUTTONDBLCLK) {
@@ -16973,9 +17181,14 @@ static LRESULT CALLBACK NotesTabsSubclass(HWND tabs, UINT message,
       position = {selected.left, selected.bottom}; ClientToScreen(tabs, &position);
     }
     HMENU menu = CreatePopupMenu();
-    AppendMenuW(menu, MF_STRING, IDC_NOTES_RENAME_TAB, L"Rename tab...");
-    const UINT command = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON,
-                                        position.x, position.y, 0, dialog, nullptr);
+    for (const auto [command,label] : {std::pair{IDC_NOTES_RENAME_TAB,L"Rename tab..."},
+        {IDC_NOTES_DUPLICATE,L"Duplicate"}, {IDC_NOTES_PIN,L"Pin / unpin"},
+        {IDC_NOTES_CLOSE_TAB,L"Close tab\tCtrl+W"}, {IDC_NOTES_CLOSE_OTHERS,L"Close other tabs"},
+        {IDC_NOTES_CLOSE_ALL,L"Close all tabs"}, {IDC_NOTES_ARCHIVE,L"Archive"},
+        {IDC_NOTES_DELETE,L"Move to Recently deleted"}})
+      AppendMenuW(menu,MF_STRING,command,label);
+    const UINT command = TrackThemedNotesMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON,
+                                        position.x, position.y, dialog);
     DestroyMenu(menu);
     if (command) PostMessageW(dialog, WM_COMMAND, command, 0);
     return 0;
@@ -17019,7 +17232,13 @@ static LRESULT CALLBACK NotesTabsSubclass(HWND tabs, UINT message,
       item.cchTextMax = static_cast<int>(std::size(name));
       TabCtrl_GetItem(tabs, i, &item);
       rect.left += ScaleByDpi(8, GetDpiForWindow(tabs));
-      rect.right -= ScaleByDpi(8, GetDpiForWindow(tabs));
+      RECT close{rect.right-ScaleByDpi(24,GetDpiForWindow(tabs)),rect.top,rect.right-ScaleByDpi(2,GetDpiForWindow(tabs)),rect.bottom};
+      notes_editor_ui::DrawIcon(dc,close,IDCANCEL,g_themeColors.crControlText);
+      if (state && static_cast<size_t>(i)<state->visiblePages.size() && state->pages[state->visiblePages[i]].pinned) {
+        RECT pin=rect; pin.right=pin.left+ScaleByDpi(8,GetDpiForWindow(tabs));
+        DrawTextW(dc,L"*",1,&pin,DT_SINGLELINE|DT_VCENTER); rect.left+=ScaleByDpi(9,GetDpiForWindow(tabs));
+      }
+      rect.right -= ScaleByDpi(25, GetDpiForWindow(tabs));
       SelectObject(dc, selected && state ? state->tabFont : reinterpret_cast<HFONT>(SendMessageW(tabs, WM_GETFONT, 0, 0)));
       SetTextColor(dc, selected ? g_themeColors.crControlText :
                       BlendColor(g_themeColors.crControlText, g_themeColors.crWindow, 20));
@@ -17039,19 +17258,25 @@ static LRESULT CALLBACK NotesTabsSubclass(HWND tabs, UINT message,
 
 static void RefreshNotesTabs(HWND dialog, ClientNotesDialogState &state) {
   HWND tabs = GetDlgItem(dialog, IDC_NOTES_TABS);
-  TabCtrl_DeleteAllItems(tabs);
-  for (size_t i = 0; i < state.pages.size(); ++i) {
-    TCITEMW item{};
-    item.mask = TCIF_TEXT;
-    item.pszText = state.pages[i].name.data();
-    TabCtrl_InsertItem(tabs, static_cast<int>(i), &item);
+  TabCtrl_DeleteAllItems(tabs); state.visiblePages.clear();
+  for (bool pinned : {true, false}) for (size_t i = 0; i < state.pages.size(); ++i) {
+    const auto &p = state.pages[i];
+    if (!p.open || p.archived || p.deleted || p.pinned != pinned) continue;
+    TCITEMW item{}; item.mask = TCIF_TEXT;
+    item.pszText = const_cast<wchar_t *>(p.name.c_str());
+    TabCtrl_InsertItem(tabs, static_cast<int>(state.visiblePages.size()), &item);
+    state.visiblePages.push_back(i);
   }
-  TabCtrl_SetCurSel(tabs, static_cast<int>(state.activePage));
-  EnableWindow(GetDlgItem(dialog, IDC_NOTES_ADD_TAB),
-                state.pages.size() < client_notes::kMaxPages);
-  InvalidateRect(tabs, nullptr, TRUE);
-  LayoutClientNotes(dialog, GetDpiForWindow(dialog));
+  int selection = -1;
+  for (size_t i = 0; i < state.visiblePages.size(); ++i)
+    if (state.visiblePages[i] == state.activePage) selection = static_cast<int>(i);
+  TabCtrl_SetCurSel(tabs,selection);
+  EnableWindow(GetDlgItem(dialog, IDC_NOTES_ADD_TAB),state.pages.size() < client_notes::kMaxPages);
+  LayoutClientNotes(dialog,GetDpiForWindow(dialog));
+  InvalidateRect(tabs,nullptr,FALSE);
 }
+
+#include "NotesWorkspaceUi.inl"
 
 struct NotesTabNameState {
   const std::vector<client_notes::NotePage> *pages;
@@ -17100,8 +17325,8 @@ static INT_PTR CALLBACK NotesTabNameDlgProc(HWND dialog, UINT message,
 }
 
 static void NotesCharacterFormat(HWND dialog, ClientNotesDialogState &state,
-                                 DWORD mask, DWORD effect, COLORREF color = 0,
-                                 LONG height = 0) {
+                                 DWORD mask, DWORD effect, COLORREF color,
+                                 LONG height) {
   HWND edit = GetDlgItem(dialog, IDC_CLIENT_NOTES_TEXT);
   CHARFORMAT2W format{};
   format.cbSize = sizeof(format);
@@ -17157,7 +17382,7 @@ static INT_PTR CALLBACK ClientNotesDlgProc(HWND dialog, UINT message,
     DwmSetWindowAttribute(dialog, static_cast<DWMWINDOWATTRIBUTE>(33), &rounded, sizeof(rounded));
     HWND edit = GetDlgItem(dialog, IDC_CLIENT_NOTES_TEXT);
     if (!edit) {
-      EndDialog(dialog, IDCANCEL);
+      DestroyWindow(dialog);
       return FALSE;
     }
     SetWindowSubclass(edit, NotesEditSubclass, 1, 0);
@@ -17167,7 +17392,7 @@ static INT_PTR CALLBACK ClientNotesDlgProc(HWND dialog, UINT message,
     SendMessageW(edit, EM_SETEVENTMASK, 0,
                  ENM_CHANGE | ENM_SELCHANGE | ENM_LINK);
     SendMessageW(edit, EM_AUTOURLDETECT, AURL_ENABLEURL, 0);
-    const wchar_t *styles[] = {L"Normal text", L"Heading", L"Subheading"};
+    const wchar_t *styles[] = {L"Normal text", L"Heading", L"Subheading", L"Code"};
     const wchar_t *sizes[] = {L"10", L"11", L"12", L"14", L"16", L"18",
                               L"20", L"24", L"28", L"32"};
     for (const auto *style : styles)
@@ -17194,10 +17419,9 @@ static INT_PTR CALLBACK ClientNotesDlgProc(HWND dialog, UINT message,
         {IDC_NOTES_UNDERLINE, L"Underline (Ctrl+U)"}, {IDC_NOTES_HIGHLIGHT, L"Highlight"},
         {IDC_NOTES_HIGHLIGHT_COLOR, L"Highlight color"},
         {IDC_NOTES_BULLETS, L"Bulleted list"}, {IDC_NOTES_NUMBERS, L"Numbered list"},
-        {IDC_NOTES_CHECKLIST, L"Checklist"}, {IDC_NOTES_LINK, L"Format selected URL as a link"},
+        {IDC_NOTES_CHECKLIST, L"Checklist"}, {IDC_NOTES_LINK, L"Insert or edit a link"},
         {IDC_NOTES_UNDO, L"Undo (Ctrl+Z)"}, {IDC_NOTES_REDO, L"Redo (Ctrl+Y)"},
-        {IDC_NOTES_CLEAR, L"Clear formatting"}, {IDC_NOTES_ADD_TAB, L"New ticket tab"},
-        {IDC_NOTES_TABS, L"Double-click a tab, or right-click for Rename tab"}}) {
+        {IDC_NOTES_CLEAR, L"Clear formatting"}, {IDC_NOTES_ADD_TAB, L"New ticket tab"}}) {
       TOOLINFOW tool{}; tool.cbSize = sizeof(tool); tool.hwnd = dialog;
       tool.uFlags = TTF_IDISHWND | TTF_SUBCLASS;
       tool.uId = reinterpret_cast<UINT_PTR>(GetDlgItem(dialog, id));
@@ -17207,23 +17431,43 @@ static INT_PTR CALLBACK ClientNotesDlgProc(HWND dialog, UINT message,
     ApplyNotesEditorTheme(dialog, *state);
     state->pages = state->original.pages;
     state->baselines.resize(state->pages.size());
+    state->activePage = state->pages.size();
+    for (size_t i = 0; i < state->pages.size(); ++i) {
+      auto &page = state->pages[i];
+      if (!page.id) page.id = client_notes::NextId(state->pages);
+      if (page.open && !page.archived && !page.deleted &&
+          (state->activePage == state->pages.size() || page.active)) state->activePage = i;
+    }
     RefreshNotesTabs(dialog, *state);
     if (!LoadNotesPage(dialog, *state)) {
       MessageBoxW(dialog, L"The note cannot be edited within the rich text size limit.",
                   L"Client Notes", MB_OK | MB_ICONWARNING);
-      EndDialog(dialog, IDCANCEL);
+      DestroyWindow(dialog);
       return FALSE;
     }
+    state->topmost=GetPrivateProfileIntW(L"notes_window",L"topmost",0,g_sConfigPath.c_str())!=0;
+    state->showProgress=GetPrivateProfileIntW(L"notes_window",L"progress",0,g_sConfigPath.c_str())!=0;
+    if (state->topmost) SetWindowPos(dialog,HWND_TOPMOST,0,0,0,0,SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE);
     RestoreNotesWindowSize(dialog);
     LayoutClientNotes(dialog, GetDpiForWindow(dialog));
     SetNotesStatus(dialog, *state);
     UpdateNotesToolbar(dialog, *state);
-    SetFocus(edit);
+    SetFocus(HasActiveNote(*state) ? GetDlgItem(dialog,IDC_CLIENT_NOTES_TEXT) : GetDlgItem(dialog,IDC_NOTES_ADD_TAB));
     return FALSE;
   }
   if (message == WM_DRAWITEM && lParam) {
     const auto &draw = *reinterpret_cast<const DRAWITEMSTRUCT *>(lParam);
-    if (draw.CtlType == ODT_MENU) { DrawThemedMenuItem(draw, dialog); return TRUE; }
+    if (draw.CtlType == ODT_MENU) {
+      DrawThemedMenuItem(draw, dialog);
+      if (state && state->highlightPalette && draw.itemID>=1 && draw.itemID<=4) {
+        const COLORREF colors[]={RGB(249,211,66),RGB(164,224,141),RGB(149,207,245),RGB(245,164,200)};
+        const int size=ScaleByDpi(18,GetDpiForWindow(dialog));
+        RECT swatch{draw.rcItem.right-size*2,(draw.rcItem.top+draw.rcItem.bottom-size)/2,draw.rcItem.right-size,(draw.rcItem.top+draw.rcItem.bottom+size)/2};
+        HBRUSH fill=CreateSolidBrush(colors[draw.itemID-1]); FillRect(draw.hDC,&swatch,fill); DeleteObject(fill);
+        FrameRect(draw.hDC,&swatch,g_hbrThemeBorder);
+      }
+      return TRUE;
+    }
     if (DrawNotesComboItem(draw) || (state && DrawNotesToolbarButton(draw, *state))) return TRUE;
   }
   if (message == WM_MEASUREITEM && lParam) {
@@ -17302,6 +17546,11 @@ static INT_PTR CALLBACK ClientNotesDlgProc(HWND dialog, UINT message,
     return TRUE;
   case WM_NOTIFY: {
     auto *notice = reinterpret_cast<NMHDR *>(lParam);
+    if (notice && notice->code==TTN_GETDISPINFOW && notice->hwndFrom==TabCtrl_GetToolTips(GetDlgItem(dialog,IDC_NOTES_TABS))) {
+      auto *tip=reinterpret_cast<NMTTDISPINFOW *>(lParam);
+      if (notice->idFrom<state->visiblePages.size()) tip->lpszText=state->pages[state->visiblePages[notice->idFrom]].name.data();
+      return TRUE;
+    }
     if (notice && notice->idFrom == IDC_NOTES_TABS) {
       if (notice->code == TCN_SELCHANGING) {
         SetWindowLongPtrW(dialog, DWLP_MSGRESULT,
@@ -17310,14 +17559,14 @@ static INT_PTR CALLBACK ClientNotesDlgProc(HWND dialog, UINT message,
       }
       if (notice->code == TCN_SELCHANGE) {
         const int selected = TabCtrl_GetCurSel(notice->hwndFrom);
-        if (selected >= 0 && static_cast<size_t>(selected) < state->pages.size()) {
+        if (selected >= 0 && static_cast<size_t>(selected) < state->visiblePages.size()) {
           const size_t previous = state->activePage;
-          state->activePage = static_cast<size_t>(selected);
+          state->activePage = state->visiblePages[selected];
           if (!LoadNotesPage(dialog, *state)) {
             MessageBoxW(dialog, L"This tab cannot be edited within the rich text size limit.",
                         L"Client Notes", MB_OK | MB_ICONWARNING);
             state->activePage = previous;
-            TabCtrl_SetCurSel(notice->hwndFrom, static_cast<int>(previous));
+            RefreshNotesTabs(dialog, *state);
             LoadNotesPage(dialog, *state);
           }
           InvalidateRect(notice->hwndFrom, nullptr, TRUE);
@@ -17336,13 +17585,17 @@ static INT_PTR CALLBACK ClientNotesDlgProc(HWND dialog, UINT message,
       if (link->msg == WM_LBUTTONUP || link->msg == WM_LBUTTONDBLCLK) {
         const std::wstring url = NotesRangeText(notice->hwndFrom,
                                                link->chrg.cpMin, link->chrg.cpMax);
-        OpenNotesUrl(dialog, *state, url);
+        std::wstring target=url;
+        if (HasActiveNote(*state)) for (const auto &[label,address] : state->pages[state->activePage].links)
+          if (label==url) { target=address; break; }
+        OpenNotesUrl(dialog, *state, target);
         return TRUE;
       }
     }
     break;
   }
   case WM_COMMAND:
+    if (NotesWorkspaceCommand(dialog, *state, LOWORD(wParam))) return TRUE;
     if (LOWORD(wParam) == IDC_NOTES_ADD_TAB || LOWORD(wParam) == IDC_NOTES_RENAME_TAB) {
       const bool adding = LOWORD(wParam) == IDC_NOTES_ADD_TAB;
       if (adding && state->pages.size() >= client_notes::kMaxPages)
@@ -17354,7 +17607,9 @@ static INT_PTR CALLBACK ClientNotesDlgProc(HWND dialog, UINT message,
         for (size_t suffix = 2; std::any_of(state->pages.begin(), state->pages.end(),
             [&](const auto &page) { return client_notes::SamePageName(page.name, name); }); ++suffix)
           name = L"Untitled " + std::to_wstring(suffix);
-        state->pages.push_back({name, true, "{\\rtf1\\ansi }", {}});
+        client_notes::NotePage page{name,true,"{\\rtf1\\ansi }",{}};
+        page.id = client_notes::NextId(state->pages); page.created = page.modified = client_notes::Now();
+        page.pristine = true; state->pages.push_back(std::move(page));
         state->baselines.emplace_back();
         state->activePage = state->pages.size() - 1;
         LoadNotesPage(dialog, *state);
@@ -17364,6 +17619,7 @@ static INT_PTR CALLBACK ClientNotesDlgProc(HWND dialog, UINT message,
                 NotesTabNameDlgProc, reinterpret_cast<LPARAM>(&name)) != IDOK) return TRUE;
         state->pages[state->activePage].name = std::move(name.name);
       }
+      state->metadataChanged = true;
       RefreshNotesTabs(dialog, *state);
       SaveClientNotesDraft(dialog, *state);
       SetFocus(GetDlgItem(dialog, IDC_CLIENT_NOTES_TEXT));
@@ -17388,7 +17644,8 @@ static INT_PTR CALLBACK ClientNotesDlgProc(HWND dialog, UINT message,
     if (LOWORD(wParam) == IDC_NOTES_STYLE && HIWORD(wParam) == CBN_SELCHANGE) {
       const LRESULT index = SendDlgItemMessageW(dialog, IDC_NOTES_STYLE,
                                                  CB_GETCURSEL, 0, 0);
-      NotesCharacterFormat(dialog, *state, CFM_SIZE | CFM_BOLD,
+      if (index == 3) { NotesWorkspaceCommand(dialog,*state,IDC_NOTES_CODE); return TRUE; }
+      NotesCharacterFormat(dialog, *state, CFM_FACE | CFM_SIZE | CFM_BOLD,
                            index == 1 || index == 2 ? CFE_BOLD : 0, 0,
                            index == 1 ? 560 : index == 2 ? 320 : 280);
       PARAFORMAT2 paragraph{sizeof(paragraph)};
@@ -17441,9 +17698,16 @@ static INT_PTR CALLBACK ClientNotesDlgProc(HWND dialog, UINT message,
           item.dwTypeData = const_cast<wchar_t *>(labels[i]);
           InsertMenuItemW(menu, i, TRUE, &item);
         }
+        CHARFORMAT2W selected{sizeof(selected)};
+        SendDlgItemMessageW(dialog,IDC_CLIENT_NOTES_TEXT,EM_GETCHARFORMAT,SCF_SELECTION,reinterpret_cast<LPARAM>(&selected));
+        if (selected.dwMask&CFM_BACKCOLOR) for (UINT i=0;i<5;++i)
+          if ((i==4 && (selected.dwEffects&CFE_AUTOBACKCOLOR)) || (i<4 && !(selected.dwEffects&CFE_AUTOBACKCOLOR) && selected.crBackColor==colors[i]))
+            CheckMenuItem(menu,i+1,MF_BYCOMMAND|MF_CHECKED);
+        state->highlightPalette=true;
         RECT anchor{}; GetWindowRect(GetDlgItem(dialog, IDC_NOTES_HIGHLIGHT_COLOR), &anchor);
         const UINT command = TrackPopupMenuEx(menu, TPM_RETURNCMD | TPM_NONOTIFY,
             anchor.left, anchor.bottom, dialog, nullptr);
+        state->highlightPalette=false;
         DestroyMenu(menu);
         SetFocus(GetDlgItem(dialog, IDC_CLIENT_NOTES_TEXT));
         if (!command) return TRUE;
@@ -17529,10 +17793,15 @@ static INT_PTR CALLBACK ClientNotesDlgProc(HWND dialog, UINT message,
       return TRUE;
     }
     break;
+  case WM_NCDESTROY:
+    SetWindowLongPtrW(dialog,DWLP_USER,0);
+    if (g_hNotesWindow == dialog) g_hNotesWindow = nullptr;
+    delete state; return FALSE;
   case WM_CLOSE:
     CloseClientNotesDialog(dialog, *state);
     return TRUE;
   case WM_TIMER:
+    if (wParam == 2) { KillTimer(dialog, 2); NotesWriteRecovery(dialog, *state); return TRUE; }
     if (wParam == 1 && !state->loading) {
       SaveClientNotesDraft(dialog, *state);
       return TRUE;
@@ -17553,41 +17822,36 @@ static void ShowClientNotes(const std::wstring &clientName) {
                 MB_OK | MB_ICONINFORMATION);
     return;
   }
-  ClientNotesDialogState state{clientName, clientRoot,
-                               client_notes::ReadNotebook(clientRoot)};
-  state.browser = g_selectedBrowser;
-  if (state.original.status == client_notes::ReadStatus::Error ||
-      !RevalidateSafeClientContainerPath(clientName, clientRoot)) {
-    MessageBoxW(g_hGui,
-                L"The client's notes could not be read safely. Check the "
-                L"client folder before editing them.",
-                L"Client Notes", MB_OK | MB_ICONWARNING);
-    return;
+  if (g_hNotesWindow) {
+    auto *existing = reinterpret_cast<ClientNotesDialogState *>(GetWindowLongPtrW(g_hNotesWindow,DWLP_USER));
+    if (existing && existing->clientName == clientName) {
+      ShowWindow(g_hNotesWindow,SW_RESTORE); SetForegroundWindow(g_hNotesWindow); return;
+    }
+    if (!PrepareNotesForClientChange()) return;
   }
-  g_bClientNotesBusy.store(true);
-  SetUiState(false);
-  HMODULE richEdit = LoadLibraryExW(L"Msftedit.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
-  if (!richEdit) {
-    g_bClientNotesBusy.store(false);
-    SetUiState(true);
-    MessageBoxW(g_hGui, L"The Windows rich text editor is unavailable.",
-                L"Client Notes", MB_OK | MB_ICONWARNING);
-    return;
+  auto *state = new ClientNotesDialogState{clientName,clientRoot,client_notes::ReadNotebook(clientRoot)};
+  state->browser = g_selectedBrowser;
+  state->draftName = L"ctSpaces-notes-draft-" + std::to_wstring(GetCurrentProcessId()) + L".ctn";
+  if (state->original.status == client_notes::ReadStatus::Error) {
+    delete state; MessageBoxW(g_hGui,L"The client's notes could not be read safely.",L"Client Notes",MB_OK|MB_ICONWARNING); return;
   }
-  const INT_PTR result = DialogBoxParamW(g_hInst,
-                                          MAKEINTRESOURCEW(IDD_CLIENT_NOTES),
-                                          g_hGui, ClientNotesDlgProc,
-                                          reinterpret_cast<LPARAM>(&state));
-  FreeLibrary(richEdit);
-  g_bClientNotesBusy.store(false);
-  auto deferredExits = std::move(g_notesDeferredExits);
-  g_notesDeferredExits.clear();
-  for (const auto &payload : deferredExits)
-    HandleProfileExitOnUiThread(*payload);
-  SetUiState(true);
-  if (result == -1)
-    MessageBoxW(g_hGui, L"The notes window could not be opened.",
-                L"Client Notes", MB_OK | MB_ICONWARNING);
+  state->richEditModule = LoadLibraryExW(L"Msftedit.dll",nullptr,LOAD_LIBRARY_SEARCH_SYSTEM32);
+  if (!state->richEditModule) { delete state; return; }
+  g_hNotesWindow = CreateDialogParamW(g_hInst,MAKEINTRESOURCEW(IDD_CLIENT_NOTES),g_hGui,
+      ClientNotesDlgProc,reinterpret_cast<LPARAM>(state));
+  if (g_hNotesWindow) {
+    ShowWindow(g_hNotesWindow,SW_SHOW); SetForegroundWindow(g_hNotesWindow);
+    NotesRecoverDrafts(g_hNotesWindow,*state);
+  }
+}
+
+static bool PrepareNotesForClientChange(const std::wstring &client) {
+  if (!g_hNotesWindow) return true;
+  if (!IsWindowEnabled(g_hNotesWindow)) { SetForegroundWindow(GetLastActivePopup(g_hNotesWindow)); return false; }
+  auto *state = reinterpret_cast<ClientNotesDialogState *>(GetWindowLongPtrW(g_hNotesWindow,DWLP_USER));
+  if (!state || (!client.empty() && !client_notes::SamePageName(client,state->clientName))) return true;
+  SendMessageW(g_hNotesWindow,WM_CLOSE,0,0);
+  return !g_hNotesWindow;
 }
 
 static LRESULT CALLBACK MessageButtonThemeSubclass(HWND window, UINT message,

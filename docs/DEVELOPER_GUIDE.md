@@ -14,6 +14,8 @@ The output executable is self-contained. There is no application framework, pack
 |---|---|
 | `ctSpaces.cpp` | Startup, installer/update flow, launcher UI, themes, profile lifecycle, browser launch/tracking, icons, backup/restore, and dialogs |
 | `ctSpaces.rc` | Icons, dialog resources, embedded `Default.7z`, embedded runtime sanitizer, and Windows version metadata |
+| `ClientNotes.h` / `NotesWorkspaceUi.inl` | Validated atomic notebook v1/v2 storage and native notes workflows |
+| `tests/NotesWorkspaceTests.cpp` | Isolated native-control tests compiled against production notes implementation |
 | `Resource.h` | Resource identifiers |
 | `version.h` | Single version source for app, About, file, and product versions |
 | `theme.h` | Built-in named theme catalog |
@@ -373,3 +375,9 @@ existing-client sentinel and live configuration across two browser cycles.
 ## Documentation Rule
 
 User-visible behavior, data handling, installation prompts, profile cleanup, and release steps are part of the product contract. Update the corresponding document in the same change as the code.
+
+## Notes workspace verification (6.3)
+
+Run `tests/Test-NotesWorkspace.ps1` after a Release x64 app build. This compiles production notes code into an isolated native test process, redirects only confirmation/input/file-picker boundaries, and exercises actual RichEdit and tab controls. It never runs the application startup or reads live client data. Fixtures are retained below `build/notes-workspace-test-*` for inspection. `tests/Test-ClientNotes.ps1` covers notebook storage/migration and unsafe path boundaries. Finish with a live disposable `--qa-instance` / `--qa-data-dir` visual review; native assertions do not establish visual quality or flicker behavior.
+
+The notes workspace is modeless, with one client notebook open at a time. Cached native editors preserve undo per note until the window closes. Client lifecycle operations flush/close the relevant notebook before proceeding. V2 notebooks keep bounded revisions and optional crash snapshots; all writes retain stale-snapshot and safe-path checks. Deferred work is tracked in `docs/notes-roadmap.json`.

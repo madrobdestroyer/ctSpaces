@@ -25,8 +25,9 @@ The important items are:
 | `Sites\<ClientName>` | Persistent client container holding every browser slot | Until whole-client Delete or full removal |
 | `Sites\<ClientName>\Browsers\<browser>\Profile` | Independent Edge, Chrome, Brave, or Firefox profile in the v2 layout | Retained with that client |
 | `Sites\<ClientName>\client.ico` | Optional custom client icon | Retained with that client |
-| `Sites\<ClientName>\ctSpaces-client-notes.ctn` | Local formatted ticket notebook: up to 256 named tabs, 32 MiB text and 64 MiB RTF per tab, 256 MiB total | Autosaved; retained through rename, archive, and full backup; removed with whole client deletion |
+| `Sites\<ClientName>\ctSpaces-client-notes.ctn` | Local formatted ticket notebook: up to 256 notes including closed, archived and deleted notes, 32 MiB text and 64 MiB RTF per tab, 256 MiB total | Autosaved; retained through rename, archive, and full backup; removed with whole client deletion |
 | `Sites\<ClientName>\ctSpaces-client-notes.txt` or `.rtf` | Older notes loaded into the initial Notes tab when no notebook exists | Preserved during the first notebook save; a malformed notebook is reported instead of falling back to older data |
+| `Sites\<ClientName>\ctSpaces-notes-draft-<process>.ctn` | Atomic recovery snapshots for unsaved notes | Recovered as separate copies after an abandoned session; removed after successful save/recovery |
 | `Default.7z` | Sanitized Chromium starter copied into new Edge, Chrome, and Brave profiles | Retained and revisioned |
 | `default-template-revision.txt` | Installed starter-template revision | Retained across launches |
 | `Default` | Temporary working folder for the Chromium Default editor | Recreated for one singleton Edge, Chrome, or Brave editing session; Firefox selection is not accepted |
@@ -141,3 +142,5 @@ Reset is disabled and is not a recovery tool. Delete Profile and manual folder d
 ## Configuration Safety
 
 Config-file inspection distinguishes Regular, Missing, and Unavailable results. An unreadable, unsafe, directory, or reparse-point destination is Unavailable and is not treated as an empty configuration. Client-directory probes separately distinguish Present, Missing/invalid, and Indeterminate. Pin, archive, and Restore-tabs pruning aborts as an all-or-nothing operation on an unavailable/indeterminate state. Every settings mutation is written to a unique sibling stage and committed atomically, so a staged-write failure preserves the original bytes.
+
+Client Notes 6.3 saves notebook format version 2, which includes lifecycle, ticket/link metadata, view state and bounded revision history. Older releases safely reject this format. Notebook export preserves all metadata; individual TXT/RTF exports preserve text/formatting only. Full client backups include archived/deleted notes and any recovery snapshots.

@@ -359,7 +359,7 @@ $clientShortcutNameHeader = Get-Content -Raw -LiteralPath (Join-Path $projectRoo
 Assert-ReleaseCheck ($clientShortcutNameHeader -match 'hashToken\.size\(\)\s*>\s*availableBaseLength\)\s*\r?\n?\s*return\s+L"";' -and $clientShortcutNameHeader -notmatch 'hashToken\.substr') 'A tight Desktop budget can truncate the shortcut collision hash instead of failing safely.'
 $firstPartyProductionSources = @(
     Get-ChildItem -LiteralPath $projectRoot -File |
-        Where-Object { $_.Extension -in @('.cpp', '.h', '.rc') }
+        Where-Object { $_.Extension -in @('.cpp', '.h', '.rc', '.inl') }
 )
 $nonAsciiProductionSources = @(
     $firstPartyProductionSources | Where-Object {
