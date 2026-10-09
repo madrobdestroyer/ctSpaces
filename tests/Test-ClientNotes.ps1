@@ -5,7 +5,7 @@ $root = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
 $source = Get-Content -LiteralPath (Join-Path $root 'ctSpaces.cpp') -Raw
 foreach ($guard in @('ShowClientNotes(GetSelectedClientNameSanitized(false))',
     'ShowClientNotes(clientName)', 'IDD_CLIENT_NOTES',
-    'client_notes::Read(clientRoot)', 'client_notes::Write(state.clientRoot')) {
+    'client_notes::ReadNotebook(clientRoot)', 'client_notes::WriteNotebook(state.clientRoot')) {
     if (-not $source.Contains($guard)) {
         throw "Missing Client Notes integration: $guard"
     }

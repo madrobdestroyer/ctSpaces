@@ -1,8 +1,14 @@
-# ctSpaces 6.1 What's New
+# ctSpaces 6.2 What's New
 
-The initial ctSpaces 6.0.0.0 milestone consolidated features previously shipped across 5.2 and 5.3. The 6.1 release adds client filtering, local notes, and Close All Clients. The current 6.1.1.0 update fixes unreadable button hints. Existing client spaces, sign ins, bookmarks, icons, browser history, and saved sessions remain intact during the update.
+## Current 6.2.0.0 Update
 
-## Current 6.1.1.0 Update
+The notes editor starts compact and remembers your preferred window size. Its wider ticket tabs, grouped icon toolbar with hover hints, and padded writing area make longer notes easier to work with. The window can be resized or maximized.
+
+Client Notes now has formatted text, named tabs for individual tickets, and autosave. Existing reminders remain in Notes. Use + Ticket to add a separate note and Rename tab to name the work. The toolbar supports headings, font size, bold, italic, underline, highlighting, lists, checklists, links, undo, redo, and clearing formatting. A Saved automatically status and one Close button replace Save and Cancel. Notes continue to follow client rename, archive, backup, and deletion.
+
+The initial ctSpaces 6.0.0.0 milestone consolidated features previously shipped across 5.2 and 5.3. The 6.1 release added client filtering, local notes, and Close All Clients, followed by readable button hints in 6.1.1.0. Existing client spaces, sign ins, bookmarks, icons, browser history, and saved sessions remain intact during the update.
+
+## Previous 6.1.1.0 Update
 
 The Close all hint now has readable text and follows the selected theme at startup and after theme changes. Restore tabs receives the same correction. Browser behavior and client data are unchanged.
 

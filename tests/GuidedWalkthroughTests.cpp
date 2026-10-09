@@ -134,7 +134,7 @@ void TestRevisionProgressContract() {
       {L"identity", 4},         {L"organize", 3},
       {L"cleanup", 3},          {L"backup_restore", 1},
       {L"appearance", 3},       {L"updates", 4},
-      {L"client_filter", 1}, {L"close_all", 1}, {L"client_notes", 1}};
+      {L"client_filter", 1}, {L"close_all", 1}, {L"client_notes", 2}};
   Expect(expectedRevisions.size() == topics.size(),
           "revision contract does not cover the catalog");
   for (const auto &topic : topics) {
@@ -202,6 +202,14 @@ void TestRevisionProgressContract() {
          "previous release progress must announce only the three new workflows");
 
   State futureRead;
+  State previousNotesRead;
+  for (const auto &topic : topics)
+    previousNotesRead.readRevisions.push_back(
+        std::wstring_view(topic.id) == L"client_notes" ? 1 : topic.revision);
+  const auto revisedNotes = guided_walkthrough::UnreadAnnouncementIndices(previousNotesRead);
+  Expect(revisedNotes.size() == 1 &&
+         std::wstring_view(topics[revisedNotes.front()].id) == L"client_notes",
+         "6.1 progress announces only the updated notes editor");
   futureRead.readRevisions.assign(topics.size(), 999);
   for (size_t index = 0; index < topics.size(); ++index)
     Expect(!guided_walkthrough::IsUnread(futureRead, index),

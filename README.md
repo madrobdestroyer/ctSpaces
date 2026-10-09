@@ -2,11 +2,11 @@
 
 ctSpaces is a small Windows launcher for opening client-specific browser spaces. Each client can have an independent Microsoft Edge, Google Chrome, Brave, and Mozilla Firefox profile, so browser data stays separated both between clients and between browsers for the same client.
 
-The initial 6.0.0.0 milestone consolidated the previously shipped 5.2 and 5.3 work. The 6.1 release adds client filtering without autocomplete replacement, local client notes, and Close All Clients while keeping the launcher open. The current 6.1.1.0 update fixes unreadable button hints at startup and after changing themes. The responsive cleanup discovery and deletion safety checks remain in place.
+The initial 6.0.0.0 milestone consolidated the previously shipped 5.2 and 5.3 work. The 6.1 release added client filtering, local notes, and Close All Clients. The current 6.2.0.0 release adds formatted notes with user-named ticket tabs and autosave. Existing notes open in an initial Notes tab. Each ticket has separate notes, and the editor follows the selected theme.
 
-See [release notes](RELEASE_NOTES_6.1.1.0.md),
+See [release notes](RELEASE_NOTES_6.2.0.0.md),
 [guide help](docs/GUIDED_WALKTHROUGH.md), and the
-[current release validation](docs/RELEASE_VALIDATION_6.1.1.0.md). The
+[current release validation](docs/RELEASE_VALIDATION_6.2.0.0.md). The
 [6.0.0.0 release notes](RELEASE_NOTES_6.0.0.0.md) and
 [validation report](docs/RELEASE_VALIDATION_6.0.0.0.md) remain available as
 historical records.

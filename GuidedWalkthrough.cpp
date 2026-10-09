@@ -276,21 +276,25 @@ const std::vector<Topic> kTopics = {
      L"launcher stays open. After confirmation, each browser receives a "
      L"normal close request. Temporary and Default editor windows stay open; "
      L"any session that remains open stays in the launcher."},
-    {L"client_notes", 1, L"Keep notes for a client",
+    {L"client_notes", 2, L"Keep notes for a client",
      L"Selected client's Settings or pinned client menu",
      L"Select an existing client, then open Client Notes from Settings or "
      L"open the menu for that client's pin. Notes are local to this client and can "
-     L"use the current light or dark theme. Save keeps the edited text. "
-     L"When you leave with unsaved changes, choose whether to save, discard, "
-     L"or continue editing. Notes are ordinary local text and are not "
+     L"use the current light or dark theme. Existing notes open in Notes. "
+     L"Use + Ticket to add a named tab for each ticket and Rename tab to change "
+     L"its name. Each tab has separate notes. Use the toolbar for headings, "
+     L"font size, bold, italic, underline, highlighting, lists, checklists and links. "
+     L"Click a web link to open it in this client's selected browser space. "
+     L"Edits and tab names save automatically after a brief typing pause. "
+     L"Close finishes any pending save. Check the Saved status; if a save fails, "
+     L"your draft stays open to retry or copy. Notes are local files and are not "
      L"encrypted, so avoid putting secrets in them. Notes travel with the "
      L"client when it is renamed, archived, restored, backed up, or restored "
      L"from backup. Deleting the client removes its notes too.",
      kClientNotesCommand, true, L"Client Notes",
-     L"Selected existing clients now have local Client Notes, available from "
-     L"Settings or a pinned client's menu. The editor follows the current "
-     L"theme. Save keeps your changes; leaving with unsaved changes offers "
-     L"Save, Discard, and Cancel choices."},
+     L"Client Notes now supports formatted text and named ticket tabs. Existing "
+     L"notes stay in Notes; use + Ticket for separate work and Rename tab to "
+     L"change a name. Edits save automatically, with a Saved status and one Close button."},
 };
 
 bool IsMissingPathError(DWORD error) {

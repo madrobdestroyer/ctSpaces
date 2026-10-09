@@ -422,6 +422,11 @@ function Assert-ClientNotes {
         (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash -cne $notesHash) {
         throw "Client notes changed or disappeared: $path"
     }
+    $notebookPath = Join-Path $ClientRoot 'ctSpaces-client-notes.ctn'
+    if (-not (Test-Path -LiteralPath $notebookPath -PathType Leaf) -or
+        (Get-FileHash -LiteralPath $notebookPath -Algorithm SHA256).Hash -cne $notebookHash) {
+        throw "Ticket notebook changed or disappeared: $notebookPath"
+    }
 }
 
 function Assert-LiveDataUnchanged {
@@ -496,6 +501,22 @@ try {
     )
     [IO.File]::WriteAllText($notesPath, $notesPayload, $utf8NoBom)
     $notesHash = (Get-FileHash -LiteralPath $notesPath -Algorithm SHA256).Hash
+    $notebookPath = Join-Path $alphaRoot 'ctSpaces-client-notes.ctn'
+    $notebookStream = [IO.MemoryStream]::new()
+    $notebookWriter = [IO.BinaryWriter]::new($notebookStream)
+    try {
+        $notebookWriter.Write([Text.Encoding]::ASCII.GetBytes('CTNBOOK1'))
+        $notebookWriter.Write([uint32]1); $notebookWriter.Write([uint32]2)
+        foreach ($pageName in @('Notes', 'INC-12345')) {
+            $nameBytes = $utf8NoBom.GetBytes($pageName)
+            $rtfBytes = [Text.Encoding]::ASCII.GetBytes('{\rtf1\b Workflow ticket\b0}')
+            $notebookWriter.Write([uint32]$nameBytes.Length)
+            $notebookWriter.Write([uint32]$rtfBytes.Length)
+            $notebookWriter.Write($nameBytes); $notebookWriter.Write($rtfBytes)
+        }
+        [IO.File]::WriteAllBytes($notebookPath, $notebookStream.ToArray())
+    } finally { $notebookWriter.Dispose(); $notebookStream.Dispose() }
+    $notebookHash = (Get-FileHash -LiteralPath $notebookPath -Algorithm SHA256).Hash
     Copy-Item -LiteralPath (Join-Path $projectRoot 'icons\ctdkgrsq.ico') `
         -Destination (Join-Path $alphaRoot 'client.ico') -Force
     [IO.File]::WriteAllText(

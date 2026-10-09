@@ -64,9 +64,17 @@ Choose a result with the mouse or arrow keys and confirm your selection to fill 
 
 ## Client Notes
 
-Select an existing client, then choose `Client Notes` from Settings. The same command is available by right clicking a visible pinned client. Add local reminders in the separate themed window and select Save. Cancel or closing the window with unsaved changes asks whether to save, discard, or keep editing. A failed save leaves your draft available to retry.
+The notes window starts at a compact size. Drag its edges or corners to resize it, or maximize it. ctSpaces remembers your preferred size, including maximized state, for future openings and adjusts it to fit the current display. The writing area grows with the window, and formatting controls have hover hints.
 
-Notes belong to the client rather than a particular browser slot. They stay with the client through rename and archive and are included in a full client backup. Deleting the whole client also deletes its notes. Notes are plain local text, not encrypted or synced, so do not put passwords or other secrets in them.
+Select an existing client, then choose `Client Notes` from Settings. The same command is available by right clicking a visible pinned client. Existing notes open in **Notes**. Select **+ Ticket** to add a tab and give it the ticket number or another name for the work. Each tab keeps its own notes. Use **Rename tab** to change the selected tab's name. Names must be unique, with up to 64 characters; a client can have up to 256 tabs.
+
+The toolbar supports normal text and headings, font sizes, bold, italic, underline, highlighting, bullets, numbered lists, checklists, links, undo, redo, and clearing formatting. Click a checklist box to mark it complete or incomplete. HTTP and HTTPS URLs are detected automatically; select a complete URL and choose Link to underline it explicitly. Clicking a URL asks to open it in this client's selected browser space. A closed client is opened with that URL, and an already open Chromium client receives a new tab. Pasted content is plain text.
+
+Firefox clients can open a note link when closed. An already open isolated Firefox session cannot receive another command-line URL; ctSpaces explains this and preserves the existing session.
+
+Text, formatting, and tab names save automatically after a short typing pause. The status shows **Saving...**, **Saved automatically**, or a save failure. Switching tabs and **Close** finish pending saves immediately. If a save fails, your draft stays in the editor; retry after fixing the problem or copy the text elsewhere. Each tab allows 32 MiB of UTF8 text and 64 MiB of formatted content; the total notebook limit is 256 MiB. Opening an untouched note creates no new file. Old TXT notes are preserved when the notebook is first saved.
+
+Notes belong to the client rather than a particular browser slot. They stay with the client through rename and archive and are included in a full client backup. Deleting the whole client also deletes its notes. Notes are local files, not encrypted or synced, so do not put passwords or other secrets in them.
 
 ## Choose Whether A Browser Slot Restores Tabs
 

@@ -391,8 +391,15 @@ int wmain(int argc, wchar_t **argv) {
     const fs::path hiddenPath = alphaProfile / L"hidden-state.bin";
     const std::vector<unsigned char> notesData = {
         'C', 'a', 'f', 0xc3, 0xa9, '\r', '\n', 'R', 'e', 'm', 'i', 'n', 'd', 'e', 'r'};
+    std::string notebook;
+    if (!client_notes::SerializeNotebook(
+            {{L"Notes", true, "{\\rtf1 Legacy reminder}", {}},
+             {L"INC-123", true, "{\\rtf1\\b Formatted ticket\\b0}", {}}}, notebook))
+      return 5;
+    const std::vector<unsigned char> notebookData(notebook.begin(), notebook.end());
     if (!WriteBytes(alphaProfile / L"state.bin", binaryData) ||
         !WriteBytes(backupSites / L"Alpha" / client_notes::kFileName, notesData) ||
+        !WriteBytes(backupSites / L"Alpha" / client_notes::kNotebookFileName, notebookData) ||
         !WriteBytes(alphaProfile / L"unicode-\x00E9.txt", rootData) ||
         !WriteBytes(hiddenPath, rootData) ||
         !WriteBytes(betaProfile / L"bookmarks.bin", rootData) ||
@@ -625,6 +632,8 @@ int wmain(int argc, wchar_t **argv) {
         ReadBytes(stagedAlpha / L"state.bin") != binaryData ||
         ReadBytes(stagedRestore.payloadDir / L"Alpha" /
                   client_notes::kFileName) != notesData ||
+        ReadBytes(stagedRestore.payloadDir / L"Alpha" /
+                  client_notes::kNotebookFileName) != notebookData ||
         ReadBytes(stagedAlpha / L"unicode-\x00E9.txt") != rootData ||
         (GetFileAttributesW((stagedAlpha / L"hidden-state.bin").c_str()) &
          FILE_ATTRIBUTE_HIDDEN) == 0 ||
@@ -647,6 +656,7 @@ int wmain(int argc, wchar_t **argv) {
         ReadBytes(liveSites / L"Alpha" / L"Default" / L"state.bin") !=
             binaryData ||
         ReadBytes(liveSites / L"Alpha" / client_notes::kFileName) != notesData ||
+        ReadBytes(liveSites / L"Alpha" / client_notes::kNotebookFileName) != notebookData ||
         ReadBytes(recovery / L"OldClient" / L"old.bin") != rootData ||
         fs::exists(restoreStage)) {
       std::wcerr << L"Transactional restore commit failed: "
