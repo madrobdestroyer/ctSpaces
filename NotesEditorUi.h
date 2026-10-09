@@ -38,7 +38,8 @@ inline void DrawSurface(HDC dc, const RECT &bounds, COLORREF top,
 }
 
 // Draw at a consistent logical size, with smooth strokes at every display DPI.
-inline void DrawIcon(HDC dc, const RECT &bounds, UINT id, COLORREF color) {
+inline void DrawIcon(HDC dc, const RECT &bounds, UINT id, COLORREF color,
+                     COLORREF highlight = RGB(249, 211, 66)) {
   using namespace Gdiplus;
   Graphics graphics(dc);
   graphics.SetSmoothingMode(SmoothingModeAntiAlias);
@@ -79,7 +80,7 @@ inline void DrawIcon(HDC dc, const RECT &bounds, UINT id, COLORREF color) {
     marker.AddLine(-8, 6, 5, -10); marker.AddLine(5, -10, 11, -4);
     marker.AddLine(11, -4, -2, 12); marker.CloseFigure();
     graphics.DrawPath(&pen, &marker); line(-5, 2, 2, 8); line(-8, 6, -9, 11);
-    SolidBrush yellow(Gdiplus::Color(255, 249, 211, 66));
+    SolidBrush yellow(Color(highlight));
     graphics.FillRectangle(&yellow, -10.0f, 14.0f, 22.0f, 3.0f);
     break;
   }

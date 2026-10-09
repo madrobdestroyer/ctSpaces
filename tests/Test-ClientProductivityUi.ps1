@@ -162,7 +162,17 @@ function Switch-Note([IntPtr]$notes,[int]$index){
     Assert([ProductivityQa]::Query($tabs,0x130B,0)-eq$index) 'Ticket tab did not switch.'
 }
 function Name-Note([IntPtr]$notes,[string]$name,[switch]$Rename){
-    [void][ProductivityQa]::PostMessageW($notes,0x111,[UIntPtr]$(if($Rename){1336}else{1335}),[IntPtr]::Zero)
+    Assert(-not[ProductivityQa]::IsWindowVisible([ProductivityQa]::GetDlgItem($notes,1333))) 'Notes status footer still takes space.'
+    Assert(-not[ProductivityQa]::IsWindowVisible([ProductivityQa]::GetDlgItem($notes,1339))) 'Notes context footer still takes space.'
+    if(-not $Rename){
+        $tabs=[ProductivityQa]::GetDlgItem($notes,1334)
+        $before=[ProductivityQa]::Query($tabs,0x1304,0)
+        [ProductivityQa]::Command($notes,1335)
+        Wait-Until{[ProductivityQa]::Query($tabs,0x1304,0)-eq($before+1)} 'New tab did not open immediately.'|Out-Null
+        Assert([ProductivityQa]::FindWithChild([uint32]$process.Id,1337)-eq[IntPtr]::Zero) 'New tab unexpectedly requested a name.'
+        Wait-Saved $notes
+    }
+    [void][ProductivityQa]::PostMessageW($notes,0x111,[UIntPtr]1336,[IntPtr]::Zero)
     $naming=Wait-Until{[ProductivityQa]::FindWithChild([uint32]$process.Id,1337)} 'Ticket name dialog did not open.'
     [void][ProductivityQa]::SetWindowTextW([ProductivityQa]::GetDlgItem($naming,1337),$name)
     [ProductivityQa]::Command($naming,1)

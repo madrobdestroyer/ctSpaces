@@ -16028,15 +16028,16 @@ struct ClientNotesDialogState {
   bool loading = false;
   bool formattingChanged = false;
   bool updatingToolbar = false;
+  bool saveFailed = false;
+  COLORREF highlightColor = RGB(249, 211, 66);
   UINT fontDpi = 0;
   HFONT uiFont = nullptr;
   HFONT tabFont = nullptr;
-  HFONT footerFont = nullptr;
   HWND toolbarTooltip = nullptr;
   ~ClientNotesDialogState() {
     if (toolbarTooltip && IsWindow(toolbarTooltip))
       DestroyWindow(toolbarTooltip);
-    for (HFONT font : {uiFont, tabFont, footerFont})
+    for (HFONT font : {uiFont, tabFont})
       if (font) DeleteObject(font);
   }
 };
@@ -16147,6 +16148,14 @@ static bool NotesOtherPagesChanged(const ClientNotesDialogState &state) {
         (!state.baselines[i].empty() && state.pages[i].rtf != state.baselines[i]))
       return true;
   return false;
+}
+
+static void SetNotesSaveFailure(HWND dialog, ClientNotesDialogState &state, bool failed) {
+  state.saveFailed = failed;
+  const std::wstring title = L"Client Notes: " + state.clientName +
+      (failed ? L" - Could not save" : L"");
+  SetWindowTextW(dialog, title.c_str());
+  SetDlgItemTextW(dialog, IDC_NOTES_CLIENT_HEADING, title.c_str());
 }
 
 static void SetNotesStatus(HWND dialog, ClientNotesDialogState &state) {
@@ -16508,12 +16517,14 @@ static bool SaveClientNotesDraft(HWND dialog, ClientNotesDialogState &state,
                                  bool reportFailure) {
   KillTimer(dialog, 1);
   if (!CaptureNotesPage(dialog, state, reportFailure)) {
+    SetNotesSaveFailure(dialog, state, true);
     SetDlgItemTextW(dialog, IDC_NOTES_STATUS, L"Could not save: shorten this note");
     return false;
   }
   if (!NotesOtherPagesChanged(state)) {
     state.formattingChanged = false;
     SendDlgItemMessageW(dialog, IDC_CLIENT_NOTES_TEXT, EM_SETMODIFY, FALSE, 0);
+    SetNotesSaveFailure(dialog, state, false);
     SetNotesStatus(dialog, state);
     return true;
   }
@@ -16525,6 +16536,7 @@ static bool SaveClientNotesDraft(HWND dialog, ClientNotesDialogState &state,
   };
   if (!safeClient() ||
       !client_notes::WriteNotebook(state.clientRoot, state.pages, state.original, safeClient)) {
+    SetNotesSaveFailure(dialog, state, true);
     SetDlgItemTextW(dialog, IDC_NOTES_STATUS, L"Could not save - drafts are still open");
     if (reportFailure) MessageBoxW(dialog,
                 L"The notes could not be saved safely. They may have changed on "
@@ -16543,6 +16555,7 @@ static bool SaveClientNotesDraft(HWND dialog, ClientNotesDialogState &state,
     state.baselines[i] = state.pages[i].rtf;
   state.formattingChanged = false;
   SendDlgItemMessageW(dialog, IDC_CLIENT_NOTES_TEXT, EM_SETMODIFY, FALSE, 0);
+  SetNotesSaveFailure(dialog, state, false);
   SetNotesStatus(dialog, state);
   return true;
 }
@@ -16628,8 +16641,9 @@ static LRESULT CALLBACK NotesWindowSubclass(HWND dialog, UINT message,
 static void LayoutClientNotes(HWND dialog, UINT dpi) {
   auto *state = reinterpret_cast<ClientNotesDialogState *>(GetWindowLongPtrW(dialog, DWLP_USER));
   if (!state) return;
-  if (state->fontDpi != dpi) {
-    const HFONT oldFont = state->uiFont, oldTabFont = state->tabFont, oldFooterFont = state->footerFont;
+  const bool dpiChanged = state->fontDpi != dpi;
+  if (dpiChanged) {
+    const HFONT oldFont = state->uiFont, oldTabFont = state->tabFont;
     state->uiFont = CreateFontW(-MulDiv(12, dpi, 72), 0, 0, 0, FW_NORMAL,
         FALSE, FALSE, FALSE, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, L"Segoe UI");
     EnumChildWindows(dialog, [](HWND control, LPARAM font) -> BOOL {
@@ -16639,38 +16653,46 @@ static void LayoutClientNotes(HWND dialog, UINT dpi) {
     }, reinterpret_cast<LPARAM>(state->uiFont));
     state->tabFont = CreateFontW(-MulDiv(12, dpi, 72), 0, 0, 0, FW_SEMIBOLD,
         FALSE, FALSE, FALSE, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, L"Segoe UI");
-    state->footerFont = CreateFontW(-MulDiv(10, dpi, 72), 0, 0, 0, FW_NORMAL,
-        FALSE, FALSE, FALSE, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, L"Segoe UI");
-    for (int id : {IDC_NOTES_CONTEXT, IDC_NOTES_STATUS})
-      SendDlgItemMessageW(dialog, id, WM_SETFONT, reinterpret_cast<WPARAM>(state->footerFont), TRUE);
-    for (HFONT font : {oldFont, oldTabFont, oldFooterFont}) if (font) DeleteObject(font);
+    for (HFONT font : {oldFont, oldTabFont}) if (font) DeleteObject(font);
     state->fontDpi = dpi;
   }
   RECT area{}; GetClientRect(dialog, &area);
   const int margin = ScaleByDpi(24, dpi), gap = ScaleByDpi(6, dpi);
   const int height = ScaleByDpi(36, dpi);
+  HDWP layout = BeginDeferWindowPos(24);
   auto place = [&](int id, int x, int y, int width, int h = -1) {
-    SetWindowPos(GetDlgItem(dialog, id), nullptr, x, y, width, h < 0 ? height : h,
-                 SWP_NOZORDER | SWP_NOACTIVATE);
+    HWND control = GetDlgItem(dialog, id);
+    RECT old{}; GetWindowRect(control, &old);
+    MapWindowPoints(nullptr, dialog, reinterpret_cast<POINT *>(&old), 2);
+    const bool combo = id == IDC_NOTES_STYLE || id == IDC_NOTES_SIZE;
+    const int targetHeight = h < 0 ? height : h;
+    const UINT flags = SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOCOPYBITS |
+        (combo && !dpiChanged && old.right - old.left == width ? SWP_NOSIZE : 0);
+    if (old.left == x && old.top == y && old.right - old.left == width &&
+        ((combo && !dpiChanged) || old.bottom - old.top == targetHeight)) return;
+    if (layout) layout = DeferWindowPos(layout, control, nullptr, x, y, width, targetHeight,
+        flags);
+    else SetWindowPos(control, nullptr, x, y, width, targetHeight,
+        flags);
   };
   place(IDC_NOTES_CLIENT_HEADING, ScaleByDpi(20, dpi), ScaleByDpi(10, dpi),
         area.right - ScaleByDpi(80, dpi), ScaleByDpi(26, dpi));
   place(IDCANCEL, area.right - ScaleByDpi(44, dpi), ScaleByDpi(2, dpi),
         ScaleByDpi(36, dpi), ScaleByDpi(36, dpi));
   ShowWindow(GetDlgItem(dialog, IDC_NOTES_CLIENT_HEADING), SW_SHOW);
-  ShowWindow(GetDlgItem(dialog, IDC_NOTES_CONTEXT), SW_SHOW);
+  ShowWindow(GetDlgItem(dialog, IDC_NOTES_CONTEXT), SW_HIDE);
+  ShowWindow(GetDlgItem(dialog, IDC_NOTES_STATUS), SW_HIDE);
   ShowWindow(GetDlgItem(dialog, IDC_NOTES_RENAME_TAB), SW_HIDE);
   const int tabTop = ScaleByDpi(46, dpi), plusWidth = ScaleByDpi(40, dpi);
   const int maxTabs = (std::max)(1, static_cast<int>(area.right) - margin * 2 - plusWidth - gap);
   HWND tabs = GetDlgItem(dialog, IDC_NOTES_TABS);
-  TabCtrl_SetPadding(tabs, ScaleByDpi(24, dpi), ScaleByDpi(10, dpi));
-  SendMessageW(tabs, TCM_SETMINTABWIDTH, 0, ScaleByDpi(118, dpi));
-  TabCtrl_SetItemSize(tabs, ScaleByDpi(118, dpi), height);
-  place(IDC_NOTES_TABS, margin, tabTop, maxTabs, height + ScaleByDpi(3, dpi));
-  RECT last{};
+  if (dpiChanged) {
+    TabCtrl_SetPadding(tabs, ScaleByDpi(24, dpi), ScaleByDpi(10, dpi));
+    SendMessageW(tabs, TCM_SETMINTABWIDTH, 0, ScaleByDpi(118, dpi));
+    TabCtrl_SetItemSize(tabs, ScaleByDpi(118, dpi), height);
+  }
   const int count = TabCtrl_GetItemCount(tabs);
-  if (count) TabCtrl_GetItemRect(tabs, count - 1, &last);
-  const int tabWidth = (std::min)(maxTabs, (std::max)(ScaleByDpi(118, dpi), static_cast<int>(last.right) + 2));
+  const int tabWidth = (std::min)(maxTabs, (std::max)(1, count) * ScaleByDpi(118, dpi) + ScaleByDpi(6, dpi));
   place(IDC_NOTES_TABS, margin, tabTop, tabWidth, height + ScaleByDpi(3, dpi));
   place(IDC_NOTES_ADD_TAB, margin + tabWidth + gap, tabTop, plusWidth);
   const int extra = std::clamp(MulDiv(area.right, 96, dpi) - 900, 0, 50);
@@ -16687,32 +16709,38 @@ static void LayoutClientNotes(HWND dialog, UINT dpi) {
         id == IDC_NOTES_LINK || id == IDC_NOTES_UNDO || id == IDC_NOTES_CLEAR)
       x += ScaleByDpi(16 + extra * 3 / 50, dpi);
     const bool combo = id == IDC_NOTES_STYLE || id == IDC_NOTES_SIZE;
-    if (combo) {
+    if (combo && dpiChanged) {
       SendDlgItemMessageW(dialog, id, CB_SETITEMHEIGHT, -1, ScaleByDpi(30, dpi));
       SendDlgItemMessageW(dialog, id, CB_SETITEMHEIGHT, 0, ScaleByDpi(30, dpi));
     }
-    place(id, x, top + (combo ? ScaleByDpi(2, dpi) : 0), ScaleByDpi(width, dpi),
+    if (id == IDC_NOTES_HIGHLIGHT)
+      place(IDC_NOTES_HIGHLIGHT_COLOR, x + ScaleByDpi(40, dpi), top, ScaleByDpi(18, dpi));
+    place(id, x, top + (combo ? ScaleByDpi(2, dpi) : 0), ScaleByDpi(id == IDC_NOTES_HIGHLIGHT ? 40 : width, dpi),
           combo ? ScaleByDpi(210, dpi) : -1);
     x += ScaleByDpi(width, dpi) + toolGap;
   }
-  const int footer = area.bottom - ScaleByDpi(74, dpi);
-  place(IDC_NOTES_CONTEXT, margin + ScaleByDpi(4, dpi), footer,
-        area.right - margin * 2, ScaleByDpi(24, dpi));
-  place(IDC_NOTES_STATUS, margin + ScaleByDpi(4, dpi), footer + ScaleByDpi(26, dpi),
-        area.right - margin * 2, ScaleByDpi(24, dpi));
   const int editorTop = ScaleByDpi(144, dpi);
   place(IDC_CLIENT_NOTES_TEXT, margin + ScaleByDpi(4, dpi), editorTop,
         (std::max)(0, static_cast<int>(area.right) - margin * 2 - ScaleByDpi(8, dpi)),
-        (std::max)(0, footer - ScaleByDpi(16, dpi) - editorTop));
+        (std::max)(0, static_cast<int>(area.bottom) - margin - editorTop));
+  if (layout) EndDeferWindowPos(layout);
   RECT document{};
   GetClientRect(GetDlgItem(dialog, IDC_CLIENT_NOTES_TEXT), &document);
   InflateRect(&document, -ScaleByDpi(28, dpi), -ScaleByDpi(16, dpi));
-  SendDlgItemMessageW(dialog, IDC_CLIENT_NOTES_TEXT, EM_SETRECT, 0, reinterpret_cast<LPARAM>(&document));
-  InvalidateRect(dialog, nullptr, TRUE);
+  RECT previous{};
+  SendDlgItemMessageW(dialog, IDC_CLIENT_NOTES_TEXT, EM_GETRECT, 0, reinterpret_cast<LPARAM>(&previous));
+  if (!EqualRect(&previous, &document))
+    SendDlgItemMessageW(dialog, IDC_CLIENT_NOTES_TEXT, EM_SETRECTNP, 0, reinterpret_cast<LPARAM>(&document));
+  RedrawWindow(dialog, nullptr, nullptr, RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN | RDW_UPDATENOW);
 }
 
 static void ApplyNotesEditorTheme(HWND dialog, ClientNotesDialogState &state) {
   ApplyCleanupDialogTheme(dialog);
+  // Our client frame owns the border, including on Windows 10/classic themes.
+  const DWMNCRENDERINGPOLICY policy = DWMNCRP_DISABLED;
+  DwmSetWindowAttribute(dialog, DWMWA_NCRENDERING_POLICY, &policy, sizeof(policy));
+  const COLORREF noBorder = 0xfffffffe; // DWMWA_COLOR_NONE
+  DwmSetWindowAttribute(dialog, static_cast<DWMWINDOWATTRIBUTE>(34), &noBorder, sizeof(noBorder));
   HWND edit = GetDlgItem(dialog, IDC_CLIENT_NOTES_TEXT);
   SetWindowTheme(edit, g_bThemeIsDark ? L"DarkMode_Explorer" : L"Explorer", nullptr);
   SendMessageW(edit, EM_SETBKGNDCOLOR, 0, g_themeColors.crControl);
@@ -16727,10 +16755,10 @@ static void ApplyNotesEditorTheme(HWND dialog, ClientNotesDialogState &state) {
 }
 
 static bool DrawNotesToolbarButton(const DRAWITEMSTRUCT &draw,
-                                  const ClientNotesDialogState &) {
+                                  const ClientNotesDialogState &state) {
   if (draw.CtlType != ODT_BUTTON ||
       !((draw.CtlID >= IDC_NOTES_BOLD && draw.CtlID <= IDC_NOTES_CLEAR) ||
-        draw.CtlID == IDC_NOTES_ADD_TAB || draw.CtlID == IDCANCEL)) return false;
+        draw.CtlID == IDC_NOTES_ADD_TAB || draw.CtlID == IDC_NOTES_HIGHLIGHT_COLOR || draw.CtlID == IDCANCEL)) return false;
   const UINT dpi = GetDpiForWindow(draw.hwndItem);
   const bool disabled = (draw.itemState & ODS_DISABLED) != 0;
   const bool active = !disabled && (SendMessageW(draw.hwndItem, BM_GETSTATE, 0, 0) & BST_PUSHED);
@@ -16744,12 +16772,10 @@ static bool DrawNotesToolbarButton(const DRAWITEMSTRUCT &draw,
   const COLORREF ink = disabled ? BlendColor(g_themeColors.crControlText, g_themeColors.crWindow, 55) :
                                   g_themeColors.crControlText;
   RECT icon = draw.rcItem;
-  if (draw.CtlID == IDC_NOTES_HIGHLIGHT) {
-    icon.right -= ScaleByDpi(18, dpi);
-    RECT arrow{icon.right, icon.top, draw.rcItem.right, icon.bottom};
-    DrawModernComboChevron(draw.hDC, arrow, ink, dpi);
-  }
-  notes_editor_ui::DrawIcon(draw.hDC, icon, draw.CtlID, ink);
+  if (draw.CtlID == IDC_NOTES_HIGHLIGHT_COLOR)
+    DrawModernComboChevron(draw.hDC, icon, ink, dpi);
+  else
+    notes_editor_ui::DrawIcon(draw.hDC, icon, draw.CtlID, ink, state.highlightColor);
   if ((draw.itemState & (ODS_FOCUS | ODS_NOFOCUSRECT)) == ODS_FOCUS) {
     RECT focus = draw.rcItem; InflateRect(&focus, -3, -3); DrawFocusRect(draw.hDC, &focus);
   }
@@ -17123,8 +17149,8 @@ static INT_PTR CALLBACK ClientNotesDlgProc(HWND dialog, UINT message,
     SetDlgItemTextW(dialog, IDCANCEL, L"Close notes");
     SetDialogDpiChangeBehavior(dialog, DDC_DISABLE_ALL, DDC_DISABLE_ALL);
     SetWindowSubclass(dialog, NotesWindowSubclass, 1, 0);
-    SetWindowLongPtrW(dialog, GWL_STYLE, GetWindowLongPtrW(dialog, GWL_STYLE) & ~WS_CAPTION);
-    SetWindowLongPtrW(dialog, GWL_EXSTYLE, GetWindowLongPtrW(dialog, GWL_EXSTYLE) & ~WS_EX_DLGMODALFRAME);
+    SetWindowLongPtrW(dialog, GWL_STYLE, (GetWindowLongPtrW(dialog, GWL_STYLE) & ~(WS_CAPTION | DS_MODALFRAME)) | WS_CLIPCHILDREN);
+    SetWindowLongPtrW(dialog, GWL_EXSTYLE, (GetWindowLongPtrW(dialog, GWL_EXSTYLE) & ~(WS_EX_DLGMODALFRAME | WS_EX_WINDOWEDGE | WS_EX_CLIENTEDGE)) | WS_EX_COMPOSITED);
     SetWindowPos(dialog, nullptr, 0, 0, 0, 0,
                   SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED);
     const DWORD rounded = 2; // DWMWCP_ROUND on Windows 11; ignored on older Windows.
@@ -17166,6 +17192,7 @@ static INT_PTR CALLBACK ClientNotesDlgProc(HWND dialog, UINT message,
     for (const auto [id, text] : {
         std::pair{IDC_NOTES_BOLD, L"Bold (Ctrl+B)"}, {IDC_NOTES_ITALIC, L"Italic (Ctrl+I)"},
         {IDC_NOTES_UNDERLINE, L"Underline (Ctrl+U)"}, {IDC_NOTES_HIGHLIGHT, L"Highlight"},
+        {IDC_NOTES_HIGHLIGHT_COLOR, L"Highlight color"},
         {IDC_NOTES_BULLETS, L"Bulleted list"}, {IDC_NOTES_NUMBERS, L"Numbered list"},
         {IDC_NOTES_CHECKLIST, L"Checklist"}, {IDC_NOTES_LINK, L"Format selected URL as a link"},
         {IDC_NOTES_UNDO, L"Undo (Ctrl+Z)"}, {IDC_NOTES_REDO, L"Redo (Ctrl+Y)"},
@@ -17196,10 +17223,12 @@ static INT_PTR CALLBACK ClientNotesDlgProc(HWND dialog, UINT message,
   }
   if (message == WM_DRAWITEM && lParam) {
     const auto &draw = *reinterpret_cast<const DRAWITEMSTRUCT *>(lParam);
+    if (draw.CtlType == ODT_MENU) { DrawThemedMenuItem(draw, dialog); return TRUE; }
     if (DrawNotesComboItem(draw) || (state && DrawNotesToolbarButton(draw, *state))) return TRUE;
   }
   if (message == WM_MEASUREITEM && lParam) {
     auto *measure = reinterpret_cast<MEASUREITEMSTRUCT *>(lParam);
+    if (measure->CtlType == ODT_MENU) { MeasureThemedMenuItem(*measure, dialog); return TRUE; }
     if (measure->CtlType == ODT_COMBOBOX &&
         (measure->CtlID == IDC_NOTES_STYLE || measure->CtlID == IDC_NOTES_SIZE)) {
       measure->itemHeight = ScaleByDpi(30, GetDpiForWindow(dialog)); return TRUE;
@@ -17320,22 +17349,24 @@ static INT_PTR CALLBACK ClientNotesDlgProc(HWND dialog, UINT message,
         return TRUE;
       if (!SaveClientNotesDraft(dialog, *state, true))
         return TRUE;
-      NotesTabNameState name{&state->pages,
-          adding ? state->pages.size() : state->activePage,
-          adding ? L"" : state->pages[state->activePage].name};
-      if (DialogBoxParamW(g_hInst, MAKEINTRESOURCEW(IDD_NOTES_TAB_NAME), dialog,
-              NotesTabNameDlgProc, reinterpret_cast<LPARAM>(&name)) == IDOK) {
-        if (adding) {
-          state->pages.push_back({name.name, true, "{\\rtf1\\ansi }", {}});
-          state->baselines.emplace_back();
-          state->activePage = state->pages.size() - 1;
-          LoadNotesPage(dialog, *state);
-        } else {
-          state->pages[state->activePage].name = std::move(name.name);
-        }
-        RefreshNotesTabs(dialog, *state);
-        SaveClientNotesDraft(dialog, *state);
+      if (adding) {
+        std::wstring name = L"Untitled";
+        for (size_t suffix = 2; std::any_of(state->pages.begin(), state->pages.end(),
+            [&](const auto &page) { return client_notes::SamePageName(page.name, name); }); ++suffix)
+          name = L"Untitled " + std::to_wstring(suffix);
+        state->pages.push_back({name, true, "{\\rtf1\\ansi }", {}});
+        state->baselines.emplace_back();
+        state->activePage = state->pages.size() - 1;
+        LoadNotesPage(dialog, *state);
+      } else {
+        NotesTabNameState name{&state->pages, state->activePage, state->pages[state->activePage].name};
+        if (DialogBoxParamW(g_hInst, MAKEINTRESOURCEW(IDD_NOTES_TAB_NAME), dialog,
+                NotesTabNameDlgProc, reinterpret_cast<LPARAM>(&name)) != IDOK) return TRUE;
+        state->pages[state->activePage].name = std::move(name.name);
       }
+      RefreshNotesTabs(dialog, *state);
+      SaveClientNotesDraft(dialog, *state);
+      SetFocus(GetDlgItem(dialog, IDC_CLIENT_NOTES_TEXT));
       return TRUE;
     }
     if (LOWORD(wParam) == IDC_CLIENT_NOTES_TEXT &&
@@ -17390,20 +17421,50 @@ static INT_PTR CALLBACK ClientNotesDlgProc(HWND dialog, UINT message,
                            (current.dwEffects & mask) ? 0 : mask);
       return TRUE;
     }
-    if (LOWORD(wParam) == IDC_NOTES_HIGHLIGHT) {
+    if (LOWORD(wParam) == IDC_NOTES_HIGHLIGHT || LOWORD(wParam) == IDC_NOTES_HIGHLIGHT_COLOR) {
+      const bool choosing = LOWORD(wParam) == IDC_NOTES_HIGHLIGHT_COLOR;
+      bool remove = false;
+      if (choosing) {
+        const wchar_t *labels[] = {L"Yellow", L"Green", L"Blue", L"Pink", L"No highlight"};
+        const COLORREF colors[] = {RGB(249,211,66), RGB(164,224,141), RGB(149,207,245), RGB(245,164,200)};
+        HMENU menu = CreatePopupMenu();
+        if (!menu) return TRUE;
+        MenuItemData items[5]{};
+        MENUINFO info{sizeof(info)}; info.fMask = MIM_BACKGROUND; info.hbrBack = g_hbrThemeMenu;
+        SetMenuInfo(menu, &info);
+        for (UINT i = 0; i < 5; ++i) {
+          items[i] = {labels[i], nullptr, false};
+          MENUITEMINFOW item{sizeof(item)};
+          item.fMask = MIIM_ID | MIIM_FTYPE | MIIM_DATA | MIIM_STRING;
+          item.wID = i + 1; item.fType = MFT_OWNERDRAW;
+          item.dwItemData = reinterpret_cast<ULONG_PTR>(&items[i]);
+          item.dwTypeData = const_cast<wchar_t *>(labels[i]);
+          InsertMenuItemW(menu, i, TRUE, &item);
+        }
+        RECT anchor{}; GetWindowRect(GetDlgItem(dialog, IDC_NOTES_HIGHLIGHT_COLOR), &anchor);
+        const UINT command = TrackPopupMenuEx(menu, TPM_RETURNCMD | TPM_NONOTIFY,
+            anchor.left, anchor.bottom, dialog, nullptr);
+        DestroyMenu(menu);
+        SetFocus(GetDlgItem(dialog, IDC_CLIENT_NOTES_TEXT));
+        if (!command) return TRUE;
+        remove = command == 5;
+        if (!remove) state->highlightColor = colors[command - 1];
+        InvalidateRect(GetDlgItem(dialog, IDC_NOTES_HIGHLIGHT), nullptr, FALSE);
+      }
       CHARFORMAT2W current{};
       current.cbSize = sizeof(current);
       SendDlgItemMessageW(dialog, IDC_CLIENT_NOTES_TEXT, EM_GETCHARFORMAT,
                            SCF_SELECTION, reinterpret_cast<LPARAM>(&current));
       const bool highlighted = (current.dwMask & CFM_BACKCOLOR) &&
                                !(current.dwEffects & CFE_AUTOBACKCOLOR) &&
-                               current.crBackColor == RGB(249, 211, 66);
+                               current.crBackColor == state->highlightColor;
+      remove = remove || (!choosing && highlighted);
       CHARFORMAT2W format{};
       format.cbSize = sizeof(format);
       format.dwMask = CFM_BACKCOLOR | CFM_COLOR;
-      format.dwEffects = highlighted ? CFE_AUTOBACKCOLOR : 0;
-      format.crBackColor = RGB(249, 211, 66);
-      format.crTextColor = highlighted ? g_themeColors.crControlText : RGB(24, 24, 24);
+      format.dwEffects = remove ? CFE_AUTOBACKCOLOR : 0;
+      format.crBackColor = state->highlightColor;
+      format.crTextColor = remove ? g_themeColors.crControlText : RGB(24, 24, 24);
       HWND edit = GetDlgItem(dialog, IDC_CLIENT_NOTES_TEXT);
       SendMessageW(edit, EM_SETCHARFORMAT, SCF_SELECTION,
                    reinterpret_cast<LPARAM>(&format));

@@ -1,6 +1,14 @@
 # ctSpaces 6.2 What's New
 
-## Current 6.2.2.0 Update
+## Current 6.2.3.0 Update
+
+- Fixed notes repainting during resizing and removed the unwanted native outer frame.
+- The highlighter arrow now offers yellow, green, blue, pink, and no highlight.
+- New tabs open immediately as Untitled; rename them whenever convenient.
+- Removed the notes footer to give the document more space. Autosave failures appear in the title.
+- Kept theme colors, slim ticket tabs, autosave, and remembered window dimensions.
+
+## 6.2.2.0 Update
 
 Client Notes more closely follows the approved visual reference, with shaded tabs and dropdowns, softer separators, refined formatting icons, and a quieter autosave footer. The selected application theme still controls its colors and accent. Large checklist boxes now retain their appearance after saving and reopening. Existing notes and formatting are preserved, along with slimmer ticket tabs and remembered window dimensions.
 
