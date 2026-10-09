@@ -2,11 +2,11 @@
 
 ctSpaces is a small Windows launcher for opening client-specific browser spaces. Each client can have an independent Microsoft Edge, Google Chrome, Brave, and Mozilla Firefox profile, so browser data stays separated both between clients and between browsers for the same client.
 
-The initial 6.0.0.0 milestone consolidated the previously shipped 5.2 and 5.3 work. The 6.1 release added client filtering, local notes, and Close All Clients. The current 6.2.0.0 release adds formatted notes with user-named ticket tabs and autosave. Existing notes open in an initial Notes tab. Each ticket has separate notes, and the editor follows the selected theme.
+The initial 6.0.0.0 milestone consolidated the previously shipped 5.2 and 5.3 work. The 6.1 release added client filtering, local notes, and Close All Clients. The current 6.2.1.0 release polishes the formatted notes editor with an integrated title bar, slimmer ticket tabs, a grouped toolbar, and autosave without footer buttons. Existing notes open in an initial Notes tab. Each ticket has separate notes, and the editor follows the selected theme.
 
-See [release notes](RELEASE_NOTES_6.2.0.0.md),
+See [release notes](RELEASE_NOTES_6.2.1.0.md),
 [guide help](docs/GUIDED_WALKTHROUGH.md), and the
-[current release validation](docs/RELEASE_VALIDATION_6.2.0.0.md). The
+[current release validation](docs/RELEASE_VALIDATION_6.2.1.0.md). The
 [6.0.0.0 release notes](RELEASE_NOTES_6.0.0.0.md) and
 [validation report](docs/RELEASE_VALIDATION_6.0.0.0.md) remain available as
 historical records.
@@ -18,8 +18,8 @@ original project.
 
 ## Download
 
-Download the application ZIP [`ctSpaces6.1.1.0.zip`](https://github.com/madrobdestroyer/ctSpaces/releases/download/v6.1.1.0/ctSpaces6.1.1.0.zip)
-from [ctSpaces 6.1 / tag v6.1.1.0](https://github.com/madrobdestroyer/ctSpaces/releases/tag/v6.1.1.0),
+Download the application ZIP [`ctSpaces6.2.1.0.zip`](https://github.com/madrobdestroyer/ctSpaces/releases/download/v6.2.1.0/ctSpaces6.2.1.0.zip)
+from [ctSpaces 6.2 / tag v6.2.1.0](https://github.com/madrobdestroyer/ctSpaces/releases/tag/v6.2.1.0),
 extract it to a folder, and run `ctSpaces.exe`. The runtime ZIP contains only
 `ctSpaces.exe`; documentation, release history, source, and license notices
 remain available in this GitHub repository.

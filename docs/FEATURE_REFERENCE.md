@@ -85,7 +85,7 @@ Dropping a visible pinned client on the Windows Desktop creates one `.lnk` launc
 | Set Profile Icon | Yes | Yes | Copies an ICO or converts another supported image into `client.ico`. |
 | Remove Custom Icon | Yes | Yes | Deletes the custom client icon. |
 | Create Desktop Shortcut | Existing client | Yes | Creates or updates the client-named Desktop link for the browser currently selected, using the customer icon when available. |
-| Client Notes | Existing client | Yes | Opens a themed editor with formatted notes and user-named ticket tabs. Existing notes open in Notes. Changes autosave; Close finishes pending saves. Notes follow rename, archive, and full backup. Whole client deletion removes notes. |
+| Client Notes | Existing client | Yes | Opens a themed editor with formatted notes and user-named ticket tabs. Existing notes open in Notes. Changes autosave; the top-right X finishes pending saves. The window remembers its size and maximized state. Notes follow rename, archive, and full backup. Whole client deletion removes notes. |
 | Rename Client | Existing client | No | Renames the complete client container and migrates its pinned entry, browser-specific Restore tabs choices, shared icon, and ctSpaces-managed client shortcut. |
 | Archive Client | Existing client | No | Hides the client from the normal list without removing profile data. |
 | Archived Clients | No | Yes | Restores a hidden client to the normal list. |

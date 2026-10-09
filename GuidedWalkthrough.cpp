@@ -281,20 +281,20 @@ const std::vector<Topic> kTopics = {
      L"Select an existing client, then open Client Notes from Settings or "
      L"open the menu for that client's pin. Notes are local to this client and can "
      L"use the current light or dark theme. Existing notes open in Notes. "
-     L"Use + Ticket to add a named tab for each ticket and Rename tab to change "
+     L"Use + to add a named tab for each ticket and double-click a tab to change "
      L"its name. Each tab has separate notes. Use the toolbar for headings, "
      L"font size, bold, italic, underline, highlighting, lists, checklists and links. "
      L"Click a web link to open it in this client's selected browser space. "
      L"Edits and tab names save automatically after a brief typing pause. "
-     L"Close finishes any pending save. Check the Saved status; if a save fails, "
+     L"The top-right X finishes any pending save. Check the Saved status; if a save fails, "
      L"your draft stays open to retry or copy. Notes are local files and are not "
      L"encrypted, so avoid putting secrets in them. Notes travel with the "
      L"client when it is renamed, archived, restored, backed up, or restored "
      L"from backup. Deleting the client removes its notes too.",
      kClientNotesCommand, true, L"Client Notes",
      L"Client Notes now supports formatted text and named ticket tabs. Existing "
-     L"notes stay in Notes; use + Ticket for separate work and Rename tab to "
-     L"change a name. Edits save automatically, with a Saved status and one Close button."},
+     L"notes stay in Notes; use + for separate work and double-click a tab to "
+     L"change a name. Edits save automatically. The editor remembers its size and closes with the top-right X."},
 };
 
 bool IsMissingPathError(DWORD error) {

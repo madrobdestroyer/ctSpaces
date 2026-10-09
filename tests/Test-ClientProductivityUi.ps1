@@ -81,6 +81,7 @@ public static class ProductivityQa {
   public static string ChildTexts(IntPtr parent){var texts=new StringBuilder();EnumChildWindows(parent,(w,p)=>{var title=Text(w);if(!String.IsNullOrEmpty(title)){if(texts.Length>0)texts.Append(" | ");texts.Append(title);}return true;},IntPtr.Zero);return texts.ToString();}
   public static string ChildIds(IntPtr parent){var text=new StringBuilder();EnumChildWindows(parent,(w,p)=>{text.Append(GetDlgCtrlID(w)+":"+Text(w)+" | ");return true;},IntPtr.Zero);return text.ToString();}
   public static long Query(IntPtr w,uint message,long parameter){UIntPtr result;if(!SendMessageTimeoutW(w,message,new UIntPtr(unchecked((ulong)parameter)),IntPtr.Zero,3,3000,out result))throw new Exception("UI query timed out: "+message);return unchecked((long)result.ToUInt64());}
+  public static long HitTest(IntPtr w,int x,int y){UIntPtr result;if(!SendMessageTimeoutW(w,0x84,UIntPtr.Zero,new IntPtr((y<<16)|(x&0xffff)),3,3000,out result))throw new Exception("Frame hit test timed out");return unchecked((long)result.ToUInt64());}
   public static void Command(IntPtr w,uint id){UIntPtr result;if(!SendMessageTimeoutW(w,0x111,new UIntPtr(id),IntPtr.Zero,3,5000,out result))throw new Exception("UI command timed out: "+id);}
   public static void FocusControl(IntPtr parent,IntPtr child){UIntPtr result;if(!SendMessageTimeoutW(parent,0x28,new UIntPtr(unchecked((ulong)child.ToInt64())),new IntPtr(1),3,3000,out result))throw new Exception("Focus transfer timed out");}
   public static void NotifyComboSelection(IntPtr dialog,uint id,IntPtr combo){UIntPtr result;ulong command=id|(1ul<<16);if(!SendMessageTimeoutW(dialog,0x111,new UIntPtr(command),combo,3,5000,out result))throw new Exception("Combo selection notification timed out");}
@@ -262,7 +263,11 @@ try {
     Assert([Math]::Abs(($firstBounds.Bottom-$firstBounds.Top)*96/$firstDpi-640)-le 2) "Notes compact height differed: $($firstBounds.Bottom-$firstBounds.Top) at DPI $firstDpi."
     Assert([ProductivityQa]::ControlText($notesEdit)-eq'Existing legacy reminder') 'Legacy note did not open in Notes.'
     Assert([ProductivityQa]::GetDlgItem($notes,1)-eq[IntPtr]::Zero) 'Manual Save button remains.'
-    Assert([ProductivityQa]::ControlText([ProductivityQa]::GetDlgItem($notes,2))-eq'Close') 'Close button differs.'
+    Assert([ProductivityQa]::ControlText([ProductivityQa]::GetDlgItem($notes,2))-eq'Close notes') 'Caption close control differs.'
+    $closeBounds=[ProductivityQa+Rect]::new();[void][ProductivityQa]::GetWindowRect([ProductivityQa]::GetDlgItem($notes,2),[ref]$closeBounds)
+    Assert(($closeBounds.Top-$firstBounds.Top)*96/$firstDpi-lt 10) 'Close control is not in the caption.'
+    Assert([ProductivityQa]::HitTest($notes,($firstBounds.Left+50),($firstBounds.Top+20))-eq 2) 'Custom caption cannot drag the window.'
+    Assert([ProductivityQa]::HitTest($notes,($firstBounds.Left+2),($firstBounds.Top+2))-eq 13) 'Custom frame cannot resize from its corner.'
     $noteFile=Join-Path $data ('Sites\'+$clientA+'\ctSpaces-client-notes.ctn')
     Assert(-not(Test-Path $noteFile)) 'Opening notes created a notebook before an edit.'
     $marine=Save-VisibleShot $notes 'notes-marine'
@@ -300,13 +305,19 @@ try {
     Assert(([BitConverter]::ToUInt32([ProductivityQa]::CharacterFormat($notesEdit),8)-band 6)-eq 6) 'Italic and underline did not apply.'
     $style=[ProductivityQa]::GetDlgItem($notes,1320)
     [void][ProductivityQa]::Query($style,0x14E,1);[ProductivityQa]::NotifyComboSelection($notes,1320,$style);Wait-Saved $notes
-    Assert([BitConverter]::ToInt32([ProductivityQa]::CharacterFormat($notesEdit),12)-eq 400) 'Heading font size differs.'
+    Assert([BitConverter]::ToInt32([ProductivityQa]::CharacterFormat($notesEdit),12)-eq 560) 'Heading font size differs.'
     $size=[ProductivityQa]::GetDlgItem($notes,1321)
     [void][ProductivityQa]::Query($size,0x14E,5);[ProductivityQa]::NotifyComboSelection($notes,1321,$size);Wait-Saved $notes
     Assert([BitConverter]::ToInt32([ProductivityQa]::CharacterFormat($notesEdit),12)-eq 360) 'Font size did not apply.'
     [ProductivityQa]::Command($notes,1327);Wait-Saved $notes
     [ProductivityQa]::Command($notes,1332);Wait-Saved $notes
     Assert(([BitConverter]::ToUInt32([ProductivityQa]::CharacterFormat($notesEdit),8)-band 7)-eq 0) 'Clear formatting retained bold/italic/underline.'
+    [ProductivityQa]::Command($notes,1325);Wait-Saved $notes
+    Assert([BitConverter]::ToUInt32([ProductivityQa]::CharacterFormat($notesEdit),20)-eq 0x181818) 'Yellow highlight lacks dark foreground.'
+    Switch-Note $notes 0;Switch-Note $notes 2
+    [ProductivityQa]::Select($notesEdit,0,-1)
+    Assert([BitConverter]::ToUInt32([ProductivityQa]::CharacterFormat($notesEdit),20)-eq 0x181818) 'Highlight foreground was lost while reopening the tab.'
+    [ProductivityQa]::Command($notes,1332);Wait-Saved $notes
     [ProductivityQa]::Select($notesEdit,0,0);[ProductivityQa]::Command($notes,1328);Wait-Saved $notes
     $checkText=[ProductivityQa]::ControlText($notesEdit)
     Assert($checkText.StartsWith([string][char]0x2610)) 'Checklist marker was not inserted.'
@@ -397,13 +408,44 @@ try {
     }
     Switch-Note $notes 2;Name-Note $notes 'INC-1245' -Rename
     $previewEdit=[ProductivityQa]::GetDlgItem($notes,1317)
-    $preview="VPN connection issue`r`n`r`nUser cannot connect from home. Office connection works normally.`r`n`r`nChecks completed`r`n"+[char]0x2611+" Confirmed internet connection`r`n"+[char]0x2611+" Restarted the VPN client`r`n"+[char]0x2610+" Collect connection logs`r`n`r`nNext step`r`nReview the logs and test again with the user.`r`n`r`nReference: https://support.example.com/vpn"
+    $preview="Client reminders`r`n`r`nKeep useful details and tasks together for this client.`r`n`r`nMonthly tasks`r`n"+[char]0x2610+" Review account access`r`n"+[char]0x2611+" Update the contact list`r`n"+[char]0x2611+" Confirm the next maintenance window`r`n`r`nImportant`r`nBefore making changes: confirm the maintenance window with the client.`r`n`r`nUseful links`r`nhttps://support.example.com/client`r`n`r`nLast discussed with the client on October 9."
+    $preview=$preview.Replace("`r`n`r`n","`r`n").Replace("`r`nLast discussed","`r`n`r`nLast discussed")
     [ProductivityQa]::Select($previewEdit,0,-1);[ProductivityQa]::PasteLike($previewEdit,$preview)
     [ProductivityQa]::Select($previewEdit,0,-1);[ProductivityQa]::Command($notes,1332)
-    [ProductivityQa]::Select($previewEdit,0,'VPN connection issue'.Length)
+    [ProductivityQa]::Select($previewEdit,0,'Client reminders'.Length)
     [void][ProductivityQa]::Query([ProductivityQa]::GetDlgItem($notes,1320),0x14E,1)
     [ProductivityQa]::NotifyComboSelection($notes,1320,[ProductivityQa]::GetDlgItem($notes,1320));Wait-Saved $notes
-    [ProductivityQa]::Select($previewEdit,0,0)
+    foreach($label in @('Monthly tasks','Important','Useful links')){
+        $at=[ProductivityQa]::ControlText($previewEdit).Replace("`r`n","`r").IndexOf($label)
+        [ProductivityQa]::Select($previewEdit,$at,($at+$label.Length))
+        [void][ProductivityQa]::Query([ProductivityQa]::GetDlgItem($notes,1320),0x14E,2)
+        [ProductivityQa]::NotifyComboSelection($notes,1320,[ProductivityQa]::GetDlgItem($notes,1320))
+    }
+    foreach($label in @('Review account access','Update the contact list','Confirm the next maintenance window')){
+        $at=[ProductivityQa]::ControlText($previewEdit).Replace("`r`n","`r").IndexOf($label)
+        [ProductivityQa]::Select($previewEdit,$at,$at);[ProductivityQa]::Command($notes,1328)
+    }
+    $at=[ProductivityQa]::ControlText($previewEdit).Replace("`r`n","`r").IndexOf('Review account access')
+    [ProductivityQa]::Select($previewEdit,$at,($at+21))
+    Assert(([BitConverter]::ToUInt32([ProductivityQa]::CharacterFormat($previewEdit),8)-band 8)-eq 8) 'Completed checklist text is not struck through.'
+    foreach($pair in @(@('Before making changes:',1322),@('confirm the maintenance window with the client.',1325),@('Last discussed with the client on October 9.',1323))){
+        $at=[ProductivityQa]::ControlText($previewEdit).Replace("`r`n","`r").IndexOf($pair[0])
+        [ProductivityQa]::Select($previewEdit,$at,($at+$pair[0].Length));[ProductivityQa]::Command($notes,$pair[1])
+    }
+    Wait-Saved $notes
+    foreach($screen in [Windows.Forms.Screen]::AllScreens){
+        [void][ProductivityQa]::SetWindowPos($notes,[IntPtr]::Zero,$screen.WorkingArea.Left+20,$screen.WorkingArea.Top+20,0,0,0x15)
+        Start-Sleep -Milliseconds 350
+        if([ProductivityQa]::GetDpiForWindow($notes)-eq 144){break}
+    }
+    $previewDpi=[ProductivityQa]::GetDpiForWindow($notes)
+    [void][ProductivityQa]::SetWindowPos($notes,[IntPtr]::Zero,0,0,[int](950*$previewDpi/96),[int](735*$previewDpi/96),0x16)
+    $at=[ProductivityQa]::ControlText($previewEdit).Replace("`r`n","`r").IndexOf('https://support.example.com/client')
+    [ProductivityQa]::Select($previewEdit,$at,($at+'https://support.example.com/client'.Length));[ProductivityQa]::Command($notes,1329);Wait-Saved $notes
+    $at=[ProductivityQa]::ControlText($previewEdit).Replace("`r`n","`r").IndexOf('Keep useful details')
+    [ProductivityQa]::Select($previewEdit,$at,$at);[ProductivityQa]::FocusControl($notes,[ProductivityQa]::GetDlgItem($notes,1334))
+    [void][ProductivityQa]::Query($notes,0x127,0x10001)
+    [void][ProductivityQa]::Query($previewEdit,0x115,6)
     $gothicShot=Save-VisibleShot $notes 'notes-gothic'
     Assert((Fingerprint $marine)-ne(Fingerprint $gothicShot)) 'Notes did not repaint for the dark theme.'
     [ProductivityQa]::Command($notes,2);Wait-Until{-not[ProductivityQa]::IsWindow($notes)} 'Dark themed notes did not close.'|Out-Null

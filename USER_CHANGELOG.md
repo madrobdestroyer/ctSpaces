@@ -1,6 +1,12 @@
 # ctSpaces 6.2 What's New
 
-## Current 6.2.0.0 Update
+## Current 6.2.1.0 Update
+
+Client Notes has a polished window with an integrated title and close X, slimmer ticket tabs, a grouped icon toolbar, themed dropdowns, and a padded writing area. The footer shows autosave status with no Save or Cancel buttons. Use + to add a ticket tab, and double-click or right-click a tab to rename it.
+
+Headings, subheadings, yellow highlights, and larger checklist markers improve readability. Completed tasks receive a strike-through. The window still opens compactly and remembers your preferred size and maximized state.
+
+## Previous 6.2.0.0 Update
 
 The notes editor starts compact and remembers your preferred window size. Its wider ticket tabs, grouped icon toolbar with hover hints, and padded writing area make longer notes easier to work with. The window can be resized or maximized.
 

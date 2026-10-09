@@ -176,6 +176,7 @@
     <ClInclude Include="InProc7z.h" />
     <ClInclude Include="CleanupResultPages.h" />
     <ClInclude Include="OwnerDrawUi.h" />
+    <ClInclude Include="NotesEditorUi.h" />
     <ClInclude Include="ProgressUI.h" />
     <ClInclude Include="Resource.h" />
     <ClInclude Include="SiblingStageName.h" />
