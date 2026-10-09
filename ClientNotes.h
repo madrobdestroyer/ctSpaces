@@ -314,6 +314,38 @@ inline DocumentResult ReadDocument(const std::filesystem::path &root) {
   return result;
 }
 
+// RichEdit exports U+2003 as \emspace but imports that control as U+0020.
+// Use an explicit Unicode group so checklist spacing survives a round trip.
+// Tokenize escaped backslashes too: literal text such as "\\emspace" is data.
+inline bool PreserveEditorSpacing(std::string &rtf) {
+  std::string normalized;
+  normalized.reserve(rtf.size());
+  for (size_t i = 0; i < rtf.size();) {
+    if (rtf[i] != '\\' || i + 1 == rtf.size()) {
+      normalized.push_back(rtf[i++]);
+    } else {
+      const size_t start = i++;
+      if (!std::isalpha(static_cast<unsigned char>(rtf[i]))) {
+        normalized.append(rtf, start, 2);
+        ++i;
+      } else {
+        const size_t word = i;
+        while (i < rtf.size() && std::isalpha(static_cast<unsigned char>(rtf[i]))) ++i;
+        if (rtf.compare(word, i - word, "emspace") == 0 &&
+            (i == rtf.size() || (rtf[i] != '-' && !std::isdigit(static_cast<unsigned char>(rtf[i]))))) {
+          if (i < rtf.size() && rtf[i] == ' ') ++i;
+          normalized += "{\\uc1\\u8195?}";
+        } else {
+          normalized.append(rtf, start, i - start);
+        }
+      }
+    }
+    if (normalized.size() > kMaxRichBytes) return false;
+  }
+  rtf = std::move(normalized);
+  return true;
+}
+
 // Use only for a native editor export. Store hyperlink display text without
 // its field instruction; RichEdit detects the URL again on the next load.
 // Incoming files must still pass ValidRichText without this normalization.
@@ -353,7 +385,7 @@ inline bool NormalizeEditorExport(std::string &rtf) {
     rtf.replace(cursor, fieldEnd - cursor, display);
     // Examine the inserted display as well; any nested field must be flattened.
   }
-  return ValidRichText(rtf);
+  return PreserveEditorSpacing(rtf) && ValidRichText(rtf);
 }
 
 inline bool SameSnapshot(const FileSnapshot &a, const FileSnapshot &b) {

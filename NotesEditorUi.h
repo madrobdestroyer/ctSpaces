@@ -2,12 +2,39 @@
 
 #include <windows.h>
 #include <gdiplus.h>
+#include <algorithm>
 #include "Resource.h"
 
 namespace notes_editor_ui {
 
 inline Gdiplus::Color Color(COLORREF value) {
   return Gdiplus::Color(255, GetRValue(value), GetGValue(value), GetBValue(value));
+}
+
+// Subtle vertical lighting gives the reference's controls depth without
+// introducing bitmap assets or losing sharpness on another display scale.
+inline void DrawSurface(HDC dc, const RECT &bounds, COLORREF top,
+                        COLORREF bottom, COLORREF border, float radius,
+                        float stroke = 1.0f) {
+  using namespace Gdiplus;
+  Graphics graphics(dc);
+  graphics.SetSmoothingMode(SmoothingModeAntiAlias);
+  const float x = static_cast<float>(bounds.left) + stroke / 2;
+  const float y = static_cast<float>(bounds.top) + stroke / 2;
+  const float w = static_cast<float>(bounds.right - bounds.left) - stroke;
+  const float h = static_cast<float>(bounds.bottom - bounds.top) - stroke;
+  if (w <= 0 || h <= 0) return;
+  const float d = (std::min)(radius * 2, (std::min)(w, h));
+  GraphicsPath path;
+  path.AddArc(x, y, d, d, 180, 90);
+  path.AddArc(x + w - d, y, d, d, 270, 90);
+  path.AddArc(x + w - d, y + h - d, d, d, 0, 90);
+  path.AddArc(x, y + h - d, d, d, 90, 90);
+  path.CloseFigure();
+  LinearGradientBrush fill(PointF(x, y), PointF(x, y + h), Color(top), Color(bottom));
+  graphics.FillPath(&fill, &path);
+  Pen outline(Color(border), stroke);
+  graphics.DrawPath(&outline, &path);
 }
 
 // Draw at a consistent logical size, with smooth strokes at every display DPI.
@@ -20,7 +47,7 @@ inline void DrawIcon(HDC dc, const RECT &bounds, UINT id, COLORREF color) {
   graphics.TranslateTransform((bounds.left + bounds.right) / 2.0f,
                               (bounds.top + bounds.bottom) / 2.0f);
   graphics.ScaleTransform(scale, scale);
-  Pen pen(Color(color), 1.8f);
+  Pen pen(Color(color), 2.1f);
   pen.SetStartCap(LineCapRound); pen.SetEndCap(LineCapRound); pen.SetLineJoin(LineJoinRound);
   SolidBrush ink(Color(color));
   auto line = [&](float x1, float y1, float x2, float y2) {
@@ -37,14 +64,14 @@ inline void DrawIcon(HDC dc, const RECT &bounds, UINT id, COLORREF color) {
                           id == IDC_NOTES_UNDERLINE ? L"U" : L"T";
     const int style = id == IDC_NOTES_BOLD ? FontStyleBold :
                       id == IDC_NOTES_ITALIC || id == IDC_NOTES_CLEAR ? FontStyleItalic : FontStyleRegular;
-    Font font(L"Segoe UI", 25.0f, style, UnitPixel);
+    Font font(id == IDC_NOTES_ITALIC || id == IDC_NOTES_CLEAR ? L"Cambria" : L"Segoe UI", 27.0f, style, UnitPixel);
     StringFormat format;
     format.SetAlignment(StringAlignmentCenter); format.SetLineAlignment(StringAlignmentCenter);
     RectF box(-18, -21, id == IDC_NOTES_CLEAR ? 28.0f : 36.0f, 40);
     graphics.SetTextRenderingHint(TextRenderingHintAntiAliasGridFit);
     graphics.DrawString(text, 1, &font, box, &format, &ink);
     if (id == IDC_NOTES_UNDERLINE) line(-8, 12, 8, 12);
-    if (id == IDC_NOTES_CLEAR) { line(6, 5, 13, 12); line(13, 5, 6, 12); }
+    if (id == IDC_NOTES_CLEAR) { line(-10, 12, 4, 12); line(6, 5, 13, 12); line(13, 5, 6, 12); }
     break;
   }
   case IDC_NOTES_HIGHLIGHT: {
@@ -77,12 +104,12 @@ inline void DrawIcon(HDC dc, const RECT &bounds, UINT id, COLORREF color) {
     break;
   }
   case IDC_NOTES_LINK: {
-    graphics.RotateTransform(-45);
+    graphics.RotateTransform(40);
     GraphicsPath first, second;
-    first.AddArc(-5, -15, 10, 10, 180, 180); first.AddLine(5, -10, 5, -2);
-    first.AddArc(-5, -7, 10, 10, 0, 180); first.AddLine(-5, -2, -5, -10);
-    second.AddArc(-5, -3, 10, 10, 180, 180); second.AddLine(5, 2, 5, 10);
-    second.AddArc(-5, 5, 10, 10, 0, 180); second.AddLine(-5, 10, -5, 2);
+    first.AddLine(-5, -2, -5, -9); first.AddArc(-5, -14, 10, 10, 180, 180);
+    first.AddLine(5, -9, 5, -2);
+    second.AddLine(-5, 2, -5, 9); second.AddArc(-5, 4, 10, 10, 180, -180);
+    second.AddLine(5, 9, 5, 2);
     graphics.DrawPath(&pen, &first); graphics.DrawPath(&pen, &second);
     line(0, -6, 0, 6); break;
   }

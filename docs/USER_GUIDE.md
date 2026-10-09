@@ -64,7 +64,7 @@ Choose a result with the mouse or arrow keys and confirm your selection to fill 
 
 ## Client Notes
 
-The notes window starts at a compact size. Drag its edges or corners to resize it, or double-click the title area to maximize and restore it. ctSpaces remembers your preferred size, including maximized state, for future openings and adjusts it to fit the current display. The writing area grows with the window, and formatting controls have hover hints.
+The notes window follows the selected application theme, with shaded tabs and formatting controls, a padded writing area, and autosave status in the footer. It starts at a compact size. Drag its edges or corners to resize it, or double-click the title area to maximize and restore it. ctSpaces remembers your preferred size, including maximized state, for future openings and adjusts it to fit the current display. The writing area grows with the window, and formatting controls have hover hints.
 
 Select an existing client, then choose `Client Notes` from Settings. The same command is available by right clicking a visible pinned client. Existing notes open in **Notes**. Select **+** to add a tab and give it the ticket number or another name for the work. Each tab keeps its own notes. Double-click a tab, or right-click it and choose **Rename tab**, to change its name. Names must be unique, with up to 64 characters; a client can have up to 256 tabs.
 

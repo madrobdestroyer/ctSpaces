@@ -15981,6 +15981,42 @@ static std::optional<INT_PTR> HandleCleanupDialogTheme(
   return std::nullopt;
 }
 
+// Notes keeps the selected theme; only its surface treatment is specialized.
+static COLORREF NotesWindowColor() {
+  // System Dark supplies the same color for every surface. Give it the same
+  // document/chrome separation as named palettes, without changing its hue.
+  return g_bThemeIsDark && g_themeColors.crWindow == g_themeColors.crControl ?
+      BlendColor(g_themeColors.crWindow, RGB(0, 0, 0), 18) : g_themeColors.crWindow;
+}
+
+static COLORREF NotesControlColor() {
+  return g_bThemeIsDark && g_themeColors.crButtonFace == g_themeColors.crWindow ?
+      BlendColor(g_themeColors.crButtonFace, g_themeColors.crControlText, 4) : g_themeColors.crButtonFace;
+}
+
+static COLORREF NotesBorder() {
+  return BlendColor(g_themeColors.crControlBorder, NotesWindowColor(), 35);
+}
+
+static void PaintNotesChrome(HDC dc, HWND window) {
+  RECT client{}; GetClientRect(window, &client);
+  SetDCBrushColor(dc, NotesWindowColor());
+  FillRect(dc, &client, reinterpret_cast<HBRUSH>(GetStockObject(DC_BRUSH)));
+  HWND dialog = GetAncestor(window, GA_ROOT);
+  RECT area{}; GetClientRect(dialog, &area);
+  MapWindowPoints(dialog, window, reinterpret_cast<POINT *>(&area), 2);
+  const COLORREF top = BlendColor(NotesWindowColor(), g_themeColors.crControlText, 3);
+  notes_editor_ui::DrawSurface(dc, area, top, NotesWindowColor(),
+      g_themeColors.crControlBorder, static_cast<float>(ScaleByDpi(9, GetDpiForWindow(dialog))));
+}
+
+static void DrawNotesSurface(HDC dc, const RECT &area, COLORREF base,
+                             COLORREF border, UINT dpi, int radius = 4) {
+  notes_editor_ui::DrawSurface(dc, area,
+      BlendColor(base, g_themeColors.crControlText, g_bThemeIsDark ? 5 : 2),
+      base, border, static_cast<float>(ScaleByDpi(radius, dpi)));
+}
+
 struct ClientNotesDialogState {
   std::wstring clientName;
   fs::path clientRoot;
@@ -16327,8 +16363,11 @@ static void DrawNotesChecklistMarkers(HWND edit, HDC dc) {
     FillRect(dc, &erase, g_hbrThemeControl);
     RECT box{point.x, point.y + ScaleByDpi(2, dpi), point.x + size, point.y + ScaleByDpi(2, dpi) + size};
     const bool checked = prefix[0] == L'\u2611';
-    DrawRoundedRect(dc, box, checked ? g_themeColors.crAccent : g_themeColors.crControl,
-                    checked ? g_themeColors.crAccent : g_themeColors.crControlText, ScaleByDpi(3, dpi));
+    notes_editor_ui::DrawSurface(dc, box,
+        checked ? BlendColor(g_themeColors.crAccent, g_themeColors.crAccentText, 8) : g_themeColors.crControl,
+        checked ? g_themeColors.crAccent : g_themeColors.crControl,
+        checked ? g_themeColors.crAccent : g_themeColors.crControlText,
+        static_cast<float>(ScaleByDpi(3, dpi)), static_cast<float>(dpi) / 72.0f);
     if (checked) {
       Gdiplus::Graphics graphics(dc);
       graphics.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
@@ -16656,10 +16695,10 @@ static void LayoutClientNotes(HWND dialog, UINT dpi) {
           combo ? ScaleByDpi(210, dpi) : -1);
     x += ScaleByDpi(width, dpi) + toolGap;
   }
-  const int footer = area.bottom - ScaleByDpi(80, dpi);
+  const int footer = area.bottom - ScaleByDpi(74, dpi);
   place(IDC_NOTES_CONTEXT, margin + ScaleByDpi(4, dpi), footer,
         area.right - margin * 2, ScaleByDpi(24, dpi));
-  place(IDC_NOTES_STATUS, margin + ScaleByDpi(4, dpi), footer + ScaleByDpi(27, dpi),
+  place(IDC_NOTES_STATUS, margin + ScaleByDpi(4, dpi), footer + ScaleByDpi(26, dpi),
         area.right - margin * 2, ScaleByDpi(24, dpi));
   const int editorTop = ScaleByDpi(144, dpi);
   place(IDC_CLIENT_NOTES_TEXT, margin + ScaleByDpi(4, dpi), editorTop,
@@ -16696,12 +16735,12 @@ static bool DrawNotesToolbarButton(const DRAWITEMSTRUCT &draw,
   const bool disabled = (draw.itemState & ODS_DISABLED) != 0;
   const bool active = !disabled && (SendMessageW(draw.hwndItem, BM_GETSTATE, 0, 0) & BST_PUSHED);
   const bool hot = !disabled && (draw.hwndItem == g_hHotButton || (draw.itemState & ODS_SELECTED));
-  FillRect(draw.hDC, &draw.rcItem, g_hbrThemeWindow);
+  PaintNotesChrome(draw.hDC, draw.hwndItem);
   if (active || hot || draw.CtlID == IDC_NOTES_ADD_TAB)
-    DrawRoundedRect(draw.hDC, draw.rcItem,
+    DrawNotesSurface(draw.hDC, draw.rcItem,
         active ? BlendColor(g_themeColors.crWindow, g_themeColors.crAccent, 28) :
-        hot ? g_themeColors.crControlHot : g_themeColors.crWindow,
-        active ? g_themeColors.crAccent : g_themeColors.crControlBorder, ScaleByDpi(5, dpi));
+        hot ? g_themeColors.crControlHot : NotesControlColor(),
+        active ? g_themeColors.crAccent : NotesBorder(), dpi);
   const COLORREF ink = disabled ? BlendColor(g_themeColors.crControlText, g_themeColors.crWindow, 55) :
                                   g_themeColors.crControlText;
   RECT icon = draw.rcItem;
@@ -16725,11 +16764,11 @@ static LRESULT CALLBACK NotesComboSubclass(HWND combo, UINT message,
     PAINTSTRUCT paint{};
     HDC dc = message == WM_PAINT ? BeginPaint(combo, &paint) : reinterpret_cast<HDC>(wParam);
     RECT rect{}; GetClientRect(combo, &rect);
-    FillRect(dc, &rect, g_hbrThemeWindow);
+    PaintNotesChrome(dc, combo);
     const UINT dpi = GetDpiForWindow(combo);
     const bool focused = GetFocus() == combo;
-    DrawRoundedRect(dc, rect, g_themeColors.crControl,
-        focused ? g_themeColors.crAccent : g_themeColors.crControlBorder, ScaleByDpi(5, dpi));
+    DrawNotesSurface(dc, rect, NotesControlColor(),
+        focused ? g_themeColors.crAccent : g_themeColors.crControlBorder, dpi);
     wchar_t text[128]{}; GetWindowTextW(combo, text, static_cast<int>(std::size(text)));
     HGDIOBJ oldFont = SelectObject(dc, reinterpret_cast<HFONT>(SendMessageW(combo, WM_GETFONT, 0, 0)));
     SetBkMode(dc, TRANSPARENT); SetTextColor(dc, g_themeColors.crControlText);
@@ -16846,6 +16885,11 @@ static bool LoadNotesPage(HWND dialog, ClientNotesDialogState &state) {
   bool ok = true;
   if (page.rich) {
     NotesStream stream{page.rtf};
+    // Also repair the spacing token in notebooks saved by earlier versions.
+    if (!client_notes::PreserveEditorSpacing(stream.bytes)) {
+      state.loading = false;
+      return false;
+    }
     EDITSTREAM source{reinterpret_cast<DWORD_PTR>(&stream), 0, NotesStreamIn};
     SendMessageW(edit, EM_STREAMIN, SF_RTF, reinterpret_cast<LPARAM>(&source));
     ok = !source.dwError && stream.offset == stream.bytes.size();
@@ -16918,14 +16962,13 @@ static LRESULT CALLBACK NotesTabsSubclass(HWND tabs, UINT message,
                                 : reinterpret_cast<HDC>(wParam);
     RECT area{};
     GetClientRect(tabs, &area);
-    FillRect(dc, &area, g_hbrThemeWindow);
+    PaintNotesChrome(dc, tabs);
     HGDIOBJ oldFont = SelectObject(dc, reinterpret_cast<HFONT>(
         SendMessageW(tabs, WM_GETFONT, 0, 0)));
     SetBkMode(dc, TRANSPARENT);
     const int savedDc = SaveDC(dc);
     IntersectClipRect(dc, area.left, area.top, area.right, area.bottom);
-    DrawRoundedRect(dc, area, g_themeColors.crWindow, g_themeColors.crControlBorder,
-                    ScaleByDpi(4, GetDpiForWindow(tabs)));
+    DrawNotesSurface(dc, area, NotesWindowColor(), NotesBorder(), GetDpiForWindow(tabs));
     auto *state = reinterpret_cast<ClientNotesDialogState *>(GetWindowLongPtrW(GetParent(tabs), DWLP_USER));
     for (int i = 0; i < TabCtrl_GetItemCount(tabs); ++i) {
       RECT rect{};
@@ -16933,15 +16976,16 @@ static LRESULT CALLBACK NotesTabsSubclass(HWND tabs, UINT message,
       const bool selected = i == TabCtrl_GetCurSel(tabs);
       rect.top = 0; rect.bottom = area.bottom - 1;
       if (selected) {
-        DrawRoundedRect(dc, rect, BlendColor(g_themeColors.crWindow, g_themeColors.crControlHot, 55), g_themeColors.crControlBorder,
-                        ScaleByDpi(4, GetDpiForWindow(tabs)));
+        DrawNotesSurface(dc, rect, NotesControlColor(),
+                         g_themeColors.crControlBorder, GetDpiForWindow(tabs));
         RECT underline{rect.left, rect.bottom - ScaleByDpi(4, GetDpiForWindow(tabs)), rect.right, rect.bottom};
         HBRUSH accent = CreateSolidBrush(g_themeColors.crAccent);
         FillRect(dc, &underline, accent); DeleteObject(accent);
       }
       RECT separator{rect.right - 1, rect.top + ScaleByDpi(6, GetDpiForWindow(tabs)), rect.right,
                      rect.bottom - ScaleByDpi(8, GetDpiForWindow(tabs))};
-      FillRect(dc, &separator, g_hbrThemeBorder);
+      SetDCBrushColor(dc, NotesBorder());
+      FillRect(dc, &separator, reinterpret_cast<HBRUSH>(GetStockObject(DC_BRUSH)));
       wchar_t name[65]{};
       TCITEMW item{};
       item.mask = TCIF_TEXT;
@@ -17166,24 +17210,32 @@ static INT_PTR CALLBACK ClientNotesDlgProc(HWND dialog, UINT message,
     RECT area{}; GetClientRect(dialog, &area);
     RECT tabLine{ScaleByDpi(24, dpi), ScaleByDpi(87, dpi),
                  area.right - ScaleByDpi(24, dpi), ScaleByDpi(88, dpi)};
-    FillRect(reinterpret_cast<HDC>(wParam), &area, g_hbrThemeWindow);
-    // Fine outline belongs to the integrated frame, not a second title bar.
-    DrawRoundedRect(reinterpret_cast<HDC>(wParam), area, g_themeColors.crWindow,
-                    g_themeColors.crControlBorder, ScaleByDpi(9, dpi));
+    PaintNotesChrome(reinterpret_cast<HDC>(wParam), dialog);
     // Document and toolbar outlines share the frame's subtle border color.
     RECT editor{}; GetWindowRect(GetDlgItem(dialog, IDC_CLIENT_NOTES_TEXT), &editor);
     MapWindowPoints(nullptr, dialog, reinterpret_cast<POINT *>(&editor), 2);
     InflateRect(&editor, 1, 1);
     FrameRect(reinterpret_cast<HDC>(wParam), &editor, g_hbrThemeBorder);
-    FillRect(reinterpret_cast<HDC>(wParam), &tabLine, g_hbrThemeBorder);
+    SetDCBrushColor(reinterpret_cast<HDC>(wParam), NotesBorder());
+    FillRect(reinterpret_cast<HDC>(wParam), &tabLine, reinterpret_cast<HBRUSH>(GetStockObject(DC_BRUSH)));
     for (int id : {IDC_NOTES_BOLD, IDC_NOTES_BULLETS, IDC_NOTES_LINK, IDC_NOTES_UNDO, IDC_NOTES_CLEAR}) {
       RECT rect{}; GetWindowRect(GetDlgItem(dialog, id), &rect);
       MapWindowPoints(nullptr, dialog, reinterpret_cast<POINT *>(&rect), 2);
       const int x = rect.left - ScaleByDpi(11, dpi);
       RECT divider{x, rect.top, x + 1, rect.top + ScaleByDpi(36, dpi)};
-      FillRect(reinterpret_cast<HDC>(wParam), &divider, g_hbrThemeBorder);
+      FillRect(reinterpret_cast<HDC>(wParam), &divider, reinterpret_cast<HBRUSH>(GetStockObject(DC_BRUSH)));
     }
     return TRUE;
+  }
+  if (message == WM_CTLCOLORSTATIC) {
+    HDC dc = reinterpret_cast<HDC>(wParam);
+    HWND control = reinterpret_cast<HWND>(lParam);
+    PaintNotesChrome(dc, control);
+    const int id = GetDlgCtrlID(control);
+    SetTextColor(dc, id == IDC_NOTES_CLIENT_HEADING ? g_themeColors.crWindowText :
+        BlendColor(g_themeColors.crWindowText, g_themeColors.crWindow, 22));
+    SetBkMode(dc, TRANSPARENT);
+    return reinterpret_cast<INT_PTR>(GetStockObject(NULL_BRUSH));
   }
   if (const auto themed = HandleCleanupDialogTheme(dialog, message, wParam,
                                                    lParam))

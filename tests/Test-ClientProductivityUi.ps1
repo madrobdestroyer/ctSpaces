@@ -3,7 +3,8 @@
 param(
     [string]$ExePath = (Join-Path $PSScriptRoot '..\dist\x64\Release\ctSpaces.exe'),
     [string]$ArtifactDirectory = (Join-Path $PSScriptRoot '..\build\client-productivity-ui'),
-    [switch]$NotesOnly
+    [switch]$NotesOnly,
+    [switch]$VisualOnly
 )
 
 $ErrorActionPreference = 'Stop'
@@ -271,6 +272,7 @@ try {
     $noteFile=Join-Path $data ('Sites\'+$clientA+'\ctSpaces-client-notes.ctn')
     Assert(-not(Test-Path $noteFile)) 'Opening notes created a notebook before an edit.'
     $marine=Save-VisibleShot $notes 'notes-marine'
+    if(-not $VisualOnly){
     [void][ProductivityQa]::SetWindowPos($notes,[IntPtr]::Zero,0,0,[int](1000*$firstDpi/96),[int](700*$firstDpi/96),0x16)
     $saved='A local note for '+$clientA
     [ProductivityQa]::Select($notesEdit,0,-1)
@@ -372,6 +374,17 @@ try {
     Switch-Note $notes 0;Switch-Note $notes 3
     Assert(([ProductivityQa]::ControlText($notesEdit)).Replace("`r`n","`n").Replace("`r","`n")-eq$longText.Replace("`r`n","`n")) 'Large document changed while switching tabs.'
     [ProductivityQa]::Command($notes,2);Wait-Until{-not[ProductivityQa]::IsWindow($notes)} 'Reopened notes did not close.'|Out-Null
+    } else {
+        $ticketText='Visual review'
+        Name-Note $notes 'INC-12345'
+        [ProductivityQa]::PasteLike($notesEdit,$ticketText)
+        [ProductivityQa]::Select($notesEdit,0,$ticketText.Length)
+        [ProductivityQa]::Command($notes,1322);Wait-Saved $notes
+        Name-Note $notes 'INC-1245'
+        Name-Note $notes 'Long document'
+        [ProductivityQa]::Command($notes,2)
+        Wait-Until{-not[ProductivityQa]::IsWindow($notes)} 'Visual fixture did not close.'|Out-Null
+    }
     [void][ProductivityQa]::PostMessageW($main,0x111,[UIntPtr]41006,[IntPtr]::Zero)
     $theme=Wait-Until{[ProductivityQa]::FindWithChild([uint32]$process.Id,5201)} 'Theme dialog did not open.'
     $themeCombo=[ProductivityQa]::GetDlgItem($theme,5201)
@@ -450,9 +463,49 @@ try {
     Assert((Fingerprint $marine)-ne(Fingerprint $gothicShot)) 'Notes did not repaint for the dark theme.'
     [ProductivityQa]::Command($notes,2);Wait-Until{-not[ProductivityQa]::IsWindow($notes)} 'Dark themed notes did not close.'|Out-Null
     Wait-Until{[ProductivityQa]::IsWindowEnabled($edit)} 'Launcher did not reenable after Client Notes.'|Out-Null
-    $noteHash=Fingerprint $noteFile
+    # Review the same populated document under the ordinary dark theme as well.
+    # This catches a reference treatment accidentally hard-coded to Gothic.
+    [void][ProductivityQa]::PostMessageW($main,0x111,[UIntPtr]41006,[IntPtr]::Zero)
+    $theme=Wait-Until{[ProductivityQa]::FindWithChild([uint32]$process.Id,5201)} 'Theme dialog did not open for Default Dark.'
+    $themeCombo=[ProductivityQa]::GetDlgItem($theme,5201)
+    $defaultDark=[ProductivityQa]::FindComboString($themeCombo,'System (Dark)')
+    Assert($defaultDark-ge 0) 'Default Dark theme was not available.'
+    [void][ProductivityQa]::Query($themeCombo,0x14E,$defaultDark)
+    [ProductivityQa]::NotifyComboSelection($theme,5201,$themeCombo)
+    [ProductivityQa]::Command($theme,5202)
+    Wait-Until{-not[ProductivityQa]::IsWindow($theme)} 'Default Dark did not apply.'|Out-Null
     $notes=Open-Notes $clientA;Switch-Note $notes 2
     $notesEdit=[ProductivityQa]::GetDlgItem($notes,1317)
+    [ProductivityQa]::Select($notesEdit,0,0)
+    [void][ProductivityQa]::Query($notesEdit,0x115,6)
+    [void][ProductivityQa]::Query($notes,0x127,0x10001)
+    $reopenedPreview=[ProductivityQa]::ControlText($notesEdit)
+    $markerAt=$reopenedPreview.IndexOf([char]0x2611)
+    Assert($markerAt-ge 0) 'Completed checklist marker did not survive reopening.'
+    Assert([int]$reopenedPreview[$markerAt+1]-eq 0x2003) ('Checklist spacing changed on reopen: U+'+([int]$reopenedPreview[$markerAt+1]).ToString('X4'))
+    foreach($label in @('Client reminders','Keep useful details','https://support.example.com/client')){
+        $at=$reopenedPreview.Replace("`r`n","`r").IndexOf($label)
+        [ProductivityQa]::Select($notesEdit,$at,($at+$label.Length))
+        $face=[Text.Encoding]::Unicode.GetString([ProductivityQa]::CharacterFormat($notesEdit),26,64).Trim([char]0)
+        Assert($face-eq'Segoe UI') ("Reopening changed the reference typography for '$label' to '$face'.")
+    }
+    $at=$reopenedPreview.Replace("`r`n","`r").IndexOf('Keep useful details')
+    [ProductivityQa]::Select($notesEdit,$at,$at)
+    [ProductivityQa]::FocusControl($notes,[ProductivityQa]::GetDlgItem($notes,1334))
+    $defaultDarkShot=Save-VisibleShot $notes 'notes-default-dark'
+    Assert((Fingerprint $defaultDarkShot)-ne(Fingerprint $gothicShot)) 'Default Dark did not change the notes palette.'
+    Name-Note $notes 'Blank ticket'
+    $blankShot=Save-VisibleShot $notes 'notes-empty-dark'
+    Switch-Note $notes 2
+    $noteHash=Fingerprint $noteFile
+    if($VisualOnly){
+        [ProductivityQa]::Command($notes,2)
+        Wait-Until{-not[ProductivityQa]::IsWindow($notes)} 'Visual review did not close.'|Out-Null
+        Assert((Fingerprint $liveConfig)-eq$liveBefore) 'Visual review changed live configuration.'
+        $completed=$true
+        [pscustomobject]@{VisualReview=$true;ObservedDpis=@($dpiObserved);MarineCapture=$marine;GothicCapture=$gothicShot;DefaultDarkCapture=$defaultDarkShot;EmptyDarkCapture=$blankShot}|ConvertTo-Json
+        return
+    }
     $notesPort=[ProductivityQa]::StartNotesServer()
     foreach($linkPath in @("/notes-first-$run","/notes-second-$run")){
         $linkUrl='http://127.0.0.1:'+$notesPort+$linkPath
@@ -482,7 +535,7 @@ try {
         Assert-NotesSizeAfterRestart
         Assert((Fingerprint $liveConfig)-eq$liveBefore) 'Notes test changed live configuration.'
         $completed=$true
-        [pscustomobject]@{NotesAutosave=$true;TicketTabs=$true;ToolbarFormatting=$true;UndoRedo=$true;LargeDocument=$true;FailedSaveRetainsDraft=$true;ResizableEditor=$true;MinimumWidthFitsToolbar=$true;NoteLinksUseClientBrowser=$true;RepeatedLinksUseSameBrowser=$true;ObservedDpis=@($dpiObserved);MarineCapture=$marine;GothicCapture=$gothicShot}|ConvertTo-Json
+        [pscustomobject]@{NotesAutosave=$true;TicketTabs=$true;ToolbarFormatting=$true;UndoRedo=$true;LargeDocument=$true;FailedSaveRetainsDraft=$true;ResizableEditor=$true;MinimumWidthFitsToolbar=$true;NoteLinksUseClientBrowser=$true;RepeatedLinksUseSameBrowser=$true;ObservedDpis=@($dpiObserved);MarineCapture=$marine;GothicCapture=$gothicShot;DefaultDarkCapture=$defaultDarkShot;EmptyDarkCapture=$blankShot}|ConvertTo-Json
         return
     }
     $zeroButton=[ProductivityQa]::GetDlgItem($main,209);Assert($zeroButton-ne[IntPtr]::Zero) 'Close all button is missing.'
@@ -518,7 +571,7 @@ try {
     Assert((Fingerprint $liveConfig)-eq$liveBefore) 'Live ctSpaces configuration changed.'
     Assert-NotesSizeAfterRestart
     $completed=$true
-    [pscustomobject]@{FilterMatches=2;TypedTextPreserved=$true;SelectionAndClickAway=$true;NewNameCreatedWithoutOpeningExisting=$true;NotesAutosaved=$true;LegacyNotesPreserved=$true;NamedTicketTabs=$true;FormattingSurvivesReopen=$true;DuplicateNamesRejected=$true;FailedAutosaveRetainsDraft=$true;ObservedDpis=@($dpiObserved);CloseAllZeroOneAndMultiple=$true;CloseAllCancellationPreservesSession=$true;LauncherRetained=$true;MarineTooltipCount=$marineTooltipCount;GothicTooltipCount=$gothicTooltipCount;FilterAndLauncherCapture=$filterShot;MarineNotesCapture=$marine;GothicNotesCapture=$gothicShot;LiveConfigUntouched=$true}|ConvertTo-Json
+    [pscustomobject]@{FilterMatches=2;TypedTextPreserved=$true;SelectionAndClickAway=$true;NewNameCreatedWithoutOpeningExisting=$true;NotesAutosaved=$true;LegacyNotesPreserved=$true;NamedTicketTabs=$true;FormattingSurvivesReopen=$true;DuplicateNamesRejected=$true;FailedAutosaveRetainsDraft=$true;ObservedDpis=@($dpiObserved);CloseAllZeroOneAndMultiple=$true;CloseAllCancellationPreservesSession=$true;LauncherRetained=$true;MarineTooltipCount=$marineTooltipCount;GothicTooltipCount=$gothicTooltipCount;FilterAndLauncherCapture=$filterShot;MarineNotesCapture=$marine;GothicNotesCapture=$gothicShot;DefaultDarkCapture=$defaultDarkShot;EmptyDarkCapture=$blankShot;LiveConfigUntouched=$true}|ConvertTo-Json
 } finally {
     [ProductivityQa]::StopNotesServer()
     foreach($edge in @($owned)){if($edge){try{[ProductivityQa]::ClosePidWindows([uint32]$edge.ProcessId)}catch{}}}

@@ -1,6 +1,10 @@
 # ctSpaces 6.2 What's New
 
-## Current 6.2.1.0 Update
+## Current 6.2.2.0 Update
+
+Client Notes more closely follows the approved visual reference, with shaded tabs and dropdowns, softer separators, refined formatting icons, and a quieter autosave footer. The selected application theme still controls its colors and accent. Large checklist boxes now retain their appearance after saving and reopening. Existing notes and formatting are preserved, along with slimmer ticket tabs and remembered window dimensions.
+
+## Previous 6.2.1.0 Update
 
 Client Notes has a polished window with an integrated title and close X, slimmer ticket tabs, a grouped icon toolbar, themed dropdowns, and a padded writing area. The footer shows autosave status with no Save or Cancel buttons. Use + to add a ticket tab, and double-click or right-click a tab to rename it.
 

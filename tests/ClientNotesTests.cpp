@@ -204,6 +204,16 @@ static DWORD CALLBACK ProbeStream(DWORD_PTR cookie, LPBYTE bytes, LONG count,
   return 0;
 }
 
+static DWORD CALLBACK ProbeRead(DWORD_PTR cookie, LPBYTE bytes, LONG count,
+                               LONG *read) {
+  auto &input = *reinterpret_cast<std::string_view *>(cookie);
+  const size_t length = (std::min)(input.size(), static_cast<size_t>(count));
+  memcpy(bytes, input.data(), length);
+  input.remove_prefix(length);
+  *read = static_cast<LONG>(length);
+  return 0;
+}
+
 static void TestNativeRichText() {
   HMODULE module = LoadLibraryW(L"Msftedit.dll");
   Check(module != nullptr, "Native rich editor loads");
@@ -240,6 +250,25 @@ static void TestNativeRichText() {
   Check(bytes.find("\\fldinst") == std::string::npos &&
         bytes.find("https://example.com/ticket") != std::string::npos,
         "Link export preserves visible URL without field instructions");
+  SetWindowTextW(edit, L"\u2611\u2003 Completed task");
+  bytes.clear(); stream.dwError = 0;
+  SendMessageW(edit, EM_STREAMOUT, SF_RTF, reinterpret_cast<LPARAM>(&stream));
+  Check(client_notes::NormalizeEditorExport(bytes), "Normalize checklist spacing");
+  SetWindowTextW(edit, L"");
+  std::string_view input(bytes);
+  EDITSTREAM reader{reinterpret_cast<DWORD_PTR>(&input), 0, ProbeRead};
+  SendMessageW(edit, EM_STREAMIN, SF_RTF, reinterpret_cast<LPARAM>(&reader));
+  wchar_t restored[64]{};
+  GetWindowTextW(edit, restored, 64);
+  Check(!reader.dwError && std::wstring_view(restored) == L"\u2611\u2003 Completed task",
+        "Native checklist marker and em-space survive save/reopen");
+  std::string legacy = "{\\rtf1\\ansi\\uc0\\emspace text \\\\emspace}";
+  Check(client_notes::PreserveEditorSpacing(legacy), "Repair legacy spacing tokens");
+  Check(legacy == "{\\rtf1\\ansi\\uc0{\\uc1\\u8195?}text \\\\emspace}",
+        "Spacing normalization consumes delimiter, scopes Unicode fallback, preserves literal slash");
+  const auto normalized = legacy;
+  Check(client_notes::PreserveEditorSpacing(legacy) && legacy == normalized,
+        "Spacing normalization is idempotent");
   DestroyWindow(edit);
   FreeLibrary(module);
 }
