@@ -30,6 +30,7 @@ if(-not(Test-Path -LiteralPath $exe -PathType Leaf)){throw "Missing executable: 
 Add-Type -AssemblyName System.Drawing
 Add-Type -TypeDefinition @'
 using System;
+using System.Collections.Generic;
 using System.Runtime.InteropServices;
 using System.Text;
 public static class ProductivityQa {
@@ -62,6 +63,7 @@ public static class ProductivityQa {
   public static bool SetWindowTextW(IntPtr w,string text){UIntPtr result;return SendMessageTimeoutTextW(w,0xC,UIntPtr.Zero,text,3,3000,out result);}
   public static IntPtr Find(uint pid,string cls,string title){IntPtr hit=IntPtr.Zero;EnumWindows((w,p)=>{uint owner;GetWindowThreadProcessId(w,out owner);if(owner!=pid)return true;var b=new StringBuilder(256);GetClassNameW(w,b,b.Capacity);if(b.ToString()==cls&&(String.IsNullOrEmpty(title)||Text(w)==title)){hit=w;return false;}return true;},IntPtr.Zero);return hit;}
   public static IntPtr FindWithChild(uint pid,int childId){IntPtr hit=IntPtr.Zero;EnumWindows((w,p)=>{uint owner;GetWindowThreadProcessId(w,out owner);if(owner==pid&&GetDlgItem(w,childId)!=IntPtr.Zero){hit=w;return false;}return true;},IntPtr.Zero);return hit;}
+  public static IntPtr[] Tooltips(uint pid){var found=new HashSet<IntPtr>();EnumWindows((w,p)=>{uint owner;GetWindowThreadProcessId(w,out owner);if(owner!=pid)return true;var b=new StringBuilder(64);GetClassNameW(w,b,b.Capacity);if(String.Equals(b.ToString(),"tooltips_class32",StringComparison.OrdinalIgnoreCase))found.Add(w);EnumChildWindows(w,(child,unused)=>{uint childOwner;GetWindowThreadProcessId(child,out childOwner);if(childOwner==pid){var name=new StringBuilder(64);GetClassNameW(child,name,name.Capacity);if(String.Equals(name.ToString(),"tooltips_class32",StringComparison.OrdinalIgnoreCase))found.Add(child);}return true;},IntPtr.Zero);return true;},IntPtr.Zero);var result=new IntPtr[found.Count];found.CopyTo(result);return result;}
   public static string WindowTitles(uint pid){var titles=new StringBuilder();EnumWindows((w,p)=>{uint owner;GetWindowThreadProcessId(w,out owner);if(owner==pid){var title=Text(w);if(!String.IsNullOrEmpty(title)){if(titles.Length>0)titles.Append(" | ");titles.Append(title);}}return true;},IntPtr.Zero);return titles.ToString();}
   public static string ChildTexts(IntPtr parent){var texts=new StringBuilder();EnumChildWindows(parent,(w,p)=>{var title=Text(w);if(!String.IsNullOrEmpty(title)){if(texts.Length>0)texts.Append(" | ");texts.Append(title);}return true;},IntPtr.Zero);return texts.ToString();}
   public static long Query(IntPtr w,uint message,long parameter){UIntPtr result;if(!SendMessageTimeoutW(w,message,new UIntPtr(unchecked((ulong)parameter)),IntPtr.Zero,3,3000,out result))throw new Exception("UI query timed out: "+message);return unchecked((long)result.ToUInt64());}
@@ -81,6 +83,7 @@ $oldDpiContext = [ProductivityQa]::SetThreadDpiAwarenessContext([IntPtr]::new(-4
 function Assert($condition,[string]$message){if(-not$condition){throw $message}}
 function Wait-Until([scriptblock]$check,[string]$failure,[int]$seconds=12){$end=[DateTime]::UtcNow.AddSeconds($seconds);do{$value=&$check;if($value-is[IntPtr]){if($value-ne[IntPtr]::Zero){return $value}}elseif($value){return $value};Start-Sleep -Milliseconds 100}while([DateTime]::UtcNow-lt$end);throw $failure}
 function Fingerprint([string]$path){if(Test-Path -LiteralPath $path -PathType Leaf){(Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash}else{'<missing>'}}
+function Assert-TooltipPalette([uint32]$qaProcessId,[string]$theme,[long]$background,[long]$foreground){$tips=@([ProductivityQa]::Tooltips($qaProcessId));Assert($tips.Count-ge 6) "$theme has too few owned tooltip windows: $($tips.Count).";Assert($background-ne$foreground) "$theme tooltip colors have no contrast.";foreach($tip in $tips){$actualBackground=[ProductivityQa]::Query($tip,0x416,0);$actualForeground=[ProductivityQa]::Query($tip,0x417,0);Assert($actualBackground-eq$background-and$actualForeground-eq$foreground) "$theme tooltip $tip has colors $actualBackground/$actualForeground, expected $background/$foreground."};$tips.Count}
 function Save-Shot([IntPtr]$window,[string]$label){New-Item -ItemType Directory -Path $ArtifactDirectory -Force|Out-Null;$r=[ProductivityQa+Rect]::new();Assert([ProductivityQa]::GetWindowRect($window,[ref]$r)) "Cannot size $label screenshot.";$bmp=[Drawing.Bitmap]::new($r.Right-$r.Left,$r.Bottom-$r.Top);$g=[Drawing.Graphics]::FromImage($bmp);$dc=$g.GetHdc();try{Assert([ProductivityQa]::PrintWindow($window,$dc,2)) "Cannot capture $label."}finally{$g.ReleaseHdc($dc);$g.Dispose()};$path=Join-Path $ArtifactDirectory ($run+'-'+$label+'.png');$bmp.Save($path,[Drawing.Imaging.ImageFormat]::Png);$bmp.Dispose();$path}
 function Save-VisibleShot([IntPtr]$window,[string]$label){New-Item -ItemType Directory -Path $ArtifactDirectory -Force|Out-Null;[void][ProductivityQa]::SetForegroundWindow($window);Start-Sleep -Milliseconds 250;$r=[ProductivityQa+Rect]::new();Assert([ProductivityQa]::GetWindowRect($window,[ref]$r)) "Cannot size $label screenshot.";$bmp=[Drawing.Bitmap]::new($r.Right-$r.Left,$r.Bottom-$r.Top);$g=[Drawing.Graphics]::FromImage($bmp);try{$g.CopyFromScreen($r.Left,$r.Top,0,0,$bmp.Size,[Drawing.CopyPixelOperation]::SourceCopy);$path=Join-Path $ArtifactDirectory ($run+'-'+$label+'.png');$bmp.Save($path,[Drawing.Imaging.ImageFormat]::Png);$path}finally{$g.Dispose();$bmp.Dispose()}}
 function Save-FilterShot([IntPtr]$main,[IntPtr]$combo){New-Item -ItemType Directory -Path $ArtifactDirectory -Force|Out-Null;Start-Sleep -Milliseconds 250;$r=[ProductivityQa+Rect]::new();Assert([ProductivityQa]::GetWindowRect($main,[ref]$r)) 'Cannot size filter screenshot.';$info=[ProductivityQa+ComboBoxInfo]::new();$info.Size=[Runtime.InteropServices.Marshal]::SizeOf($info);Assert([ProductivityQa]::GetComboBoxInfo($combo,[ref]$info)-and$info.List-ne[IntPtr]::Zero-and[ProductivityQa]::IsWindowVisible($info.List)) 'Filtered suggestion list is not visible for screenshot.';$listRect=[ProductivityQa+Rect]::new();Assert([ProductivityQa]::GetWindowRect($info.List,[ref]$listRect)) 'Cannot size suggestion list.';$r.Left=[Math]::Min($r.Left,$listRect.Left);$r.Top=[Math]::Min($r.Top,$listRect.Top);$r.Right=[Math]::Max($r.Right,$listRect.Right);$r.Bottom=[Math]::Max($r.Bottom,$listRect.Bottom);$bmp=[Drawing.Bitmap]::new($r.Right-$r.Left,$r.Bottom-$r.Top);$g=[Drawing.Graphics]::FromImage($bmp);try{$g.CopyFromScreen($r.Left,$r.Top,0,0,$bmp.Size,[Drawing.CopyPixelOperation]::SourceCopy);$path=Join-Path $ArtifactDirectory ($run+'-filter-and-close-all.png');$bmp.Save($path,[Drawing.Imaging.ImageFormat]::Png);$path}finally{$g.Dispose();$bmp.Dispose()}}
@@ -106,6 +109,7 @@ try {
     $process=Start-Process -FilePath $copy -ArgumentList ('--qa-instance='+$run+' --qa-data-dir="'+$data+'"') -PassThru
     [void]$process.WaitForInputIdle(10000)
     $main=Wait-Until{[ProductivityQa]::Find([uint32]$process.Id,'ctSpacesLauncherClass',$null)} 'QA launcher did not open.'
+    $marineTooltipCount=Assert-TooltipPalette ([uint32]$process.Id) 'Marine' 0xD8E0C8 0
     $edit=[ProductivityQa]::GetDlgItem($main,206);$combo=[ProductivityQa]::GetDlgItem($main,102)
     Assert($edit-ne[IntPtr]::Zero-and$combo-ne[IntPtr]::Zero) 'Client picker controls are missing.'
     Assert([ProductivityQa]::Query($combo,0x146,0)-eq 3) 'Fixture clients were not listed.'
@@ -159,6 +163,7 @@ try {
     [ProductivityQa]::NotifyComboSelection($theme,5201,$themeCombo)
     [ProductivityQa]::Command($theme,5202)
     Wait-Until{-not[ProductivityQa]::IsWindow($theme)} 'Theme dialog did not apply.'|Out-Null
+    $gothicTooltipCount=Assert-TooltipPalette ([uint32]$process.Id) 'Dark Gothic' 0x272326 0xE5ECF2
     $notes=Open-Notes $clientA
     $gothicShot=Save-VisibleShot $notes 'notes-gothic'
     Assert((Fingerprint $marine)-ne(Fingerprint $gothicShot)) 'Notes did not repaint for the dark theme.'
@@ -196,7 +201,7 @@ try {
     Assert((Fingerprint $noteFile)-eq$noteHash) 'Closing browsers changed Client Notes.'
     Assert((Fingerprint $liveConfig)-eq$liveBefore) 'Live ctSpaces configuration changed.'
     $completed=$true
-    [pscustomobject]@{FilterMatches=2;TypedTextPreserved=$true;SelectionAndClickAway=$true;NewNameCreatedWithoutOpeningExisting=$true;CancelDiscardAndReopen=$true;NotesSaved=$true;CloseAllZeroOneAndMultiple=$true;CloseAllCancellationPreservesSession=$true;LauncherRetained=$true;FilterAndLauncherCapture=$filterShot;MarineNotesCapture=$marine;GothicNotesCapture=$gothicShot;LiveConfigUntouched=$true}|ConvertTo-Json
+    [pscustomobject]@{FilterMatches=2;TypedTextPreserved=$true;SelectionAndClickAway=$true;NewNameCreatedWithoutOpeningExisting=$true;CancelDiscardAndReopen=$true;NotesSaved=$true;CloseAllZeroOneAndMultiple=$true;CloseAllCancellationPreservesSession=$true;LauncherRetained=$true;MarineTooltipCount=$marineTooltipCount;GothicTooltipCount=$gothicTooltipCount;FilterAndLauncherCapture=$filterShot;MarineNotesCapture=$marine;GothicNotesCapture=$gothicShot;LiveConfigUntouched=$true}|ConvertTo-Json
 } finally {
     foreach($edge in @($owned)){if($edge){try{[ProductivityQa]::ClosePidWindows([uint32]$edge.ProcessId)}catch{}}}
     foreach($name in @($clientA,$clientB,$newName)){if($name){foreach($edge in @(Owned-Edge $name)){try{[ProductivityQa]::ClosePidWindows([uint32]$edge.ProcessId)}catch{}}}}

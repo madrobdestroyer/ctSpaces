@@ -1,6 +1,6 @@
 # ctSpaces Feature Reference
 
-Applies to ctSpaces 6.1.0.0.
+Applies to ctSpaces 6.1.1.0.
 
 ## Core Purpose
 

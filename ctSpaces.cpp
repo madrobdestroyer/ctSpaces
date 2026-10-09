@@ -325,6 +325,7 @@ HWND g_hBtnTmpProf = NULL;
 HWND g_hBtnConfig = NULL;
 HWND g_hBtnPinTip = NULL;
 HWND g_hBtnRestoreTabsTip = NULL;
+HWND g_hBtnCloseAllTip = NULL;
 static RECT g_rcSessionTabs{};
 static RECT g_rcUtilityBar{};
 static RECT g_rcPinnedArea{};
@@ -1378,6 +1379,8 @@ static void UpdateUiFont(HWND hWnd, UINT dpi) {
     SendMessageW(g_hBtnPinTip, WM_SETFONT, (WPARAM)g_hFont, TRUE);
   if (g_hBtnRestoreTabsTip)
     SendMessageW(g_hBtnRestoreTabsTip, WM_SETFONT, (WPARAM)g_hFont, TRUE);
+  if (g_hBtnCloseAllTip)
+    SendMessageW(g_hBtnCloseAllTip, WM_SETFONT, (WPARAM)g_hFont, TRUE);
   if (g_hIconPreviewTip)
     SendMessageW(g_hIconPreviewTip, WM_SETFONT, (WPARAM)g_hFont, TRUE);
 
@@ -1933,6 +1936,8 @@ static void UpdateTooltipColors() {
   vApplyColors(g_hBtnTmpProfTip);
   vApplyColors(g_hBtnConfigTip);
   vApplyColors(g_hBtnPinTip);
+  vApplyColors(g_hBtnRestoreTabsTip);
+  vApplyColors(g_hBtnCloseAllTip);
   vApplyColors(g_hIconPreviewTip);
 }
 
@@ -4970,8 +4975,9 @@ BOOL InitInstance(HINSTANCE hInstance, int nCmdShow) {
       ScaleByDpi(26, dpi), g_hGui,
       (HMENU)(INT_PTR)IDC_BTN_CLOSE_ALL, hInstance, nullptr);
   if (g_hBtnCloseAll)
-    CreateToolTip(g_hBtnCloseAll, g_hGui,
-                  (LPWSTR)L"Close open client browsers and keep ctSpaces open");
+    g_hBtnCloseAllTip = CreateToolTip(
+        g_hBtnCloseAll, g_hGui,
+        (LPWSTR)L"Close open client browsers and keep ctSpaces open");
   // HWND
   // hToolTip=CreateWindowEx(0,TOOLTIPS_CLASS,NULL,TTS_ALWAYSTIP|TTS_NOPREFIX,CW_USEDEFAULT,CW_USEDEFAULT,CW_USEDEFAULT,CW_USEDEFAULT,g_hGui,NULL,g_hInst,NULL);
   RECT rc{};
@@ -5882,6 +5888,14 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam,
     if (g_hBtnPinTip) {
       DestroyWindow(g_hBtnPinTip);
       g_hBtnPinTip = nullptr;
+    }
+    if (g_hBtnRestoreTabsTip) {
+      DestroyWindow(g_hBtnRestoreTabsTip);
+      g_hBtnRestoreTabsTip = nullptr;
+    }
+    if (g_hBtnCloseAllTip) {
+      DestroyWindow(g_hBtnCloseAllTip);
+      g_hBtnCloseAllTip = nullptr;
     }
     if (g_hIconPreviewTip) {
       DestroyWindow(g_hIconPreviewTip);

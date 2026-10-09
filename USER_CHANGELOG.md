@@ -1,8 +1,12 @@
 # ctSpaces 6.1 What's New
 
-The initial ctSpaces 6.0.0.0 milestone consolidated features previously shipped across 5.2 and 5.3. The current 6.1.0.0 release adds client filtering, local notes, and Close All Clients. Existing client spaces, sign ins, bookmarks, icons, browser history, and saved sessions remain intact during the update.
+The initial ctSpaces 6.0.0.0 milestone consolidated features previously shipped across 5.2 and 5.3. The 6.1 release adds client filtering, local notes, and Close All Clients. The current 6.1.1.0 update fixes unreadable button hints. Existing client spaces, sign ins, bookmarks, icons, browser history, and saved sessions remain intact during the update.
 
-## Current 6.1.0.0 Milestone
+## Current 6.1.1.0 Update
+
+The Close all hint now has readable text and follows the selected theme at startup and after theme changes. Restore tabs receives the same correction. Browser behavior and client data are unchanged.
+
+## Previous 6.1.0.0 Milestone
 
 1. Close All Clients requests normal browser closure and leaves ctSpaces running. Refused or delayed closes stay tracked without silent forced termination.
 2. Typing filters existing client names by any part of the name. The old autocomplete replacement is removed so overlapping new names stay exactly as typed.
