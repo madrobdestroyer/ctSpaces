@@ -1322,6 +1322,108 @@ static void CodeBorderRegression() {
   auto &state=State(owner);state.activePage=static_cast<size_t>(std::find_if(state.pages.begin(),state.pages.end(),[codeId](const auto &page){return page.id==codeId;})-state.pages.begin());Check(LoadNotesPage(owner,state),"Code note reopens from its cached editor");
   inspect("Cached tab reveal retains complete code borders");CloseClientNotesDialog(owner,state);
 }
+static void NotesHeaderPolish() {
+  Fixture(L"Header polish QA");HWND owner=Open(L"Header polish QA");auto &state=State(owner);
+  Check(NotesWindowText(GetDlgItem(owner,IDC_NOTES_STATUS)).empty(),"Opening saved notes does not show a permanent Saved label");
+  HWND picker=GetDlgItem(owner,IDC_NOTES_SWITCH_CLIENT);
+  Check(NotesWindowText(picker)==state.clientName,"Client selector exposes the client name without a text-arrow suffix");
+  const UINT dpi=GetDpiForWindow(owner);const int height=ScaleByDpi(30,dpi);
+  HDC screen=GetDC(picker),dc=CreateCompatibleDC(screen);
+  for (int width : {96,180,290}) {
+    const int pixels=ScaleByDpi(width,dpi);BITMAPINFO info{};info.bmiHeader.biSize=sizeof(BITMAPINFOHEADER);
+    info.bmiHeader.biWidth=pixels;info.bmiHeader.biHeight=-height;info.bmiHeader.biPlanes=1;info.bmiHeader.biBitCount=32;info.bmiHeader.biCompression=BI_RGB;
+    void *bits=nullptr;HBITMAP bitmap=CreateDIBSection(screen,&info,DIB_RGB_COLORS,&bits,nullptr,0);auto old=SelectObject(dc,bitmap);
+    for (UINT appearance : {0u,static_cast<UINT>(ODS_HOTLIGHT|ODS_FOCUS),static_cast<UINT>(ODS_DISABLED)}) {
+      RECT rect{0,0,pixels,height};SetWindowTextW(picker,L"");DrawThemedButtonCore(dc,rect,IDC_NOTES_SWITCH_CLIENT,appearance,picker);GdiFlush();
+      const auto *buffer=static_cast<DWORD*>(bits);std::vector<DWORD> blank(buffer,buffer+pixels*height);
+      for (const wchar_t *name : {L"rob",L"Research & Development",L"A very long client name that must truncate cleanly before the arrow"}) {
+        SetWindowTextW(picker,name);DrawThemedButtonCore(dc,rect,IDC_NOTES_SWITCH_CLIENT,appearance,picker);GdiFlush();
+        int first=pixels,changed=0;bool arrowUnchanged=true;
+        for(int y=0;y<height;++y) for(int x=0;x<pixels;++x) if(buffer[y*pixels+x]!=blank[y*pixels+x]) {
+          first=(std::min)(first,x);++changed;if(x>=pixels-ScaleByDpi(32,dpi)) arrowUnchanged=false;
+        }
+        Check(changed>0 && first>=ScaleByDpi(12,dpi) && first<ScaleByDpi(28,dpi),"Short, ampersand and long client names stay left-aligned in normal, hover and disabled states");
+        Check(arrowUnchanged,"Client names and ellipsis never intrude into the separate chevron area");
+      }
+    }
+    SelectObject(dc,old);DeleteObject(bitmap);
+  }
+  DeleteDC(dc);ReleaseDC(picker,screen);
+  const auto originalName=state.clientName;
+  int shortWidth=0,longWidth=0;
+  for(const wchar_t *name : {L"rob",L"Research & Development",L"A very long client name that must truncate cleanly before the arrow"}) {
+    state.clientName=name;UpdateNotesToolbar(owner,state);LayoutClientNotes(owner,dpi);
+    RECT button{},library{};GetWindowRect(picker,&button);GetWindowRect(GetDlgItem(owner,IDC_NOTES_LIBRARY),&library);
+    const int width=button.right-button.left;
+    if(state.clientName==L"rob") shortWidth=width;else longWidth=(std::max)(longWidth,width);
+    Check(width>=ScaleByDpi(96,dpi) && width<=ScaleByDpi(290,dpi) && button.right<library.left,"Selector autosizes within sensible bounds without crowding All notes");
+  }
+  Check(shortWidth==ScaleByDpi(96,dpi) && longWidth>shortWidth,"A short client name uses a compact selector while longer names get more room");
+  state.clientName=originalName;UpdateNotesToolbar(owner,state);LayoutClientNotes(owner,dpi);
+  if(!HasActiveNote(state)) Command(owner,IDC_NOTES_ADD_TAB);
+  Type(owner,L"Quiet autosave test");
+  Check(NotesWindowText(GetDlgItem(owner,IDC_NOTES_STATUS)).empty(),"Ordinary pending edits do not display routine saving messages");
+  SendMessageW(owner,WM_TIMER,1,0);
+  Check(NotesWindowText(GetDlgItem(owner,IDC_NOTES_STATUS)).empty(),"Successful autosave does not show Saved, even briefly");
+  Check(NotesPlain(client_notes::ReadNotebook(state.clientRoot).pages[state.activePage]).find(L"Quiet autosave test")!=std::wstring::npos,"Quiet autosave still commits the edit to the notebook");
+  Save(owner);SetNotesStatus(owner,state);
+  Check(NotesWindowText(GetDlgItem(owner,IDC_NOTES_STATUS)).empty(),"An unchanged save or toolbar refresh does not bring back Saved");
+  state.detailsDrafts[state.pages[state.activePage].id]={L"0",L"",L"",L"invalid URL"};SetNotesStatus(owner,state);
+  Check(NotesWindowText(GetDlgItem(owner,IDC_NOTES_STATUS))==L"Check details","Invalid details remain visible while routine autosave stays quiet");
+  state.detailsDrafts.clear();SetNotesStatus(owner,state);
+  Check(NotesWindowText(GetDlgItem(owner,IDC_NOTES_STATUS)).empty(),"Correcting details clears the problem indicator");
+  Type(owner,L" pending");
+  auto external=state.original.pages;external[state.activePage].name=L"Changed by another instance";
+  Check(client_notes::WriteNotebook(state.clientRoot,external,state.original),"Concurrent-writer fixture changes the saved notebook safely");
+  Check(!SaveClientNotesDraft(owner,state,false) && state.saveFailed,"A real write conflict retains the unsaved draft and reports failure");
+  UpdateNotesToolbar(owner,state);SetNotesStatus(owner,state);
+  Check(NotesWindowText(GetDlgItem(owner,IDC_NOTES_STATUS))==L"Could not save" && NotesWindowText(owner).find(L"Could not save")!=std::wstring::npos,"A real save failure remains visible across toolbar refreshes");
+  DestroyWindow(owner);
+}
+
+static LRESULT CALLBACK ObserveNotesWindowReuse(HWND window,UINT message,WPARAM w,LPARAM l,UINT_PTR id,DWORD_PTR data) {
+  if(message==WM_DESTROY) ++*reinterpret_cast<unsigned *>(data);
+  if(message==WM_NCDESTROY) RemoveWindowSubclass(window,ObserveNotesWindowReuse,id);
+  return DefSubclassProc(window,message,w,l);
+}
+static void NotesClientSwitchPlacement() {
+  Fixture(L"Placement A");Fixture(L"Placement B");
+  const bool enabled=g_bUiEnabled;g_bUiEnabled=true;
+  WritePrivateProfileStringW(L"notes_window",L"help_seen",L"1",g_sConfigPath.c_str());
+  WritePrivateProfileStringW(L"notes_window",L"maximized",L"0",g_sConfigPath.c_str());
+  ShowClientNotes(L"Placement A");Check(IsWindow(g_hNotesWindow),"Placement fixture opens through the production Notes entry point");
+  HWND owner=g_hNotesWindow;if(!HasActiveNote(State(owner))) Command(owner,IDC_NOTES_ADD_TAB);
+  const HWND originalWindow=owner,originalPicker=GetDlgItem(owner,IDC_NOTES_SWITCH_CLIENT);
+  unsigned destroyed=0;SetWindowSubclass(owner,ObserveNotesWindowReuse,96,reinterpret_cast<DWORD_PTR>(&destroyed));
+  Type(owner,L"Only belongs to client A");Save(owner);
+  MONITORINFO monitor{sizeof(monitor)};GetMonitorInfoW(MonitorFromWindow(owner,MONITOR_DEFAULTTONEAREST),&monitor);
+  SetWindowPos(owner,nullptr,monitor.rcWork.left+140,monitor.rcWork.top+110,980,620,SWP_NOZORDER|SWP_NOACTIVATE);
+  RECT expected{};GetWindowRect(owner,&expected);
+  for(int i=0;i<12;++i) {
+    const bool clientB=i%2==0;ShowClientNotes(clientB ? L"Placement B":L"Placement A");owner=g_hNotesWindow;
+    Check(owner==originalWindow && GetDlgItem(owner,IDC_NOTES_SWITCH_CLIENT)==originalPicker && !destroyed,"Client switching reuses the actual Notes window and header controls without destroying them");
+    RECT actual{};GetWindowRect(owner,&actual);
+    Check(EqualRect(&expected,&actual),"Repeated client switching preserves the exact moved position and size");
+    Check(State(owner).clientName==(clientB ? L"Placement B":L"Placement A"),"The client changes without changing window placement");
+    const bool hasA=NotesWindowText(Edit(owner)).find(L"Only belongs to client A")!=std::wstring::npos;
+    Check(hasA==!clientB,"Switching clients preserves notebook ownership and loads only the chosen client's text");
+  }
+  ShowWindow(owner,SW_MAXIMIZE);WINDOWPLACEMENT maximized{sizeof(maximized)};GetWindowPlacement(owner,&maximized);
+  ShowClientNotes(L"Placement B");owner=g_hNotesWindow;WINDOWPLACEMENT switched{sizeof(switched)};GetWindowPlacement(owner,&switched);
+  Check(IsZoomed(owner),"Switching a maximized Notes window keeps it maximized");
+  ShowClientNotes(L"Placement B");Check(IsZoomed(owner) && owner==g_hNotesWindow,"Opening the current client again keeps the same maximized Notes window");
+  Check(EqualRect(&maximized.rcNormalPosition,&switched.rcNormalPosition),"Maximized switching retains the original restore position and size");
+  ShowWindow(owner,SW_MINIMIZE);ShowClientNotes(L"Placement A");owner=g_hNotesWindow;
+  Check(IsZoomed(owner),"Switching from a minimized maximized window restores its maximized state");
+  ShowWindow(owner,SW_RESTORE);RECT normal{};GetWindowRect(owner,&normal);
+  Check(EqualRect(&expected,&normal),"Restoring after client switches returns to the user's original position and size");
+  Type(owner,L" unsaved draft");auto &state=State(owner);auto external=state.original.pages;external[state.activePage].name=L"Concurrent change";
+  Check(client_notes::WriteNotebook(state.clientRoot,external,state.original),"Placement conflict fixture safely commits a concurrent change");
+  ShowClientNotes(L"Placement B");RECT retained{};GetWindowRect(owner,&retained);
+  Check(g_hNotesWindow==owner && State(owner).clientName==L"Placement A" && EqualRect(&normal,&retained),"A failed save cancels the client switch without closing or moving the current Notes window");
+  DestroyWindow(owner);g_bUiEnabled=enabled;
+}
+
 int wmain(int argc,wchar_t **argv) {
   try {
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
@@ -1335,12 +1437,13 @@ int wmain(int argc,wchar_t **argv) {
     g_hGui=CreateWindowExW(0,L"STATIC",L"Notes test parent",WS_OVERLAPPED,0,0,100,100,nullptr,nullptr,g_hInst,nullptr);
     if(argc>1 && !wcscmp(argv[1],L"--code-border")) {CodeBorderRegression();DestroyWindow(g_hGui);return 0;}
     if(argc>1 && !wcscmp(argv[1],L"--close-race")) {CloseAllLaunchRace();DestroyWindow(g_hGui);return 0;}
+    if(argc>1 && !wcscmp(argv[1],L"--header-polish")) {NotesHeaderPolish();NotesClientSwitchPlacement();DestroyWindow(g_hGui);std::cout << "Notes header polish: " << checks << " checks passed.\n";return 0;}
     HWND dialog=Open(L"Workspace QA"); Tests(dialog); Extended(dialog); ResizeAndOverflow(dialog); FrameRegression(dialog); PickerAndTemplates(dialog); Walkthrough(dialog); GuidanceAndBulkTrash(dialog); Productivity(dialog); TicketCodeAndTopActions(dialog); AddDeleteTransitions(dialog); DirectTemplateEditing(dialog); DirectTrashAndCompactHelp(dialog); NotesLinksAndContextMenu(dialog); DestroyWindow(dialog);
     dialog=Open(L"Workspace QA");
     Check(!HasActiveNote(State(dialog)),"Zero open tabs persists across restart");
     Check((GetWindowLongPtrW(Edit(dialog),GWL_STYLE)&WS_VISIBLE)==0,"Restart empty state does not expose blank editor");
     Command(dialog,IDC_NOTES_ADD_TAB); Check(HasActiveNote(State(dialog)),"New note from empty state");
-    DestroyWindow(dialog);EmptyDraftRestart();CompactNormalSpacing();OldNotesSpacingUpgrade();DirectSnippetEditing();InspectorNavigation();NotesResizeWrapping();NotesTabOrdering();LauncherTrayTests();CloseAllLaunchRace();CodeBorderRegression();DestroyWindow(g_hGui);
+    DestroyWindow(dialog);EmptyDraftRestart();CompactNormalSpacing();OldNotesSpacingUpgrade();DirectSnippetEditing();InspectorNavigation();NotesResizeWrapping();NotesTabOrdering();LauncherTrayTests();CloseAllLaunchRace();CodeBorderRegression();NotesHeaderPolish();NotesClientSwitchPlacement();DestroyWindow(g_hGui);
     std::cout << "Notes workspace: " << checks << " checks passed.\n"; return 0;
   } catch (const std::exception &error) { std::cerr << "FAIL: " << error.what() << std::endl; return 1; }
 }

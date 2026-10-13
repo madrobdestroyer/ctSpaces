@@ -3164,8 +3164,19 @@ static void DrawThemedButtonCore(HDC hdc, const RECT &rc, int iId,
     GetWindowTextW(hWndItem, wszText, (int)(sizeof(wszText) / sizeof(wchar_t)));
     SetBkMode(hdc, TRANSPARENT);
     SetTextColor(hdc, crText);
-    DrawTextW(hdc, wszText, -1, const_cast<RECT *>(&rc),
-              DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    if (iId == IDC_NOTES_SWITCH_CLIENT) {
+      RECT arrow = rc;
+      arrow.left = arrow.right - ScaleByDpi(32, dpi);
+      RECT label = rc;
+      label.left += ScaleByDpi(12, dpi);
+      label.right = arrow.left - ScaleByDpi(4, dpi);
+      DrawTextW(hdc, wszText, -1, &label,
+                DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
+      DrawModernComboChevron(hdc, arrow, crText, dpi);
+    } else {
+      DrawTextW(hdc, wszText, -1, const_cast<RECT *>(&rc),
+                DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    }
   }
   SelectObject(hdc, hOldFont);
 
@@ -16309,6 +16320,20 @@ struct ClientNotesDialogState {
   HWND panel = nullptr;
   HFONT titleFont = nullptr;
   std::map<uint64_t,std::array<std::wstring,4>> detailsDrafts;
+  void SwapNotebook(ClientNotesDialogState &other) {
+    using std::swap;
+    swap(clientName,other.clientName);swap(clientRoot,other.clientRoot);swap(original,other.original);
+    swap(browser,other.browser);swap(pages,other.pages);swap(baselines,other.baselines);
+    swap(activePage,other.activePage);swap(preferredNextPage,other.preferredNextPage);
+    swap(metadataChanged,other.metadataChanged);swap(findVisible,other.findVisible);
+    swap(visiblePages,other.visiblePages);swap(closedPages,other.closedPages);
+    swap(editors,other.editors);swap(attachedEditor,other.attachedEditor);
+    swap(dragTab,other.dragTab);swap(dragTarget,other.dragTarget);swap(dragStart,other.dragStart);
+    swap(tabTooltip,other.tabTooltip);swap(dragging,other.dragging);swap(highlightPalette,other.highlightPalette);
+    swap(findText,other.findText);swap(draftName,other.draftName);
+    swap(formattingChanged,other.formattingChanged);swap(saveFailed,other.saveFailed);
+    swap(detailsDrafts,other.detailsDrafts);
+  }
   ~ClientNotesDialogState() {
     if (toolbarTooltip && IsWindow(toolbarTooltip))
       DestroyWindow(toolbarTooltip);
@@ -16469,14 +16494,14 @@ static void SetNotesSaveFailure(HWND dialog, ClientNotesDialogState &state, bool
   const std::wstring title = L"Client Notes: " + state.clientName +
       (failed ? L" - Could not save" : L"");
   SetWindowTextW(dialog, title.c_str());
-  SetDlgItemTextW(dialog, IDC_NOTES_STATUS, failed ? L"Could not save" : L"Saved");
+  if (failed) {
+    SetDlgItemTextW(dialog, IDC_NOTES_STATUS, L"Could not save");
+  }
 }
 
 static void SetNotesStatus(HWND dialog, ClientNotesDialogState &state) {
-  const bool changed = NotesOtherPagesChanged(state) || state.formattingChanged ||
-      SendDlgItemMessageW(dialog, IDC_CLIENT_NOTES_TEXT, EM_GETMODIFY, 0, 0);
   SetDlgItemTextW(dialog, IDC_NOTES_STATUS,
-                  state.saveFailed ? L"Could not save" : !state.detailsDrafts.empty() ? L"Check details" : changed ? L"Saving..." : L"Saved");
+                  state.saveFailed ? L"Could not save" : !state.detailsDrafts.empty() ? L"Check details" : L"");
 }
 
 static bool NotesDraftMatchesBaseline(HWND dialog,
@@ -16513,7 +16538,7 @@ static void MarkNotesChanged(HWND dialog, ClientNotesDialogState &state) {
     return;
   state.pages[state.activePage].pristine = false;
   state.formattingChanged = true;
-  SetDlgItemTextW(dialog, IDC_NOTES_STATUS, L"Saving...");
+  SetNotesStatus(dialog, state);
   SetTimer(dialog, 2, 150, nullptr);
   SetTimer(dialog, 1, 500, nullptr);
 }
@@ -16531,7 +16556,7 @@ static void UpdateNotesToolbar(HWND dialog, ClientNotesDialogState &state) {
   EnableWindow(GetDlgItem(dialog, IDC_NOTES_HIGHLIGHT_COLOR), HasActiveNote(state));
   for (int id : {IDC_NOTES_FIND_TOGGLE,IDC_NOTES_WORKLOG,IDC_NOTES_METADATA}) EnableWindow(GetDlgItem(dialog,id),HasActiveNote(state));
   for (int id : {IDC_NOTES_DETAILS, IDC_NOTES_OPEN_TICKET}) EnableWindow(GetDlgItem(dialog,id),HasActiveNote(state));
-  SetDlgItemTextW(dialog,IDC_NOTES_SWITCH_CLIENT,(state.clientName+L"  \u2304").c_str());
+  SetDlgItemTextW(dialog,IDC_NOTES_SWITCH_CLIENT,state.clientName.c_str());
   SetDlgItemTextW(dialog,IDC_NOTES_NOTE_HEADING,HasActiveNote(state) ? state.pages[state.activePage].name.c_str() : L"Your notebook");
   std::wstring context;
   if (HasActiveNote(state)) {
@@ -17088,8 +17113,21 @@ static void LayoutClientNotes(HWND dialog, UINT dpi) {
         flags);
   };
   place(IDC_NOTES_CLIENT_HEADING, ScaleByDpi(20,dpi), ScaleByDpi(11,dpi),ScaleByDpi(45,dpi),ScaleByDpi(24,dpi));
+  SIZE clientLabel{};
+  HWND clientPicker = GetDlgItem(dialog, IDC_NOTES_SWITCH_CLIENT);
+  if (HDC dc = GetDC(clientPicker)) {
+    HGDIOBJ oldFont = SelectObject(dc, state->uiFont);
+    GetTextExtentPoint32W(dc, state->clientName.c_str(),
+                         static_cast<int>(state->clientName.size()), &clientLabel);
+    SelectObject(dc, oldFont);
+    ReleaseDC(clientPicker, dc);
+  }
+  const int clientWidth = (std::min)(
+      (std::clamp)(static_cast<int>(clientLabel.cx) + ScaleByDpi(48,dpi),
+                   ScaleByDpi(96,dpi), ScaleByDpi(290,dpi)),
+      (std::max)(1, static_cast<int>(area.right) - ScaleByDpi(485,dpi)));
   place(IDC_NOTES_SWITCH_CLIENT,ScaleByDpi(74,dpi),ScaleByDpi(5,dpi),
-        (std::min)(ScaleByDpi(290,dpi),static_cast<int>(area.right)-ScaleByDpi(485,dpi)),ScaleByDpi(30,dpi));
+        clientWidth,ScaleByDpi(30,dpi));
   place(IDC_NOTES_LIBRARY,area.right-ScaleByDpi(365,dpi),ScaleByDpi(5,dpi),ScaleByDpi(90,dpi),ScaleByDpi(30,dpi));
   place(IDC_NOTES_TRASH,area.right-ScaleByDpi(267,dpi),ScaleByDpi(5,dpi),ScaleByDpi(64,dpi),ScaleByDpi(30,dpi));
   place(IDC_NOTES_MORE,area.right-ScaleByDpi(195,dpi),ScaleByDpi(5,dpi),ScaleByDpi(75,dpi),ScaleByDpi(30,dpi));
@@ -18297,6 +18335,55 @@ static INT_PTR CALLBACK ClientNotesDlgProc(HWND dialog, UINT message,
   return FALSE;
 }
 
+static bool SwitchClientNotes(HWND dialog, ClientNotesDialogState &state,
+                              const std::wstring &clientName, const fs::path &clientRoot) {
+  if (!IsWindowEnabled(dialog) || state.loading || state.updatingToolbar) {
+    SetForegroundWindow(GetLastActivePopup(dialog));return false;
+  }
+  ClientNotesDialogState next{clientName,clientRoot,client_notes::ReadNotebook(clientRoot)};
+  if (next.original.status == client_notes::ReadStatus::Error) {
+    MessageBoxW(dialog,L"The client's notes could not be read safely.",L"Client Notes",MB_OK|MB_ICONWARNING);return false;
+  }
+  CloseNotesPanel(state);
+  if (!state.detailsDrafts.empty() && MessageBoxW(dialog,
+      L"Some details have invalid values and have not been saved. Switch clients without those details?\n\nYour note text and previously saved details are kept.",
+      L"Check note details",MB_YESNO|MB_DEFBUTTON2|MB_ICONWARNING)!=IDYES) {
+    NotesWorkspaceCommand(dialog,state,IDC_NOTES_DETAILS);return false;
+  }
+  if (!CaptureNotesPage(dialog,state,true)) return false;
+  NotesDiscardEmptyDrafts(dialog,state);
+  if (!SaveClientNotesDraft(dialog,state,true)) return false;
+  KillTimer(dialog,2);
+  next.browser=g_selectedBrowser;next.draftName=state.draftName;
+  next.pages=next.original.pages;next.baselines.resize(next.pages.size());next.activePage=next.pages.size();
+  for(size_t i=0;i<next.pages.size();++i) {
+    auto &page=next.pages[i];if(!page.id) page.id=client_notes::NextId(next.pages);
+    if(page.open && !page.archived && !page.deleted &&
+       (next.activePage==next.pages.size() || page.active)) next.activePage=i;
+  }
+  // Swap only notebook state. The actual window, fonts, tooltip and window
+  // preferences stay in place. Keep old editors until the new document loads.
+  state.SwapNotebook(next);
+  state.attachedEditor=next.attachedEditor;
+  RefreshNotesTabs(dialog,state);
+  if (!LoadNotesPage(dialog,state)) {
+    state.SwapNotebook(next);
+    RefreshNotesTabs(dialog,state);LayoutClientNotes(dialog,GetDpiForWindow(dialog));
+    UpdateNotesToolbar(dialog,state);SetNotesStatus(dialog,state);
+    MessageBoxW(dialog,L"The note cannot be edited within the rich text size limit. Your previous notebook is still open.",L"Client Notes",MB_OK|MB_ICONWARNING);return false;
+  }
+  for(const auto &[id,edit]:next.editors)
+    if(edit!=next.attachedEditor && IsWindow(edit)) DestroyWindow(edit);
+  SetNotesSaveFailure(dialog,state,false);
+  SetDlgItemTextW(dialog,IDC_NOTES_FIND,L"");
+  LayoutClientNotes(dialog,GetDpiForWindow(dialog));SetNotesStatus(dialog,state);
+  NotesRememberClient(clientName);
+  if(IsIconic(dialog)) ShowWindow(dialog,SW_RESTORE);
+  SetForegroundWindow(dialog);NotesRecoverDrafts(dialog,state);
+  SetFocus(HasActiveNote(state) ? GetDlgItem(dialog,IDC_CLIENT_NOTES_TEXT) : GetDlgItem(dialog,IDC_NOTES_ADD_TAB));
+  return true;
+}
+
 static void ShowClientNotes(const std::wstring &clientName) {
   if (!g_bUiEnabled || g_bClientNotesBusy.load())
     return;
@@ -18311,9 +18398,10 @@ static void ShowClientNotes(const std::wstring &clientName) {
   if (g_hNotesWindow) {
     auto *existing = reinterpret_cast<ClientNotesDialogState *>(GetWindowLongPtrW(g_hNotesWindow,DWLP_USER));
     if (existing && existing->clientName == clientName) {
-      ShowWindow(g_hNotesWindow,SW_RESTORE); SetForegroundWindow(g_hNotesWindow); return;
+      ShowWindow(g_hNotesWindow,IsIconic(g_hNotesWindow) ? SW_RESTORE : SW_SHOW); SetForegroundWindow(g_hNotesWindow); return;
     }
-    if (!PrepareNotesForClientChange()) return;
+    if (existing) SwitchClientNotes(g_hNotesWindow,*existing,clientName,clientRoot);
+    return;
   }
   auto *state = new ClientNotesDialogState{clientName,clientRoot,client_notes::ReadNotebook(clientRoot)};
   state->browser = g_selectedBrowser;
@@ -20075,9 +20163,10 @@ static constexpr std::array<QuickTourStep, 23> kQuickTourSteps{{
      L"titles, including supported windows already open, so clients are easier to identify.",
      QuickTourTarget::Options, QuickTourDemo::ClientFirstTitles},
     {L"Keep Client Notes",
-     L"Select an existing client, then use Settings > Client Notes or open "
-     L"its pin menu. Add named ticket tabs, format each note, and check the "
-     L"Saved status. Edits save automatically; Close finishes pending saves. "
+     L"Use Notes beside Close all, then search for a client in its picker. "
+     L"Start writing in a blank tab or use a template. Edits save automatically; "
+     L"Close finishes pending saves. Notes only shows a saving message when "
+     L"a problem needs attention. "
      L"This illustration does not open or edit notes.",
      QuickTourTarget::Options, QuickTourDemo::ClientNotes},
     {L"Clean up inactive clients",

@@ -101,6 +101,11 @@ and is never executed; notebook/history/RTF exports retain the box.
 
 Click **Notes** beside **Close all**, or select an existing client and choose **Client Notes** from Settings or its context menu. The notes window uses the selected application theme and remains usable independently of the launcher. It remembers its size and maximized state. Drag an edge or corner to resize, double-click the title area to maximize or restore, and use the top-right **X** to close the window. Autosave needs no footer or Save/Cancel row.
 
+Normal autosave is quiet: Notes does not show a Saved or Saving label. A save
+failure or invalid Details draft displays a problem indicator until resolved.
+Switching clients keeps the current Notes window position, size and maximized
+state; notebook contents still belong to the selected client.
+
 New blank notes use **12-point Normal text**, single line spacing, and no extra
 space before or after paragraphs. Blank lines you type or paste remain intact.
 Existing notes automatically lose the former four-point gap after normal paragraphs

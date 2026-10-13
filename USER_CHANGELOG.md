@@ -1,5 +1,16 @@
 # ctSpaces 6.3 What's New
 
+## 6.3.2.0 Notes header polish
+
+- The client selector uses a left-aligned name and a separate, DPI-scaled
+  chevron on the right. Its width fits the name within sensible bounds, and
+  long names truncate before the chevron.
+- Normal autosave stays quiet. There is no persistent or brief Saved/Saving
+  label; a save failure or invalid details still shows a problem indicator.
+- Switching clients reuses the actual same Notes window and preserves its
+  position, size and maximized state instead of closing and reopening it.
+- The approved Notes layout and existing walkthrough recordings remain intact.
+
 ## 6.3.1.0 Notes workspace and whole-app review
 
 This is one deliberate patch release after reviewing the Notes design and testing
