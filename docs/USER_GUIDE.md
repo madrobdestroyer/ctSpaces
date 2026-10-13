@@ -78,9 +78,11 @@ clients appear first, with up to eight matches. Use arrow keys and Enter, or cli
 a client. Switching saves the original notebook before opening the destination;
 a failed save keeps the original notebook and its draft open.
 
-The full-width editor has slim tabs and a document heading with **Saved**, direct
-**Snippets**, **Templates**, **Status**, **Find**, **Add update**, and **Details**
-actions. **Details** combines ticket number, ticket URL, local status, and tags.
+The full-width editor has slim tabs, a document heading and ticket/tag context.
+One compact row below the heading contains **Find**, **Snippets**, **Templates**,
+**Details**, **Status**, **Link/Open ticket**, and **Add update**.
+Normal autosave has no status message; only save problems or invalid details are
+shown. **Details** combines ticket number, ticket URL, local status, and tags.
 Valid changes save automatically. Status organizes work locally and does not
 synchronize a ticketing system. **Open ticket** opens a linked URL in the PC's
 default browser outside client profiles.

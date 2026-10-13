@@ -17133,18 +17133,18 @@ static void LayoutClientNotes(HWND dialog, UINT dpi) {
   place(IDC_NOTES_MORE,area.right-ScaleByDpi(195,dpi),ScaleByDpi(5,dpi),ScaleByDpi(75,dpi),ScaleByDpi(30,dpi));
   place(IDC_NOTES_HELP,area.right-ScaleByDpi(112,dpi),ScaleByDpi(5,dpi),ScaleByDpi(55,dpi),ScaleByDpi(30,dpi));
   place(IDCANCEL,area.right-ScaleByDpi(44,dpi),ScaleByDpi(2,dpi),ScaleByDpi(36,dpi),ScaleByDpi(36,dpi));
-  // A compact document heading replaces the old second strip of bulky actions.
-  place(IDC_NOTES_NOTE_HEADING,margin,ScaleByDpi(99,dpi),area.right-margin*2-ScaleByDpi(425,dpi),ScaleByDpi(28,dpi));
-  place(IDC_NOTES_STATUS,area.right-margin-ScaleByDpi(410,dpi),ScaleByDpi(105,dpi),ScaleByDpi(110,dpi),ScaleByDpi(20,dpi));
-  int actionX=area.right-margin-ScaleByDpi(292,dpi);
-  for (const auto [id,width] : {std::pair{IDC_NOTES_SNIPPETS,88},{IDC_NOTES_TEMPLATES,94},{IDC_NOTES_DETAILS,94}}) {
-    place(id,actionX,ScaleByDpi(98,dpi),ScaleByDpi(width,dpi),ScaleByDpi(30,dpi));actionX+=ScaleByDpi(width+8,dpi);
+  // Keep the document context above one compact, left-aligned action row.
+  place(IDC_NOTES_NOTE_HEADING,margin,ScaleByDpi(96,dpi),area.right-margin*2-ScaleByDpi(344,dpi),ScaleByDpi(26,dpi));
+  place(IDC_NOTES_STATUS,area.right-margin-ScaleByDpi(340,dpi),ScaleByDpi(101,dpi),ScaleByDpi(110,dpi),ScaleByDpi(20,dpi));
+  place(IDC_NOTES_CONTEXT,area.right-margin-ScaleByDpi(224,dpi),ScaleByDpi(101,dpi),ScaleByDpi(224,dpi),ScaleByDpi(22,dpi));
+  int actionX=margin;
+  for (const auto [id,width] : {std::pair{IDC_NOTES_FIND_TOGGLE,54},
+      {IDC_NOTES_SNIPPETS,82},{IDC_NOTES_TEMPLATES,90},{IDC_NOTES_DETAILS,66},
+      {IDC_NOTES_METADATA,146},{IDC_NOTES_OPEN_TICKET,100},{IDC_NOTES_WORKLOG,92}}) {
+    if (id==IDC_NOTES_METADATA) actionX+=ScaleByDpi(10,dpi);
+    place(id,actionX,ScaleByDpi(128,dpi),ScaleByDpi(width,dpi),ScaleByDpi(28,dpi));
+    actionX+=ScaleByDpi(width+6,dpi);
   }
-  place(IDC_NOTES_METADATA,margin,ScaleByDpi(133,dpi),ScaleByDpi(156,dpi),ScaleByDpi(26,dpi));
-  place(IDC_NOTES_OPEN_TICKET,margin+ScaleByDpi(164,dpi),ScaleByDpi(133,dpi),ScaleByDpi(104,dpi),ScaleByDpi(26,dpi));
-  place(IDC_NOTES_CONTEXT,margin+ScaleByDpi(276,dpi),ScaleByDpi(137,dpi),area.right-margin*2-ScaleByDpi(450,dpi),ScaleByDpi(22,dpi));
-  place(IDC_NOTES_WORKLOG,area.right-margin-ScaleByDpi(100,dpi),ScaleByDpi(133,dpi),ScaleByDpi(100,dpi),ScaleByDpi(26,dpi));
-  place(IDC_NOTES_FIND_TOGGLE,area.right-margin-ScaleByDpi(170,dpi),ScaleByDpi(133,dpi),ScaleByDpi(62,dpi),ScaleByDpi(26,dpi));
   ShowWindow(GetDlgItem(dialog,IDC_NOTES_CONTEXT),SW_SHOW);
   ShowWindow(GetDlgItem(dialog,IDC_NOTES_STATUS),SW_SHOW);
   ShowWindow(GetDlgItem(dialog,IDC_NOTES_RENAME_TAB),SW_HIDE);
@@ -17163,7 +17163,7 @@ static void LayoutClientNotes(HWND dialog, UINT dpi) {
   const int extra = std::clamp(MulDiv(area.right, 96, dpi) - 900, 0, 50);
   const int toolGap = ScaleByDpi(6 + extra * 4 / 50, dpi);
   int x = margin + ScaleByDpi(extra * 12 / 50, dpi);
-  const int top = ScaleByDpi(170, dpi);
+  const int top = ScaleByDpi(162, dpi);
   for (const auto [id, width] : {
            std::pair{IDC_NOTES_STYLE, 140}, {IDC_NOTES_SIZE, 62},
            {IDC_NOTES_BOLD, 40}, {IDC_NOTES_ITALIC, 40}, {IDC_NOTES_UNDERLINE, 40},
@@ -17187,11 +17187,11 @@ static void LayoutClientNotes(HWND dialog, UINT dpi) {
   int findX = margin;
   for (const auto [id, width] : {std::pair{IDC_NOTES_FIND, 300}, {IDC_NOTES_FIND_PREV, 80},
       {IDC_NOTES_FIND_NEXT,60}, {IDC_NOTES_REPLACE,100}, {IDC_NOTES_FIND_CLOSE,120}}) {
-    place(id,findX,ScaleByDpi(215,dpi),ScaleByDpi(width,dpi),ScaleByDpi(30,dpi));
+    place(id,findX,ScaleByDpi(205,dpi),ScaleByDpi(width,dpi),ScaleByDpi(30,dpi));
     ShowWindow(GetDlgItem(dialog,id),state->findVisible ? SW_SHOW : SW_HIDE);
     findX += ScaleByDpi(width+6,dpi);
   }
-  const int editorTop = ScaleByDpi(state->findVisible ? 252 : 214, dpi);
+  const int editorTop = ScaleByDpi(state->findVisible ? 242 : 204, dpi);
   place(IDC_NOTES_EMPTY, margin, editorTop + ScaleByDpi(80,dpi),area.right-margin*2,ScaleByDpi(60,dpi));
   ShowWindow(GetDlgItem(dialog,IDC_NOTES_EMPTY),HasActiveNote(*state) ? SW_HIDE : SW_SHOW);
   place(IDC_CLIENT_NOTES_TEXT, margin + ScaleByDpi(4, dpi), editorTop,
@@ -17244,15 +17244,18 @@ static void ApplyNotesEditorTheme(HWND dialog, ClientNotesDialogState &state) {
 
 static bool DrawNotesToolbarButton(const DRAWITEMSTRUCT &draw,
                                   const ClientNotesDialogState &state) {
+  const bool textAction = draw.CtlID == IDC_NOTES_FIND_TOGGLE || draw.CtlID == IDC_NOTES_SNIPPETS ||
+      draw.CtlID == IDC_NOTES_TEMPLATES || draw.CtlID == IDC_NOTES_DETAILS ||
+      draw.CtlID == IDC_NOTES_METADATA || draw.CtlID == IDC_NOTES_OPEN_TICKET || draw.CtlID == IDC_NOTES_WORKLOG;
   if (draw.CtlType != ODT_BUTTON ||
       !((draw.CtlID >= IDC_NOTES_BOLD && draw.CtlID <= IDC_NOTES_CLEAR) ||
-        draw.CtlID == IDC_NOTES_ADD_TAB || draw.CtlID == IDC_NOTES_HIGHLIGHT_COLOR || draw.CtlID == IDCANCEL)) return false;
+        textAction || draw.CtlID == IDC_NOTES_ADD_TAB || draw.CtlID == IDC_NOTES_HIGHLIGHT_COLOR || draw.CtlID == IDCANCEL)) return false;
   const UINT dpi = GetDpiForWindow(draw.hwndItem);
   const bool disabled = (draw.itemState & ODS_DISABLED) != 0;
   const bool active = !disabled && (SendMessageW(draw.hwndItem, BM_GETSTATE, 0, 0) & BST_PUSHED);
   const bool hot = !disabled && (draw.hwndItem == g_hHotButton || (draw.itemState & ODS_SELECTED));
   PaintNotesChrome(draw.hDC, draw.hwndItem);
-  if (active || hot || draw.CtlID == IDC_NOTES_ADD_TAB)
+  if (active || hot || textAction || draw.CtlID == IDC_NOTES_ADD_TAB)
     DrawNotesSurface(draw.hDC, draw.rcItem,
         active ? BlendColor(g_themeColors.crWindow, g_themeColors.crAccent, 28) :
         hot ? g_themeColors.crControlHot : NotesControlColor(),
@@ -17260,7 +17263,15 @@ static bool DrawNotesToolbarButton(const DRAWITEMSTRUCT &draw,
   const COLORREF ink = disabled ? BlendColor(g_themeColors.crControlText, g_themeColors.crWindow, 55) :
                                   g_themeColors.crControlText;
   RECT icon = draw.rcItem;
-  if (draw.CtlID == IDC_NOTES_HIGHLIGHT_COLOR)
+  if (textAction) {
+    const HFONT font=GetOwnerDrawFont(draw.hwndItem);
+    const HGDIOBJ previous=SelectObject(draw.hDC,font);
+    RECT label=draw.rcItem;InflateRect(&label,-ScaleByDpi(8,dpi),0);
+    SetBkMode(draw.hDC,TRANSPARENT);SetTextColor(draw.hDC,ink);
+    wchar_t text[128]{};GetWindowTextW(draw.hwndItem,text,static_cast<int>(std::size(text)));
+    DrawTextW(draw.hDC,text,-1,&label,DT_CENTER|DT_VCENTER|DT_SINGLELINE|DT_NOPREFIX|DT_END_ELLIPSIS);
+    SelectObject(draw.hDC,previous);
+  } else if (draw.CtlID == IDC_NOTES_HIGHLIGHT_COLOR)
     DrawModernComboChevron(draw.hDC, icon, ink, dpi);
   else
     notes_editor_ui::DrawIcon(draw.hDC, icon, draw.CtlID, ink, state.highlightColor);

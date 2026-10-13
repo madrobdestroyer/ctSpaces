@@ -665,7 +665,7 @@ static void TicketCodeAndTopActions(HWND owner) {
   Command(owner,IDC_NOTES_FIND_TOGGLE);Check(state.findVisible,"Top Find button exposes note search");Command(owner,IDC_NOTES_FIND_CLOSE);
   for (int width : {900,1240,1500,900}) {
     SetWindowPos(owner,nullptr,0,0,ScaleByDpi(width,GetDpiForWindow(owner)),ScaleByDpi(600,GetDpiForWindow(owner)),SWP_NOMOVE|SWP_NOZORDER);
-    RECT prior{};bool first=true;for (int id : {IDC_NOTES_SNIPPETS,IDC_NOTES_TEMPLATES,IDC_NOTES_DETAILS}) {
+    RECT prior{};bool first=true;for (int id : {IDC_NOTES_FIND_TOGGLE,IDC_NOTES_SNIPPETS,IDC_NOTES_TEMPLATES,IDC_NOTES_DETAILS,IDC_NOTES_METADATA,IDC_NOTES_OPEN_TICKET,IDC_NOTES_WORKLOG}) {
       RECT bounds{};GetWindowRect(GetDlgItem(owner,id),&bounds);Check((GetWindowLongPtrW(GetDlgItem(owner,id),GWL_STYLE)&WS_VISIBLE) && (first || bounds.left>=prior.right),"Document heading actions remain visible and separated across responsive layouts");prior=bounds;first=false;
     }
     RECT trash{},actions{};GetWindowRect(GetDlgItem(owner,IDC_NOTES_TRASH),&trash);GetWindowRect(GetDlgItem(owner,IDC_NOTES_MORE),&actions);
@@ -1424,6 +1424,76 @@ static void NotesClientSwitchPlacement() {
   DestroyWindow(owner);g_bUiEnabled=enabled;
 }
 
+static void CompactNotesActionRow() {
+  Fixture(L"Action row QA");HWND owner=Open(L"Action row QA");Command(owner,IDC_NOTES_ADD_TAB);
+  auto &state=State(owner);Type(owner,L"Keep this draft intact while laying out the action row.");
+  const auto text=NotesWindowText(Edit(owner));const HWND editor=Edit(owner);
+  for (UINT dpi : {96u,144u,192u}) for (int width : {900,1240,1500,900}) {
+    SetWindowPos(owner,nullptr,0,0,ScaleByDpi(width,dpi),ScaleByDpi(600,dpi),SWP_NOMOVE|SWP_NOZORDER|SWP_NOACTIVATE);
+    LayoutClientNotes(owner,dpi);
+    RECT area{};GetClientRect(owner,&area);RECT prior{};bool first=true;
+    for (int id : {IDC_NOTES_FIND_TOGGLE,IDC_NOTES_SNIPPETS,IDC_NOTES_TEMPLATES,IDC_NOTES_DETAILS,IDC_NOTES_METADATA,IDC_NOTES_OPEN_TICKET,IDC_NOTES_WORKLOG}) {
+      const HWND button=GetDlgItem(owner,id);RECT bounds{};GetWindowRect(button,&bounds);
+      MapWindowPoints(nullptr,owner,reinterpret_cast<POINT *>(&bounds),2);
+      Check((GetWindowLongPtrW(button,GWL_STYLE)&WS_VISIBLE) && bounds.left>=0 && bounds.right<=area.right &&
+          (first || (bounds.top==prior.top && bounds.bottom==prior.bottom && bounds.left>prior.right)),
+          "Every quick action fits in one separated row at minimum and wide sizes across DPI");
+      const HDC dc=GetDC(button);const HGDIOBJ font=SelectObject(dc,GetOwnerDrawFont(button));
+      for (const std::wstring &label : id==IDC_NOTES_METADATA ?
+          std::vector<std::wstring>{L"Status: None",L"Status: Investigating",L"Status: Waiting",L"Status: Follow-up",L"Status: Resolved"} :
+          id==IDC_NOTES_OPEN_TICKET ? std::vector<std::wstring>{L"Link ticket",L"Open ticket"} :
+          std::vector<std::wstring>{NotesWindowText(button)}) {
+        SIZE extent{};GetTextExtentPoint32W(dc,label.c_str(),static_cast<int>(label.size()),&extent);
+        Check(extent.cx<=bounds.right-bounds.left-ScaleByDpi(16,dpi),"Quick action labels fit without truncating status or ticket captions");
+      }
+      SelectObject(dc,font);ReleaseDC(button,dc);prior=bounds;first=false;
+    }
+    RECT heading{},problem{},context{},format{},body{};
+    auto bounds=[&](int id,RECT &rect) {GetWindowRect(GetDlgItem(owner,id),&rect);MapWindowPoints(nullptr,owner,reinterpret_cast<POINT *>(&rect),2);};
+    bounds(IDC_NOTES_NOTE_HEADING,heading);bounds(IDC_NOTES_STATUS,problem);bounds(IDC_NOTES_CONTEXT,context);
+    bounds(IDC_NOTES_STYLE,format);bounds(IDC_CLIENT_NOTES_TEXT,body);
+    Check(heading.right<=problem.left && problem.right<context.left && context.right<=area.right &&
+        heading.bottom<prior.top && context.bottom<prior.top && prior.bottom<format.top && format.bottom<body.top,
+        "Heading, problem indicator, ticket context, actions and formatting remain separated");
+    Check(body.left==ScaleByDpi(28,dpi) && body.right==area.right-ScaleByDpi(28,dpi) &&
+        Edit(owner)==editor && NotesWindowText(editor)==text,"Compact layout preserves the full-width editor and existing draft");
+    state.findVisible=true;LayoutClientNotes(owner,dpi);RECT search{};bounds(IDC_NOTES_FIND,search);bounds(IDC_CLIENT_NOTES_TEXT,body);
+    Check(search.bottom<body.top,"Expanded search remains above the editor in the compact layout");
+    state.findVisible=false;LayoutClientNotes(owner,dpi);
+  }
+  LayoutClientNotes(owner,GetDpiForWindow(owner));DestroyWindow(owner);
+}
+
+static void CaptureCompactNotesActionRow() {
+  Fixture(L"Northstar Office (Demo)");HWND owner=Open(L"Northstar Office (Demo)");Command(owner,IDC_NOTES_ADD_TAB);
+  auto &state=State(owner);auto &page=state.pages[state.activePage];
+  page.name=L"Printer rollout";page.ticket=L"1048";page.status=2;page.tags={L"printing",L"rollout"};
+  page.ticketUrl=L"https://tickets.example.test/1048";state.metadataChanged=true;
+  RefreshNotesTabs(owner,state);
+  Type(owner,L"Office printer rollout\r\nTicket 1048 | Print server: PRINT01 | Owner: Alex Morgan\r\n\r\nTwo new office printers are ready for installation. Existing queues remain in service while the vendor confirms the rollout window.\r\n\r\nNext action\r\nConfirm the installation window with the vendor, then complete a test print from an office PC.\r\n\r\nHandover\r\nKeep the existing queues until both printers pass testing. Record the model, driver and port before closing the ticket.\r\n\r\nDemonstration note - fictional client and ticket.");
+  Select(Edit(owner),0,21);NotesCharacterFormat(owner,state,CFM_BOLD|CFM_SIZE,CFE_BOLD,0,320);Select(Edit(owner),0,0);Save(owner);
+  const auto output=fs::current_path()/L"build/notes-action-row";fs::create_directories(output);
+  LoadBakedThemesFromHeader();
+  for (const auto &[name,width,file,hover] : std::vector<std::tuple<std::wstring,int,std::wstring,bool>>{
+      {L"Dark - Gothic",900,L"gothic-compact.png",false},{L"Dark - Gothic",1120,L"gothic-wide-hover.png",true},
+      {L"Marine",900,L"marine-compact.png",false}}) {
+    const auto theme=std::find_if(g_aCustomThemes.begin(),g_aCustomThemes.end(),[&](const ThemeEntry &entry){return entry.name==name;});
+    Check(theme!=g_aCustomThemes.end(),"Native visual review loads a real built-in theme");
+    g_themeColors=theme->colors;g_bThemeIsDark=theme->dark;UpdateThemeBrushes();RefreshNotesForTheme();
+    const UINT dpi=GetDpiForWindow(owner);SetWindowPos(owner,HWND_TOP,80,80,ScaleByDpi(width,dpi),ScaleByDpi(650,dpi),SWP_SHOWWINDOW);
+    g_hHotButton=hover ? GetDlgItem(owner,IDC_NOTES_TEMPLATES) : nullptr;
+    UpdateNotesToolbar(owner,state);LayoutClientNotes(owner,dpi);RedrawWindow(owner,nullptr,nullptr,RDW_INVALIDATE|RDW_ERASE|RDW_ALLCHILDREN|RDW_UPDATENOW);
+    RECT area{};GetWindowRect(owner,&area);HDC screen=GetDC(owner),dc=CreateCompatibleDC(screen);
+    HBITMAP bitmap=CreateCompatibleBitmap(screen,area.right-area.left,area.bottom-area.top);HGDIOBJ prior=SelectObject(dc,bitmap);
+    Check(PrintWindow(owner,dc,2)!=FALSE,"Capture the actual native Notes dialog and its child controls");
+    SelectObject(dc,prior);
+    const CLSID png{0x557cf406,0x1a04,0x11d3,{0x9a,0x73,0,0,0xf8,0x1e,0xf3,0x2e}};
+    {Gdiplus::Bitmap snapshot(bitmap,nullptr);Check(snapshot.Save((output/file).c_str(),&png,nullptr)==Gdiplus::Ok,"Save the native Notes visual review artifact");}
+    DeleteObject(bitmap);DeleteDC(dc);ReleaseDC(owner,screen);
+  }
+  g_hHotButton=nullptr;DestroyWindow(owner);
+}
+
 int wmain(int argc,wchar_t **argv) {
   try {
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
@@ -1438,12 +1508,17 @@ int wmain(int argc,wchar_t **argv) {
     if(argc>1 && !wcscmp(argv[1],L"--code-border")) {CodeBorderRegression();DestroyWindow(g_hGui);return 0;}
     if(argc>1 && !wcscmp(argv[1],L"--close-race")) {CloseAllLaunchRace();DestroyWindow(g_hGui);return 0;}
     if(argc>1 && !wcscmp(argv[1],L"--header-polish")) {NotesHeaderPolish();NotesClientSwitchPlacement();DestroyWindow(g_hGui);std::cout << "Notes header polish: " << checks << " checks passed.\n";return 0;}
+    if(argc>1 && !wcscmp(argv[1],L"--action-row")) {
+      CompactNotesActionRow();HWND owner=Open(L"Workspace QA");TicketCodeAndTopActions(owner);ResizeAndOverflow(owner);DestroyWindow(owner);
+      NotesResizeWrapping();DestroyWindow(g_hGui);std::cout << "Notes action row: " << checks << " checks passed.\n";return 0;
+    }
+    if(argc>1 && !wcscmp(argv[1],L"--action-row-capture")) {CaptureCompactNotesActionRow();DestroyWindow(g_hGui);return 0;}
     HWND dialog=Open(L"Workspace QA"); Tests(dialog); Extended(dialog); ResizeAndOverflow(dialog); FrameRegression(dialog); PickerAndTemplates(dialog); Walkthrough(dialog); GuidanceAndBulkTrash(dialog); Productivity(dialog); TicketCodeAndTopActions(dialog); AddDeleteTransitions(dialog); DirectTemplateEditing(dialog); DirectTrashAndCompactHelp(dialog); NotesLinksAndContextMenu(dialog); DestroyWindow(dialog);
     dialog=Open(L"Workspace QA");
     Check(!HasActiveNote(State(dialog)),"Zero open tabs persists across restart");
     Check((GetWindowLongPtrW(Edit(dialog),GWL_STYLE)&WS_VISIBLE)==0,"Restart empty state does not expose blank editor");
     Command(dialog,IDC_NOTES_ADD_TAB); Check(HasActiveNote(State(dialog)),"New note from empty state");
-    DestroyWindow(dialog);EmptyDraftRestart();CompactNormalSpacing();OldNotesSpacingUpgrade();DirectSnippetEditing();InspectorNavigation();NotesResizeWrapping();NotesTabOrdering();LauncherTrayTests();CloseAllLaunchRace();CodeBorderRegression();NotesHeaderPolish();NotesClientSwitchPlacement();DestroyWindow(g_hGui);
+    DestroyWindow(dialog);EmptyDraftRestart();CompactNormalSpacing();OldNotesSpacingUpgrade();DirectSnippetEditing();InspectorNavigation();NotesResizeWrapping();NotesTabOrdering();LauncherTrayTests();CloseAllLaunchRace();CodeBorderRegression();NotesHeaderPolish();NotesClientSwitchPlacement();CompactNotesActionRow();DestroyWindow(g_hGui);
     std::cout << "Notes workspace: " << checks << " checks passed.\n"; return 0;
   } catch (const std::exception &error) { std::cerr << "FAIL: " << error.what() << std::endl; return 1; }
 }

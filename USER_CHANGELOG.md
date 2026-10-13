@@ -1,5 +1,15 @@
 # ctSpaces 6.3 What's New
 
+## 6.3.3.0 Compact Notes actions
+
+- Find, Snippets, Templates, Details, Status, Link/Open ticket and Add update
+  share one compact row below the note heading, with smaller buttons that match
+  the Notes toolbar and selected theme.
+- Ticket and tag context stays beside the heading. The editor gains a little
+  vertical space while retaining its full width.
+- The compact client picker, quiet autosave and same-window client switching
+  continue to work as before. Existing walkthrough recordings are unchanged.
+
 ## 6.3.2.0 Notes header polish
 
 - The client selector uses a left-aligned name and a separate, DPI-scaled
