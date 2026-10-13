@@ -6,6 +6,7 @@
 #include <filesystem>
 #include <functional>
 #include <mutex>
+#include <set>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -19,7 +20,10 @@ inline constexpr wchar_t kNotebookFileName[] = L"ctSpaces-client-notes.ctn";
 inline constexpr DWORD kMaxBytes = 32 * 1024 * 1024;
 inline constexpr DWORD kMaxRichBytes = 64 * 1024 * 1024;
 inline constexpr DWORD kMaxNotebookBytes = 256 * 1024 * 1024;
-inline constexpr size_t kMaxPages = 256;
+// Bound malformed input and whole-notebook saves without constraining ordinary
+// client work to a few hundred notes. The byte limit remains independent.
+inline constexpr size_t kMaxPages = 10000;
+inline constexpr size_t kMaxLibraryPages = 256;
 inline std::mutex mutex;
 
 enum class ReadStatus { Ok, Missing, Error };
@@ -467,6 +471,8 @@ struct NotePage {
   std::wstring ticket, ticketUrl;
   std::vector<std::pair<std::wstring,std::wstring>> links;
   std::vector<Revision> history;
+  uint32_t status = 0; // 0 none, 1 investigating, 2 waiting, 3 follow-up, 4 resolved.
+  std::vector<std::wstring> tags;
 };
 
 inline uint64_t NextId(const std::vector<NotePage> &pages) {
@@ -575,18 +581,24 @@ inline bool ReadText(std::string_view bytes, size_t &pos, std::wstring &value, s
 }
 
 // Version 2 adds stable identities, lifecycle, view state and bounded revisions.
-// Version 1 and legacy TXT/RTF remain readable. Older releases reject v2 safely.
+// Version 3 adds work status and tags only when used. V1/V2 and legacy TXT/RTF
+// remain readable; older releases reject newer formats without overwriting them.
 inline bool SerializeNotebook(const std::vector<NotePage> &pages, std::string &bytes) {
   bytes = "CTNBOOK1";
   if (pages.size() > kMaxPages) return false;
-  AppendU32(bytes, 2); AppendU32(bytes, static_cast<uint32_t>(pages.size()));
+  const bool metadata=std::any_of(pages.begin(),pages.end(),[](const auto &p){return p.status || !p.tags.empty();});
+  AppendU32(bytes, metadata ? 3 : 2); AppendU32(bytes, static_cast<uint32_t>(pages.size()));
+  const auto byName=[](const std::wstring &a,const std::wstring &b) {
+    return CompareStringOrdinal(a.data(),static_cast<int>(a.size()),b.data(),static_cast<int>(b.size()),TRUE)==CSTR_LESS_THAN;
+  };
+  std::set<std::wstring,decltype(byName)> names(byName);
+  std::set<uint64_t> identities;
   for (size_t i = 0; i < pages.size(); ++i) {
     const auto &p = pages[i]; std::string name;
     if (!p.rich || !p.text.empty() || !ValidPageName(p.name) || !EncodeUtf8(p.name, name) ||
         !ValidRichText(p.rtf) || p.history.size() > 20 || p.zoom < 25 || p.zoom > 400) return false;
     const uint64_t id = p.id ? p.id : i + 1;
-    for (size_t j = 0; j < i; ++j)
-      if (SamePageName(p.name, pages[j].name) || id == (pages[j].id ? pages[j].id : j + 1)) return false;
+    if (!names.insert(p.name).second || !identities.insert(id).second) return false;
     AppendU32(bytes, static_cast<uint32_t>(name.size()));
     AppendU32(bytes, static_cast<uint32_t>(p.rtf.size())); bytes += name; bytes += p.rtf;
     AppendU64(bytes, id); AppendU64(bytes, p.created); AppendU64(bytes, p.modified);
@@ -604,6 +616,14 @@ inline bool SerializeNotebook(const std::vector<NotePage> &pages, std::string &b
       if (!ValidRichText(rev.rtf) || (historyBytes += rev.rtf.size()) > 32 * 1024 * 1024) return false;
       AppendU64(bytes, rev.time); AppendU32(bytes, static_cast<uint32_t>(rev.rtf.size())); bytes += rev.rtf;
     }
+    if (metadata) {
+      if (p.status>4 || p.tags.size()>16) return false;
+      AppendU32(bytes,p.status); AppendU32(bytes,static_cast<uint32_t>(p.tags.size()));
+      for (size_t j=0;j<p.tags.size();++j) {
+        if (p.tags[j].size()>32 || !ValidPageName(p.tags[j]) || p.tags[j].find(L',')!=std::wstring::npos || !AppendText(bytes,p.tags[j],32)) return false;
+        for (size_t k=0;k<j;++k) if (SamePageName(p.tags[j],p.tags[k])) return false;
+      }
+    }
     if (bytes.size() > kMaxNotebookBytes) return false;
   }
   return true;
@@ -612,9 +632,14 @@ inline bool ParseNotebook(std::string_view bytes, std::vector<NotePage> &pages) 
   pages.clear();
   if (bytes.size() < 16 || bytes.size() > kMaxNotebookBytes || bytes.substr(0,8) != "CTNBOOK1") return false;
   size_t pos = 8; uint32_t version, count;
-  if (!ReadU32(bytes,pos,version) || (version != 1 && version != 2) || !ReadU32(bytes,pos,count) ||
+  if (!ReadU32(bytes,pos,version) || (version != 1 && version != 2 && version != 3) || !ReadU32(bytes,pos,count) ||
       count > kMaxPages || (!count && version == 1)) return false;
   std::vector<NotePage> parsed;
+  const auto byName=[](const std::wstring &a,const std::wstring &b) {
+    return CompareStringOrdinal(a.data(),static_cast<int>(a.size()),b.data(),static_cast<int>(b.size()),TRUE)==CSTR_LESS_THAN;
+  };
+  std::set<std::wstring,decltype(byName)> names(byName);
+  std::set<uint64_t> identities;
   for (uint32_t i = 0; i < count; ++i) {
     uint32_t n, r;
     if (!ReadU32(bytes,pos,n) || !ReadU32(bytes,pos,r) || !n || n > 256 || r > kMaxRichBytes ||
@@ -624,7 +649,7 @@ inline bool ParseNotebook(std::string_view bytes, std::vector<NotePage> &pages) 
     pos += n; p.rtf = bytes.substr(pos,r); pos += r; p.rich = true;
     if (!ValidRichText(p.rtf)) return false;
     p.id = i + 1;
-    if (version == 2) {
+    if (version >= 2) {
       uint32_t flags, revisions;
       if (!ReadU64(bytes,pos,p.id) || !p.id || !ReadU64(bytes,pos,p.created) || !ReadU64(bytes,pos,p.modified) ||
           !ReadU32(bytes,pos,flags) || flags > 63 || !ReadU32(bytes,pos,p.cursor) ||
@@ -650,7 +675,17 @@ inline bool ParseNotebook(std::string_view bytes, std::vector<NotePage> &pages) 
         p.history.push_back(std::move(rev));
       }
     }
-    for (const auto &prior : parsed) if (SamePageName(p.name,prior.name) || p.id == prior.id) return false;
+    if (version>=3) {
+      uint32_t tagCount;
+      if (!ReadU32(bytes,pos,p.status) || p.status>4 || !ReadU32(bytes,pos,tagCount) || tagCount>16) return false;
+      for (uint32_t j=0;j<tagCount;++j) {
+        std::wstring tag;
+        if (!ReadText(bytes,pos,tag,32) || !ValidPageName(tag) || tag.find(L',')!=std::wstring::npos ||
+            std::any_of(p.tags.begin(),p.tags.end(),[&](const auto &prior){return SamePageName(prior,tag);})) return false;
+        p.tags.push_back(std::move(tag));
+      }
+    }
+    if (!names.insert(p.name).second || !identities.insert(p.id).second) return false;
     parsed.push_back(std::move(p));
   }
   if (pos != bytes.size()) return false;

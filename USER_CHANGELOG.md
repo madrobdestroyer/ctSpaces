@@ -1,4 +1,24 @@
-# ctSpaces 6.2 What's New
+# ctSpaces 6.3 What's New
+
+## 6.3.0.0 Notes review on the cpp branch
+
+This review keeps version 6.3.0.0 while the Notes redesign is being evaluated.
+It has not been published as a new GitHub release.
+
+- Open Notes beside Close all, then switch clients with one searchable picker.
+  Each notebook stays with its owning client.
+- Keep the document full width. Details and searchable More actions appear on
+  demand and dismiss when you click outside; All notes and Trash remain larger
+  management windows with search, previews and recovery controls.
+- Use templates and snippets you can create and edit directly, quick capture,
+  ticket details, status, tags, work logs, bulk actions and readable handover exports.
+- Code blocks show their language and monospace source. Ticket and note links
+  open through the PC's default browser.
+- Drag notes tabs to reorder, use Move tab left/right from their right-click menu,
+  or press Ctrl+Shift+PgUp/PgDn. Reopened notes go to the end of their group.
+- Notes retains themed colors, compact paragraph spacing, autosave and remembered
+  dimensions. Unused Untitled drafts no longer keep consuming names.
+- The launcher comes forward when started and can optionally minimize to the tray.
 
 ## Current 6.2.3.0 Update
 

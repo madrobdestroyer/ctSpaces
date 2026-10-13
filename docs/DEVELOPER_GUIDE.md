@@ -10,6 +10,21 @@ The output executable is self-contained. There is no application framework, pack
 
 ## Source Map
 
+The launcher persists `[user] minimize_to_tray` through configuration mutations.
+It defaults off. Minimize registers a version-4 notification icon before hiding
+the launcher; registration/version failure retains ordinary taskbar access.
+`TaskbarCreated` re-registers a hidden launcher's icon after Explorer restarts,
+or restores the launcher if registration fails. Tray selection and verified
+same-executable launch requests restore the launcher and its active popup using
+Windows' foreground APIs without making either window always on top.
+
+All Notes HTTP/HTTPS links use `ShellExecuteW` with the `open` verb and no client
+profile arguments. RichEdit's right mouse-button release and keyboard context
+menu messages share the themed editing menu. Closing Notes captures the editor
+before pruning pristine, automatically named empty drafts, then commits the
+notebook before destroying the window. Renamed, edited, or metadata-bearing
+notes are retained.
+
 | Path | Responsibility |
 |---|---|
 | `ctSpaces.cpp` | Startup, installer/update flow, launcher UI, themes, profile lifecycle, browser launch/tracking, icons, backup/restore, and dialogs |
@@ -321,6 +336,13 @@ remain unchanged. Run it serially with the other GUI tests.
 
 ## Release Checklist
 
+UI feedback and bug-fix iterations do not automatically trigger version changes
+or GitHub releases. Keep the current development version while correcting and
+reviewing the work, and collect the fixes into a deliberate release. Change the
+version once for that release; never increment it for each build, test attempt,
+or user-reported issue. Review builds must use a separate output directory so
+published packages remain intact.
+
 1. Update the four-part Windows version and short display version together in `version.h`.
 2. Update `README.md`, `USER_CHANGELOG.md`, this developer guide, and the versioned release-validation report.
 3. Build `Release|x64` and confirm zero warnings and errors.
@@ -381,3 +403,59 @@ User-visible behavior, data handling, installation prompts, profile cleanup, and
 Run `tests/Test-NotesWorkspace.ps1` after a Release x64 app build. This compiles production notes code into an isolated native test process, redirects only confirmation/input/file-picker boundaries, and exercises actual RichEdit and tab controls. It never runs the application startup or reads live client data. Fixtures are retained below `build/notes-workspace-test-*` for inspection. `tests/Test-ClientNotes.ps1` covers notebook storage/migration and unsafe path boundaries. Finish with a live disposable `--qa-instance` / `--qa-data-dir` visual review; native assertions do not establish visual quality or flicker behavior.
 
 The notes workspace is modeless, with one client notebook open at a time. Cached native editors preserve undo per note until the window closes. Client lifecycle operations flush/close the relevant notebook before proceeding. V2 notebooks keep bounded revisions and optional crash snapshots; all writes retain stale-snapshot and safe-path checks. Deferred work is tracked in `docs/notes-roadmap.json`.
+
+Notes productivity helpers live in `NotesProductivityUi.inl`, included by the
+workspace after its text/date helpers. Status and tags opt notebooks into V3;
+V1/V2 and legacy content remain readable, and unused metadata retains V2 output.
+Shared snippets use a separate `NotesSnippets` notebook with the same atomic and
+stale-snapshot protections as templates. Quick capture closes a same-client
+editor first, debounces its plain-text draft, and blocks closing after a save
+failure. Selection scopes use stable IDs and intersect the visible results;
+filter changes clear the scope. HTML handovers escape all text/attributes and
+include only HTTP/HTTPS links. They are readable exports, not restorable backups.
+
+`NotesCodeUi.inl` inserts editable native RTF tables with a visible language
+caption and monospace source. Borders use neutral gray; automatic background
+and refreshed text colors preserve theme contrast. Fixed cell widths avoid
+document mutations during resize. Code insertion is a TOM edit collection for
+one-step undo; nested table insertion is rejected. Source is never executed.
+Readable export normalizes native soft-line/cell separators to ordinary whitespace.
+
+Ticket commands use Windows' URL association through ShellExecuteW, without
+client/browser-profile arguments. A matching saved ticket URL clicked in the
+active note follows the same route. All notes passes the owning editor when
+flushing pending content before launch. Native tests replace the shell boundary
+and cover cancellation, invalid URLs, launch failure, both ticket buttons, and
+the body-link route without visiting an external site.
+
+Notebooks permit 10,000 pages within the unchanged 256 MiB byte limit. Templates
+and snippets retain a separate 256-entry guard. Name and identity validation use
+sets rather than quadratic scans; name ordering uses the same case-insensitive
+CompareStringOrdinal semantics as equality. Full-count storage round trips,
+overflow rejection, and duplicate/malformed input remain covered.
+
+
+`NotesTemplatesUi.inl` owns a template draft separately from client notes. The
+combined manager edits names, hints and RichEdit content directly; Save uses the
+shared library's existing optimistic snapshot, and Use saves first then creates
+an independent note. Save failures leave the draft and library selection intact.
+Switch/close prompts support save, discard and cancel. Theme refresh preserves
+unsaved content and its modified flag. The text editor shares the bounded plain
+Unicode paste helper with client notes. Ctrl+V and Shift+Insert are intercepted
+explicitly because RichEdit's internal keyboard paste bypasses WM_PASTE.
+
+Notes tab changes batch native tab rebuilding under WM_SETREDRAW, then restore
+visibility before choosing the active item so native overflow keeps its scroll
+range. New RichEdit controls stay hidden while content, colors, caret and layout
+are prepared. The old editor stays visible until a deferred visibility swap;
+pristine editors retire after that swap, and the parent outline is invalidated
+afterward. Closing/deleting chooses the adjacent visible tab by stable identity.
+Cached editors preserve independent undo histories across these transitions.
+
+Tab dragging lets the native tab control select on mouse-down, then owns mouse
+capture until drop or cancellation. Mouse movement never reaches the native
+drag handler. Order changes rotate pages and formatting baselines together and
+resolve the active note by stable ID, retaining cached editors and undo. Pinned
+and ordinary tabs reorder only within their own group. Reopening a closed note
+appends it to its group; selecting an open note does not move it. All note-opening
+routes share the save-before-switch helper. No notebook schema change is needed.

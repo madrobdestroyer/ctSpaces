@@ -1,6 +1,6 @@
-# ctSpaces User Guide
+﻿# ctSpaces User Guide
 
-Applies to ctSpaces 6.1.
+Applies to ctSpaces 6.3, including the Notes design review on the cpp branch.
 
 ## What ctSpaces Does
 
@@ -64,25 +64,88 @@ Choose a result with the mouse or arrow keys and confirm your selection to fill 
 
 ## Client Notes
 
-Select an existing client, then choose **Client Notes** from Settings or the pinned client's menu. The notes window uses the selected application theme and remains usable independently of the launcher. It remembers its size and maximized state. Drag an edge or corner to resize, double-click the title area to maximize or restore, and use the top-right **X** to close the window. Autosave needs no footer or Save/Cancel row.
+**Quick note** in Settings or a pinned client's menu captures plain text with an
+optional title and autosaves it into that client's notebook. **More … / Ctrl+K**
+searches commands with hints. Use it for snippets, status/tags, dated work log
+updates, and a readable handover export. **All notes** combines search and filters,
+offers four sort orders, and lets you select several notes for one action. The
+[Notes productivity guide](NOTES_PRODUCTIVITY.md) explains these flows and their scope.
 
-**+** or **Ctrl+T** opens an Untitled note immediately. Double-click a tab to rename it when useful. Each tab has its own **X**; closing a tab preserves the note in **All notes**. **Ctrl+W** closes the current tab and **Ctrl+Shift+T** reopens the last closed tab in this session. A new unnamed note that was never edited is discarded when closed. Closing every tab leaves an empty workspace; **+** and **All notes** remain available.
+The main window has a **Notes** button beside **Close all**. It opens the selected
+client or returns to your last notebook. Inside Notes, there is one client picker:
+click the client name, then type to search every active client. Pinned and recent
+clients appear first, with up to eight matches. Use arrow keys and Enter, or click
+a client. Switching saves the original notebook before opening the destination;
+a failed save keeps the original notebook and its draft open.
 
-Right-click a tab to rename, duplicate, pin/unpin, close, close others, close all, archive, or move it to Recently deleted. Drag tabs to reorder within the pinned or unpinned group. Scroll over tabs or use **Ctrl+Tab / Ctrl+Shift+Tab** to navigate; hover for the full name. Names are unique, up to 64 characters. Open, closed, archived and deleted notes together count toward the 256-note limit.
+The full-width editor has slim tabs and a document heading with **Saved**, direct
+**Snippets**, **Templates**, **Status**, **Find**, **Add update**, and **Details**
+actions. **Details** combines ticket number, ticket URL, local status, and tags.
+Valid changes save automatically. Status organizes work locally and does not
+synchronize a ticketing system. **Open ticket** opens a linked URL in the PC's
+default browser outside client profiles.
 
-**All notes** searches titles, ticket numbers and content, with a preview of the selected result. Its filters show current notes, open tabs, archived notes, Recently deleted, or current and archived notes together. Restore an archived/deleted note before opening it. Deletion is recoverable here until you explicitly confirm **Delete forever**. The **More** menu can enable checklist progress in the preview information.
+**Switch client**, **Details**, and **More …** are temporary panels. Click outside
+one or press Escape to dismiss it without resizing the editor. More supports
+searching actions by name or description (Ctrl+K). Invalid details are not written;
+reopening Details keeps their unfinished fields while that notebook remains open.
 
-The toolbar provides normal text, headings, subheadings, monospaced code, font size, bold, italic, underline, highlighting, bullets, numbering, checklists, links, undo/redo and clearing formatting. The highlighter arrow shows color swatches and the selection's current highlight; the marker applies or removes the chosen color. Click a checklist box to toggle completion and strike through its text. Enter continues a checklist with an unchecked item; Enter on an empty item exits it. Tab and Shift+Tab adjust list indentation. Pasting inserts plain text.
+**Templates** lets you create, edit, save and use reusable starters directly.
+**From current note** optionally copies the current note into a new template draft.
+**Snippets** also has **New snippet**, a direct content editor, **Save snippet** and
+**Insert in note**. **From selection** captures selected text, or the whole note if
+nothing is selected. You can create and edit snippets even with every note tab closed.
+Choosing **Code** in the style dropdown opens a language picker and source editor,
+then inserts an editable bordered code box with a language caption. Code is text
+and is never executed; notebook/history/RTF exports retain the box.
 
-**More** adds strikethrough, a timestamp, code style, copying the entire note, and templates for ticket investigations, maintenance, contacts and handover. **Note information / ticket** shows creation/edit dates and optional ticket number and HTTP/HTTPS URL. **Always on top** and optional checklist progress are remembered settings. **Ctrl++ / Ctrl+- / Ctrl+0**, or Ctrl+mouse wheel, change view zoom without changing font sizes. Undo/redo history survives switching or closing/reopening tabs while the window stays open. The active note, cursor, scroll and zoom persist across window openings.
+Click **Notes** beside **Close all**, or select an existing client and choose **Client Notes** from Settings or its context menu. The notes window uses the selected application theme and remains usable independently of the launcher. It remembers its size and maximized state. Drag an edge or corner to resize, double-click the title area to maximize or restore, and use the top-right **X** to close the window. Autosave needs no footer or Save/Cancel row.
 
-Use **Ctrl+F** to find text in the active note, **F3 / Shift+F3** for next/previous, and **Ctrl+H** for replacement of the next match or all matches. Escape closes the find row. For a labeled web link, select text and choose Link, then enter its label and address. Select that label again to edit it, or use **More > Remove selected link / Copy selected link address**. Repeated identical labels in one note share the same address. Detected HTTP/HTTPS URLs work directly. Clicking a link asks to open it in the client's selected browser space. Existing Chromium sessions receive a new tab; an already open isolated Firefox session still cannot accept another command-line URL.
+New blank notes use **12-point Normal text**, single line spacing, and no extra
+space before or after paragraphs. Blank lines you type or paste remain intact.
+Existing notes automatically lose the former four-point gap after normal paragraphs
+when opened. Their text, explicit blank lines, font sizes, headings and differently
+configured spacing remain intact. The original rich text is retained in version
+history and the adjustment uses normal autosave. For other unwanted gaps, select
+the affected body paragraphs and choose **Normal text** even if already selected.
+That explicit command also applies 12-point text and removes heading size/bold
+styling from the selected text. Changing only font size does not change paragraph spacing.
+
+On first use, the compact **How client notes work** overview explains writing, saving, finding notes, tickets, templates and Trash. It offers direct Templates, All notes, Trash, and Walkthrough buttons. Reopen it with **Help** in the notes title area or **More > Help**.
+
+**Trash**, beside **All notes**, opens deleted notes immediately. It is also available in searchable More actions and replaces the old Recently deleted label. Restore returns notes to the notebook. **Delete forever** removes selected notes; **Empty trash** removes all deleted notes for this client, including hidden search results, after confirmation. Notes in Trash have no automatic expiry.
+
+Choose **Help > Step-by-step walkthrough**, or **More > Notes walkthrough**, for fourteen steps with actual example screenshots. Use Next/Back or choose a topic to jump directly to it. The guide explains everyday editing, saved tabs, searching, tickets, templates, transfers, restoring notes, permanent deletion and recovery. It is read-only and never performs the actions it describes. A [walkthrough with screenshots](NOTES_WALKTHROUGH.md) is also available in this documentation.
+
+**+** or **Ctrl+T** opens an Untitled note immediately. Double-click a tab to rename it when useful. Each tab has its own **X**; closing a tab preserves the note in **All notes**. **Ctrl+W** closes the current tab and **Ctrl+Shift+T** reopens the last closed tab in this session. Untouched, empty Untitled drafts are discarded when their tab or the Notes window closes, so their numbers become available again. Renamed notes, written content, and notes with metadata remain saved. Existing saved notes still reserve their names; the next blank note uses the lowest available Untitled number. Closing every tab leaves an empty workspace; **+** and **All notes** remain available.
+
+Right-click a tab to rename, duplicate, pin/unpin, close, close others, close all, archive, or move it to Trash. Drag tabs to reorder within the pinned or unpinned group; an accent line marks where the tab will land. **Move tab left/right** in the right-click menu, or **Ctrl+Shift+PgUp / Ctrl+Shift+PgDn**, moves the active tab one position. Reopening a closed note from All notes or with Ctrl+Shift+T puts it at the end of its group. Choosing an already-open note leaves its position unchanged. Scroll over tabs or use **Ctrl+Tab / Ctrl+Shift+Tab** to navigate; hover for the full name and a reordering hint. Names are unique, up to 64 characters. Open, closed, archived and deleted notes together count toward the 10,000-note limit.
+
+**All notes** and **Trash** remember their separate window dimensions and start in
+**This client** scope. The **All clients — search only** scope searches titles,
+content, tickets, tags, and client names across independent notebooks. Each result
+identifies its client. **Open client** enters that client's notebook; editing,
+archive, restore, deletion, and exports happen within an individual notebook.
+The combined scope cannot change notes, and switching scopes clears bulk selections.
+Deleting one client leaves other clients' notebooks untouched.
+
+**All notes** searches titles, ticket numbers and content, with a preview of the selected result. It initially selects the current note, when that note is in the results. The list shows each note's ticket number and whether it is open, saved with its tab closed, archived or deleted. The preview gives the ticket reference its own line and offers **Open ticket link** when a valid URL is supplied. Its filters show current notes, open tabs, archived notes, Trash, or current and archived notes together. Each view explains what it contains and what its actions do. Restore an archived/deleted note before opening it. **To trash** keeps a recoverable copy; Archive hides a note from the current list.
+
+Trash is this client's trash bin: notes remain indefinitely, with no automatic expiry, until you explicitly confirm **Delete forever** for one note or **Empty trash…** for every deleted note. Empty trash shows the total count and client before confirmation, includes deleted notes hidden by the current search, and permanently removes their revision histories. It leaves current notes, archived notes and other clients' notebooks intact. **No** is the default confirmation choice; a failed save blocks the operation before erasing notes. Deleted notes still count toward the 10,000-note limit. **More > All formatting and window commands** can enable checklist progress in the preview information.
+
+The toolbar provides normal text, headings, subheadings, labeled code blocks, font size, bold, italic, underline, highlighting, bullets, numbering, checklists, links, undo/redo and clearing formatting. The highlighter arrow shows color swatches and the selection's current highlight; the marker applies or removes the chosen color. Click a checklist box to toggle completion and strike through its text. Enter continues a checklist with an unchecked item; Enter on an empty item exits it. Tab and Shift+Tab adjust list indentation. Pasting inserts plain text.
+
+**More > All formatting and window commands** adds strikethrough, a timestamp, code style, copying the entire note, and templates for ticket investigations, maintenance, contacts and handover. **Ticket details (optional)** shows creation/edit dates and explains the ticket number and HTTP/HTTPS URL fields. The number labels the note in All notes and can be searched; the URL enables Open ticket link in All notes and Actions. These fields do not fetch or synchronize ticket data. **Always on top** and optional checklist progress are remembered settings. **Ctrl++ / Ctrl+- / Ctrl+0**, or Ctrl+mouse wheel, change view zoom without changing font sizes. Undo/redo history survives switching or closing/reopening tabs while the window stays open. The active note, cursor, scroll and zoom persist across window openings.
+
+Use **Ctrl+F** to find text in the active note, **F3 / Shift+F3** for next/previous, and **Ctrl+H** for replacement of the next match or all matches. Escape closes the find row. Right-click the document, or press the Menu key / Shift+F10, for Undo, Redo, Cut, Copy, Paste, and Select all. Paste inserts plain text. For a labeled web link, select text and choose Link, then enter its label and address. Select that label again to edit it, or use **More > Remove selected link / Copy selected link address**. Repeated identical labels in one note share the same address. Detected HTTP/HTTPS URLs work directly. **All note links**, including tickets, pasted URLs, and labeled links, ask before opening in your PC's default browser with your regular sign-in, outside client profiles.
 
 Text, formatting and note changes save automatically after a brief typing pause. Switching tabs and closing the window flush pending edits. A failed save leaves the draft open and reports the failure in the title. **More > Retry saving**, **Copy entire note**, **Export this note**, and **Resolve save conflict** provide recovery actions. Conflict resolution can preview the latest saved notebook or keep changed drafts as separate recovered copies alongside it. A client rename/archive/delete/restore closes its notes safely first; a failed save blocks that operation.
 
 Crash snapshots are written while editing. On the next opening, ctSpaces offers to recover changed notes from an abandoned session as separate copies. **More > Version history** previews and restores earlier text/formatting. History keeps up to 20 revisions and 32 MiB per note, sampled at most once a minute during editing; explicit restores retain the replaced content. It is a recovery aid, not a complete keystroke log. Undo history is limited to the current notes-window session.
 
-**Import** previews UTF-8 TXT or supported text-only RTF before adding a note. Notebook imports add uniquely named copies, including recovered archived/deleted entries, without replacing existing notes. **Export this note** writes TXT or RTF; **Export client notebook** writes a `.ctn` file including note metadata, links, archived/deleted entries and history. Use notebook export for a complete copy: RTF/TXT exports contain document text/formatting and do not include the separate ticket and labeled-link metadata. Move/copy to another client requires an explicit existing destination and confirmation. A move saves the destination first and retains its source in Recently deleted.
+**Import** previews UTF-8 TXT or supported text-only RTF before adding a note. Notebook imports add uniquely named copies, including recovered archived/deleted entries, without replacing existing notes. **Export this note** writes TXT or RTF; **Export client notebook** writes a `.ctn` file including note metadata, links, archived/deleted entries and history. Use notebook export for a complete copy: RTF/TXT exports contain document text/formatting and do not include the separate ticket and labeled-link metadata. Move/copy to another client offers a dropdown of other active clients; typing filters suggestions without replacing unfinished input. Select a client or type its full name, then confirm the destination. A move saves the destination first and retains its source in Trash.
+
+**Templates** (also in More) combines saved starters and a direct editor. Ticket investigation organizes the issue, findings, actions and next steps; Maintenance checklist tracks the maintenance window, backup, changes and verification; Client contacts records contact and escalation details; Handover records status, work and the next owner. Select a starter to edit its name, hint or formatted content, or click **New template** to write your own here. **Save template** keeps it for every client. **Use template** saves pending edits and creates an independent client note. **From current note** optionally copies your current note into a new draft. Switching templates or closing asks whether to save, discard or cancel when edits are unsaved. Updating or deleting a template leaves existing notes unchanged. Templates have an explicit Save button; client notes continue to autosave. Customizations are stored separately in the app data directory under `NotesTemplates`; a single client notebook export does not include this shared library.
 
 Each note allows 32 MiB of UTF-8 text and 64 MiB of RTF; the complete notebook, including history, is limited to 256 MiB. Existing version-1 notebooks and legacy TXT/RTF notes remain readable. Saving with 6.3 upgrades the notebook format; older releases cannot read the new format. Keep a full backup before downgrading, or export individual notes as TXT/RTF. Opening untouched legacy content alone creates no new notebook.
 
@@ -269,6 +332,16 @@ Before replacing the current `Sites` folder, ctSpaces checks the archive paths a
 Browser security can tie some passwords or cookies to a Windows user or computer. A ctSpaces backup preserves the files but cannot guarantee that every protected sign-in will work on a different computer.
 
 ## Close ctSpaces
+
+ctSpaces brings its launcher forward on a normal visible start. Launching it again
+restores the existing launcher, including when it is hidden in the tray.
+
+Enable **Gear menu > Minimize to tray** to hide the launcher in the Windows
+notification area when you minimize it. Click its ctSpaces icon to restore it,
+or right-click the icon for **Show ctSpaces** and **Exit ctSpaces**. The option is
+remembered and starts off. Turning it off keeps ordinary taskbar minimization.
+If Windows cannot register the tray icon, the window remains accessible through
+the taskbar. Closing the window still exits; tray mode affects Minimize only.
 
 If no clients are open, closing ctSpaces exits immediately.
 

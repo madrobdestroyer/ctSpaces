@@ -25,7 +25,7 @@ The important items are:
 | `Sites\<ClientName>` | Persistent client container holding every browser slot | Until whole-client Delete or full removal |
 | `Sites\<ClientName>\Browsers\<browser>\Profile` | Independent Edge, Chrome, Brave, or Firefox profile in the v2 layout | Retained with that client |
 | `Sites\<ClientName>\client.ico` | Optional custom client icon | Retained with that client |
-| `Sites\<ClientName>\ctSpaces-client-notes.ctn` | Local formatted ticket notebook: up to 256 notes including closed, archived and deleted notes, 32 MiB text and 64 MiB RTF per tab, 256 MiB total | Autosaved; retained through rename, archive, and full backup; removed with whole client deletion |
+| `Sites\<ClientName>\ctSpaces-client-notes.ctn` | Local formatted ticket notebook: up to 10,000 notes including closed, archived and deleted notes, 32 MiB text and 64 MiB RTF per tab, 256 MiB total | Autosaved; retained through rename, archive, and full backup; removed with whole client deletion |
 | `Sites\<ClientName>\ctSpaces-client-notes.txt` or `.rtf` | Older notes loaded into the initial Notes tab when no notebook exists | Preserved during the first notebook save; a malformed notebook is reported instead of falling back to older data |
 | `Sites\<ClientName>\ctSpaces-notes-draft-<process>.ctn` | Atomic recovery snapshots for unsaved notes | Recovered as separate copies after an abandoned session; removed after successful save/recovery |
 | `Default.7z` | Sanitized Chromium starter copied into new Edge, Chrome, and Brave profiles | Retained and revisioned |

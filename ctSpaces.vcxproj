@@ -178,6 +178,10 @@
     <ClInclude Include="OwnerDrawUi.h" />
     <ClInclude Include="NotesEditorUi.h" />
     <ClInclude Include="NotesWorkspaceUi.inl" />
+    <ClInclude Include="NotesInspectorUi.inl" />
+    <ClInclude Include="NotesProductivityUi.inl" />
+    <ClInclude Include="NotesCodeUi.inl" />
+    <ClInclude Include="NotesTemplatesUi.inl" />
     <ClInclude Include="ProgressUI.h" />
     <ClInclude Include="Resource.h" />
     <ClInclude Include="SiblingStageName.h" />

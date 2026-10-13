@@ -43,6 +43,17 @@ static void TestWorkspaceStorage(const fs::path &base) {
   for (size_t size=0;size<bytes.size();++size)
     Check(!ParseNotebook(std::string_view(bytes).substr(0,size),parsed),"Every truncated v2 snapshot is rejected");
   Check(!ParseNotebook(bytes+"extra",parsed),"V2 trailing bytes rejected");
+  Check(SerializeNotebook({note},bytes) && static_cast<unsigned char>(bytes[8])==2,"Unused productivity metadata keeps the V2 format");
+  note.status=2;note.tags={L"Network",L"Follow-up",L"\x4e2d\x6587"};
+  Check(SerializeNotebook({note},bytes) && static_cast<unsigned char>(bytes[8])==3 && ParseNotebook(bytes,parsed) && parsed[0].status==2 && parsed[0].tags==note.tags,"V3 status and Unicode tags round trip");
+  for (size_t size=0;size<bytes.size();++size) Check(!ParseNotebook(std::string_view(bytes).substr(0,size),parsed),"Truncated V3 snapshots are rejected");
+  Check(!ParseNotebook(bytes+"extra",parsed),"V3 trailing bytes rejected");
+  auto invalid=note;invalid.status=5;Check(!SerializeNotebook({invalid},bytes),"Unknown status rejected");
+  invalid=note;invalid.tags={L"Network",L"network"};Check(!SerializeNotebook({invalid},bytes),"Case-insensitive duplicate tags rejected");
+  invalid.tags={L"one,two"};Check(!SerializeNotebook({invalid},bytes),"Embedded tag separator rejected");
+  invalid.tags={std::wstring(33,L'x')};Check(!SerializeNotebook({invalid},bytes),"Oversize tags rejected");
+  invalid.tags=std::vector<std::wstring>(17,L"tag");Check(!SerializeNotebook({invalid},bytes),"Too many tags rejected");
+  note.status=0;note.tags.clear();
   auto duplicate=note; duplicate.name=L"Different";
   Check(!SerializeNotebook({note,duplicate},bytes),"Duplicate stable identities rejected");
   Check(SerializeNotebook({},bytes) && ParseNotebook(bytes,parsed) && parsed.empty(),"Empty notebook persists without fabricated note");
@@ -128,11 +139,11 @@ static void TestNotebook(const fs::path &base) {
     maxPages.push_back({L"Tab " + std::to_wstring(i), true, rtf, {}});
   Check(client_notes::WriteNotebook(root, maxPages, twoTabs) &&
             client_notes::ReadNotebook(root).pages.size() == client_notes::kMaxPages,
-        "256 tab boundary saves and reads");
+        "10,000 note boundary saves and reads");
   const auto full = client_notes::ReadNotebook(root);
   maxPages.push_back({L"One too many", true, rtf, {}});
   Check(!client_notes::WriteNotebook(root, maxPages, full),
-        "257th tab is rejected");
+        "10,001st note is rejected");
   {
     std::ofstream oversized(path, std::ios::binary | std::ios::trunc);
     oversized.seekp(client_notes::kMaxNotebookBytes);
