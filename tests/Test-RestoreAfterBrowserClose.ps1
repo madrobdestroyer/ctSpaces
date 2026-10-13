@@ -5,6 +5,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot 'QaProcess.ps1')
 $projectRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
 $resolvedExe = [IO.Path]::GetFullPath($ExePath)
 $qaParent = Join-Path $projectRoot 'build\qa-browser-close-restore'
@@ -311,7 +312,7 @@ function Test-ExactProfileCommandLine {
 
 function Get-DisposableProfileProcesses {
     @(
-        Get-CimInstance Win32_Process -Filter "Name = '$browserImageName'" |
+        Get-QaProcess Win32_Process -Filter "Name = '$browserImageName'" |
             Where-Object {
             Test-ExactProfileCommandLine $_.CommandLine
         }
@@ -333,7 +334,7 @@ function Stop-DisposableProfileProcess {
         $actualStart = $process.StartTime.ToUniversalTime()
         $expectedImage = [IO.Path]::GetFullPath($resolvedBrowser)
         $handleImage = [IO.Path]::GetFullPath($process.MainModule.FileName)
-        $current = Get-CimInstance Win32_Process -Filter (
+        $current = Get-QaProcess Win32_Process -Filter (
             'ProcessId = ' + [int]$ProfileProcess.ProcessId
         ) -ErrorAction Stop | Select-Object -First 1
         $currentStart = if ($current) {

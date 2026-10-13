@@ -1,4 +1,4 @@
-﻿#include <windows.h>
+#include <windows.h>
 #include <commdlg.h>
 #include <shellapi.h>
 #include <shldisp.h>
@@ -179,9 +179,13 @@ static void FrameRegression(HWND dialog) {
   Check(SendMessageW(dialog,WM_NCCALCSIZE,TRUE,reinterpret_cast<LPARAM>(&size))==0 && EqualRect(&size.rgrc[0],&bounds),"Resize preserves client pixels rather than requesting full hierarchy redraw");
   auto hit=[&](int x,int y) { return SendMessageW(dialog,WM_NCHITTEST,0,MAKELPARAM(x,y)); };
   Check(hit(bounds.left+2,bounds.top+2)==HTTOPLEFT && hit(bounds.right-2,bounds.bottom-2)==HTBOTTOMRIGHT,"Custom frame keeps both native corner resize handles");
-  Check(hit(bounds.left+300,bounds.top+20)==HTCAPTION,"Custom frame remains draggable");
+  Check(hit(bounds.left+300,bounds.top+ScaleByDpi(38,GetDpiForWindow(dialog)))==HTCAPTION,"Empty custom header space remains draggable");
   RECT close{}; GetWindowRect(GetDlgItem(dialog,IDCANCEL),&close);
   Check(hit((close.left+close.right)/2,(close.top+close.bottom)/2)==HTCLIENT,"Close button stays clickable inside custom caption");
+  for (int control : {IDC_NOTES_SWITCH_CLIENT,IDC_NOTES_LIBRARY,IDC_NOTES_TRASH,IDC_NOTES_MORE,IDC_NOTES_HELP}) {
+    RECT button{};GetWindowRect(GetDlgItem(dialog,control),&button);
+    Check(hit((button.left+button.right)/2,(button.top+button.bottom)/2)==HTCLIENT,"Notes header action receives mouse clicks instead of window dragging");
+  }
 }
 static void ResizeAndOverflow(HWND dialog) {
   auto &s=State(dialog);
@@ -703,10 +707,25 @@ static void InspectorNavigation() {
   Fixture(L"Inspector A");Fixture(L"Inspector B");
   HWND owner=Open(L"Inspector A");Command(owner,IDC_NOTES_ADD_TAB);Type(owner,L"Original client text");Save(owner);
   auto &state=State(owner);const auto aRoot=state.clientRoot;
+  const auto pageCount=state.pages.size();
+  SendMessageW(owner,WM_COMMAND,MAKEWPARAM(IDC_NOTES_ADD_TAB,BN_SETFOCUS),0);
+  Check(state.pages.size()==pageCount,"Focusing New note does not create a note");
+  SendMessageW(owner,WM_COMMAND,MAKEWPARAM(IDC_NOTES_SWITCH_CLIENT,BN_SETFOCUS),0);
+  Check(!state.panel,"Focusing the client picker does not execute its action");
   Check(NotesWindowText(GetDlgItem(owner,IDC_NOTES_CLIENT_HEADING))==L"Notes" && NotesWindowText(GetDlgItem(owner,IDC_NOTES_MORE))==L"More \u2026","Notes header has one client selector and Windows More label");
   RECT before{},after{};GetWindowRect(Edit(owner),&before);Command(owner,IDC_NOTES_DETAILS);HWND panel=state.panel;
   Check(IsWindow(panel) && IsWindowEnabled(owner),"Details is a temporary panel with an enabled owner");
+  SendMessageW(owner,WM_COMMAND,MAKEWPARAM(IDC_NOTES_DETAILS,BN_KILLFOCUS),0);
+  Check(IsWindow(panel) && state.panel==panel,"A panel taking focus does not dismiss or reopen itself");
+  SendMessageW(owner,WM_COMMAND,MAKEWPARAM(IDC_CLIENT_NOTES_TEXT,EN_KILLFOCUS),0);
+  Check(IsWindow(panel) && state.panel==panel,"Editor focus loss does not dismiss the active inspector");
   ShowWindow(panel,SW_SHOW);
+  HWND statusCombo=GetDlgItem(panel,IDC_NOTES_STATUS_PICK);SetFocus(statusCombo);
+  SendMessageW(statusCombo,CB_SHOWDROPDOWN,TRUE,0);
+  MSG accept{};accept.hwnd=statusCombo;accept.message=WM_KEYDOWN;accept.wParam=VK_RETURN;
+  if (!ProcessNotesPanelMessage(accept)) {TranslateMessage(&accept);DispatchMessageW(&accept);}
+  Check(IsWindow(panel) && state.panel==panel,"Enter accepts the open status dropdown without closing Details");
+  SendMessageW(statusCombo,CB_SHOWDROPDOWN,FALSE,0);
   RECT panelRect{},field{};GetClientRect(panel,&panelRect);GetWindowRect(GetDlgItem(panel,IDC_NOTES_TAGS_EDIT),&field);
   MapWindowPoints(nullptr,panel,reinterpret_cast<POINT *>(&field),2);
   HDC screen=GetDC(panel),buffer=CreateCompatibleDC(screen);HBITMAP bitmap=CreateCompatibleBitmap(screen,panelRect.right,panelRect.bottom);auto oldBitmap=SelectObject(buffer,bitmap);
@@ -1245,7 +1264,65 @@ static void LauncherTrayTests() {
   ShowLauncherForeground(window);realTrayApi=false;
   Check(registered && IsWindowVisible(window) && !g_launcherTrayIcon,"Real Windows tray registration, version negotiation and removal succeed");DestroyWindow(window);
 }
-int wmain() {
+static unsigned closeRequests=0;
+static LRESULT CALLBACK CloseRaceProc(HWND window,UINT message,WPARAM w,LPARAM l) {
+  if(message==WM_CLOSE) {++closeRequests;return 0;} // Deliberate browser veto.
+  return DefWindowProcW(window,message,w,l);
+}
+static void CloseAllLaunchRace() {
+  Check(g_sessions.empty(),"Close-race fixture starts without client sessions");
+  const auto pid=GetCurrentProcessId();g_sessions.push_back({L"Close race QA",BrowserKind::Edge,pid});
+  answers.push_back(IDYES);RequestCloseAllClientsNormally();
+  Check(g_bCloseAllClientsPending && g_closeAllAwaitingWindows.size()==1 && g_closeAllAwaitingWindows.front().pid==pid &&
+        WaitForSingleObject(g_closeAllAwaitingWindows.front().process.get(),0)==WAIT_TIMEOUT,"Close all holds the tracked process identity while waiting for its first window");
+  WNDCLASSW kind{};kind.lpfnWndProc=CloseRaceProc;kind.hInstance=g_hInst;kind.lpszClassName=L"ctSpaces close race fixture";RegisterClassW(&kind);
+  HWND window=CreateWindowW(kind.lpszClassName,L"Browser close QA",WS_OVERLAPPEDWINDOW|WS_VISIBLE,50,50,250,100,nullptr,nullptr,g_hInst,nullptr);
+  WndProc(g_hGui,WM_TIMER,kCloseAllCheckTimer,0);PumpPanelMessages();
+  Check(closeRequests==1 && g_closeAllAwaitingWindows.empty(),"A late browser window receives the pending normal close request");
+  for(int i=0;i<8;++i) WndProc(g_hGui,WM_TIMER,kCloseAllCheckTimer,0);
+  PumpPanelMessages();Check(closeRequests==1 && IsWindow(window),"A browser close veto is respected without repeated close requests");
+  OnSessionEnded(pid);Check(!g_bCloseAllClientsPending && g_closeAllAwaitingWindows.empty(),"Session exit clears the pending close state");DestroyWindow(window);
+  g_sessions.push_back({L"Default",BrowserKind::Edge,pid});answers.push_back(IDYES);RequestCloseAllClientsNormally();
+  Check(!g_bCloseAllClientsPending,"Default sessions are excluded from the rapid-launch close path");answers.clear();g_sessions.clear();
+}
+static void CodeBorderRegression() {
+  Fixture(L"Code border QA");HWND owner=Open(L"Code border QA");Command(owner,IDC_NOTES_CLOSE_ALL);
+  std::string rtf=NotesCodeRtf({1,L"Get-Printer\r\n    Select-Object Name"});
+  const auto row=rtf.find("\\trowd");
+  std::string lead="\\pard\\plain\\f0\\fs24 ";for(int i=0;i<12;++i) lead+="Before the code box\\par ";
+  rtf.insert(row,lead);const auto tail=rtf.rfind('}');
+  std::string after;for(int i=0;i<18;++i) after+="After the code box\\par ";rtf.insert(tail,after);
+  Check(NotesAddPage(owner,State(owner),{L"Code border",true,rtf,{}}),"Code-border scroll fixture saves");
+  const auto codeId=State(owner).pages[State(owner).activePage].id;
+  SetWindowPos(owner,HWND_TOP,30,30,1120,960,SWP_SHOWWINDOW);PumpPanelMessages();
+  const auto inspect=[&](const char *label) {
+    HWND edit=Edit(owner);RECT area{};GetClientRect(edit,&area);PumpPanelMessages();
+    HDC screen=GetDC(edit),dc=CreateCompatibleDC(screen);
+    BITMAPINFO info{};info.bmiHeader.biSize=sizeof(BITMAPINFOHEADER);info.bmiHeader.biWidth=area.right;info.bmiHeader.biHeight=-area.bottom;info.bmiHeader.biPlanes=1;info.bmiHeader.biBitCount=32;
+    void *bits=nullptr;HBITMAP bitmap=CreateDIBSection(screen,&info,DIB_RGB_COLORS,&bits,nullptr,0);auto old=SelectObject(dc,bitmap);
+    BitBlt(dc,0,0,area.right,area.bottom,screen,0,0,SRCCOPY);GdiFlush();
+    const auto pixel=[&](int x,int y){return static_cast<DWORD*>(bits)[y*area.right+x]&0xFFFFFF;};
+    std::vector<int> borders;int left=-1,right=-1;
+    for(int y=0;y<area.bottom;++y) {
+      int run=0,start=0;for(int x=0;x<area.right;++x) {
+        if(pixel(x,y)==RGB(128,128,128)) {if(!run)start=x;++run;}
+        else {if(run>200) {borders.push_back(y);left=start;right=x-1;break;}run=0;}
+      }
+    }
+    bool complete=borders.size()==3 && left>=0 && right<area.right;
+    if(complete) {for(int y=borders.front();y<=borders.back();++y) complete=complete && pixel(left,y)==RGB(128,128,128) && pixel(right,y)==RGB(128,128,128);}
+    SelectObject(dc,old);DeleteObject(bitmap);DeleteDC(dc);ReleaseDC(edit,screen);Check(complete,label);
+  };
+  inspect("Native code box has all four borders before scrolling");
+  POINT position{0,180};SendMessageW(Edit(owner),EM_SETSCROLLPOS,0,reinterpret_cast<LPARAM>(&position));
+  inspect("Scrolling preserves all code borders without stale lines at the old position");
+  for(int i=0;i<24;++i) {SetWindowPos(owner,nullptr,0,0,1020+i%5*20,880+i%4*15,SWP_NOMOVE|SWP_NOZORDER);PumpPanelMessages();}
+  inspect("Repeated native resize preserves the entire code-box outline");
+  Command(owner,IDC_NOTES_ADD_TAB);Type(owner,L"Another cached note");Save(owner);
+  auto &state=State(owner);state.activePage=static_cast<size_t>(std::find_if(state.pages.begin(),state.pages.end(),[codeId](const auto &page){return page.id==codeId;})-state.pages.begin());Check(LoadNotesPage(owner,state),"Code note reopens from its cached editor");
+  inspect("Cached tab reveal retains complete code borders");CloseClientNotesDialog(owner,state);
+}
+int wmain(int argc,wchar_t **argv) {
   try {
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     CoInitializeEx(nullptr,COINIT_APARTMENTTHREADED);
@@ -1256,12 +1333,14 @@ int wmain() {
     fs::create_directories(g_sDataDir); g_sConfigPath=g_sDataDir/L"ctSpaces.ini";
     Fixture(L"Workspace QA"); Fixture(L"Destination QA");
     g_hGui=CreateWindowExW(0,L"STATIC",L"Notes test parent",WS_OVERLAPPED,0,0,100,100,nullptr,nullptr,g_hInst,nullptr);
+    if(argc>1 && !wcscmp(argv[1],L"--code-border")) {CodeBorderRegression();DestroyWindow(g_hGui);return 0;}
+    if(argc>1 && !wcscmp(argv[1],L"--close-race")) {CloseAllLaunchRace();DestroyWindow(g_hGui);return 0;}
     HWND dialog=Open(L"Workspace QA"); Tests(dialog); Extended(dialog); ResizeAndOverflow(dialog); FrameRegression(dialog); PickerAndTemplates(dialog); Walkthrough(dialog); GuidanceAndBulkTrash(dialog); Productivity(dialog); TicketCodeAndTopActions(dialog); AddDeleteTransitions(dialog); DirectTemplateEditing(dialog); DirectTrashAndCompactHelp(dialog); NotesLinksAndContextMenu(dialog); DestroyWindow(dialog);
     dialog=Open(L"Workspace QA");
     Check(!HasActiveNote(State(dialog)),"Zero open tabs persists across restart");
     Check((GetWindowLongPtrW(Edit(dialog),GWL_STYLE)&WS_VISIBLE)==0,"Restart empty state does not expose blank editor");
     Command(dialog,IDC_NOTES_ADD_TAB); Check(HasActiveNote(State(dialog)),"New note from empty state");
-    DestroyWindow(dialog);EmptyDraftRestart();CompactNormalSpacing();OldNotesSpacingUpgrade();DirectSnippetEditing();InspectorNavigation();NotesResizeWrapping();NotesTabOrdering();LauncherTrayTests();DestroyWindow(g_hGui);
+    DestroyWindow(dialog);EmptyDraftRestart();CompactNormalSpacing();OldNotesSpacingUpgrade();DirectSnippetEditing();InspectorNavigation();NotesResizeWrapping();NotesTabOrdering();LauncherTrayTests();CloseAllLaunchRace();CodeBorderRegression();DestroyWindow(g_hGui);
     std::cout << "Notes workspace: " << checks << " checks passed.\n"; return 0;
   } catch (const std::exception &error) { std::cerr << "FAIL: " << error.what() << std::endl; return 1; }
 }

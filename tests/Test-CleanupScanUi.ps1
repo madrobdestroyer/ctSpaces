@@ -5,6 +5,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot 'QaProcess.ps1')
 $projectRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
 $resolvedExe = [IO.Path]::GetFullPath($ExePath)
 $runId = [Guid]::NewGuid().ToString('N').Substring(0, 10)
@@ -27,7 +28,8 @@ function Get-FileFingerprint([string]$Path) {
 }
 $liveConfigBefore = Get-FileFingerprint $liveConfig
 
-Add-Type -ReferencedAssemblies System.Drawing -TypeDefinition @'
+. (Join-Path $PSScriptRoot 'QaDrawing.ps1')
+Add-Type -ReferencedAssemblies @(Get-QaDrawingReferences) -TypeDefinition @'
 using System;
 using System.Collections.Generic;
 using System.Drawing;
@@ -511,7 +513,7 @@ function Invoke-ManualScenario {
     $copyResult = [CleanupScanUiQa]::CopyDataResult($fixture.Main, $request)
     if ($copyResult -ne 0) { throw "Cleanup-busy WM_COPYDATA returned $copyResult instead of explicit rejection." }
     $exactProfile = [regex]::Escape((Join-Path $fixture.Sites ($fixture.Clients[0] + '\Browsers\edge\Profile')))
-    $launched = @(Get-CimInstance Win32_Process -Filter "Name='msedge.exe'" -ErrorAction SilentlyContinue |
+    $launched = @(Get-QaProcess Win32_Process -Filter "Name='msedge.exe'" -ErrorAction SilentlyContinue |
         Where-Object { $_.CommandLine -and $_.CommandLine -match $exactProfile })
     if ($launched.Count) { throw 'Cleanup-busy WM_COPYDATA launched the isolated browser profile.' }
 

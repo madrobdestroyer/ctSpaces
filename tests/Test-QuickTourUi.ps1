@@ -5,6 +5,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot 'QaProcess.ps1')
 $ExpectedDpis = @($ExpectedDpis | ForEach-Object { $_ -split ',' } | Where-Object { $_ -ne '' } | ForEach-Object { [uint32]$_ })
 $root = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
 $exe = [IO.Path]::GetFullPath($ExePath)
@@ -163,7 +164,7 @@ $expectedSteps=@(
     [pscustomobject]@{Title='Rename a client';Needles=@('every slot for that client to be closed','preserving browser slots','pinned position','Restore tabs choices','verified managed shortcut');Demo='Illustration only — no actions performed. Options > Rename Client. Client A becomes Client North; browser data and managed settings are kept.';Slug='rename-client'},
     [pscustomobject]@{Title='Archive and restore a client';Needles=@('hides a closed client without deleting browser data','Archived Clients','normal picker','not a backup');Demo='Illustration only — no actions performed. Options > Archive Client hides Client A. Options > Archived Clients restores Client A.';Slug='archive-restore'},
     [pscustomobject]@{Title='Put client names first';Needles=@('Client name first in window titles','browser and Alt+Tab titles','windows already open');Demo='Illustration only — no actions performed. Options > Client name first in window titles. Example: Client A — Browser.';Slug='client-first-titles'},
-    [pscustomobject]@{Title='Keep Client Notes';Needles=@('existing client','Settings > Client Notes','open its pin menu','Save keeps local notes','Save, Discard, and Cancel','does not open or edit');Demo='Illustration only: no actions performed. Select Client A, then Settings > Client Notes or open its pin menu. Save keeps local notes; leaving with edits offers Save, Discard, and Cancel.';Slug='client-notes'},
+    [pscustomobject]@{Title='Keep Client Notes';Needles=@('existing client','Settings > Client Notes','open its pin menu','Edits save automatically','Close finishes pending saves','does not open or edit');Demo='Illustration only: no actions performed. Select Client A, then Settings > Client Notes or open its pin menu. Add named ticket tabs with separate formatted notes. Edits save automatically.';Slug='client-notes'},
     [pscustomobject]@{Title='Clean up inactive clients';Needles=@('three calendar months','Unknown history begins a fresh tracking period','Archived clients can appear','selection, acknowledgement, and fresh safety checks','permanently deletes','Cannot be undone','back up first');Demo='Illustration only — no actions performed. Clean Up Inactive Clients... Select Client A/B, acknowledge, Delete Selected.';Slug='inactive-cleanup'},
     [pscustomobject]@{Title='Delete multiple clients now';Needles=@('no inactivity wait','archived clients','recheck open/safety state','all browser data','existing backups are retained','permanently deletes','Cannot be undone','back up first');Demo='Illustration only — no actions performed. Delete Multiple Clients... Select Client A/B, acknowledge, Delete Selected.';Slug='manual-delete'},
     [pscustomobject]@{Title='Open Options';Needles=@('client management','backup and restore','full guide','Quick tour');Demo='';Slug='options'}
@@ -256,7 +257,7 @@ try {
     # the overlay, then the reopened tour must recognize the populated session.
     $tour=Open-Tour;Assert([QuickTourQa]::CopyData($main,('--client "'+$client+'" --browser edge'))) 'Quick-Tour-time WM_COPYDATA launch was rejected.'
     Wait-TourClosed $tour 'WM_COPYDATA did not dismiss Quick Tour before launch handoff.'
-    $owned=Wait-Until{@(Get-CimInstance Win32_Process -Filter "Name='msedge.exe'" -ErrorAction SilentlyContinue|Where-Object{$_.CommandLine-and$_.CommandLine-match[regex]::Escape($profile)})} 'WM_COPYDATA did not launch the exact isolated Edge profile.' 20
+    $owned=Wait-Until{@(Get-QaProcess Win32_Process -Filter "Name='msedge.exe'" -ErrorAction SilentlyContinue|Where-Object{$_.CommandLine-and$_.CommandLine-match[regex]::Escape($profile)})} 'WM_COPYDATA did not launch the exact isolated Edge profile.' 20
     Wait-Until{[QuickTourQa]::IsWindowEnabled($main)} 'Launcher did not finish the isolated Edge handoff.' 15|Out-Null
     $sessionConfigBefore=Get-StableFingerprint $config;$tour=Open-Tour
     $sessionIndex=[array]::IndexOf(@($expectedSteps|ForEach-Object{$_.Title}),'Switch between open sessions')
@@ -267,7 +268,7 @@ try {
     Assert((Get-StableFingerprint $config)-eq$sessionConfigBefore) 'Populated-session tour changed preferences or pinned order.'
     $otherClients=@(Get-ChildItem -LiteralPath (Join-Path $data 'Sites') -Directory|Where-Object{$_.Name-ne$client-and$_.Name-ne$clientB});Assert($otherClients.Count-eq 0) 'Quick Tour or handoff created an unexpected client profile.'
     foreach($edgeProcess in @($owned)){[QuickTourQa]::ClosePidWindows([uint32]$edgeProcess.ProcessId)}
-    Wait-Until{@(Get-CimInstance Win32_Process -Filter "Name='msedge.exe'" -ErrorAction SilentlyContinue|Where-Object{$_.CommandLine-and$_.CommandLine-match[regex]::Escape($profile)}).Count-eq 0} 'Owned Edge profile did not close normally.' 15|Out-Null
+    Wait-Until{@(Get-QaProcess Win32_Process -Filter "Name='msedge.exe'" -ErrorAction SilentlyContinue|Where-Object{$_.CommandLine-and$_.CommandLine-match[regex]::Escape($profile)}).Count-eq 0} 'Owned Edge profile did not close normally.' 15|Out-Null
     Stop-QaApp
 
     Assert((Get-Fingerprint $liveConfig)-eq$liveConfigBefore) 'Live ctSpaces configuration changed.'

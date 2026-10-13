@@ -174,6 +174,7 @@ try {
     New-Item -ItemType Directory -Path $profilePath -Force | Out-Null
     New-Item -ItemType File -Path (Join-Path $profilePath 'ctSpaces') `
         -Force | Out-Null
+    [IO.File]::WriteAllText((Join-Path $dataRoot 'config.ini'),"[guide]`r`nwelcome_handled=1`r`n")
 
     $qaArguments = '--qa-instance=' + $runId +
         ' --qa-data-dir="' + $dataRoot + '"'
@@ -207,6 +208,9 @@ try {
     }
     [void][CtDialogQaNative]::SendMessageW(
         $combo, 0x014E, $itemIndex, [IntPtr]::Zero
+    )
+    [void][CtDialogQaNative]::SendMessageStringW(
+        [CtDialogQaNative]::GetDlgItem($launcherWindow,206),0x000C,[IntPtr]::Zero,$testName
     )
 
     if (-not [CtDialogQaNative]::PostMessageW(

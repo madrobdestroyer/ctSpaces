@@ -459,3 +459,16 @@ resolve the active note by stable ID, retaining cached editors and undo. Pinned
 and ordinary tabs reorder only within their own group. Reopening a closed note
 appends it to its group; selecting an open note does not move it. All note-opening
 routes share the save-before-switch helper. No notebook schema change is needed.
+
+## Whole-app review for 6.3.1.0
+
+See FULL_APP_STRESS_REVIEW_6.3.1.0.md for the 12 core and 16 integration suites,
+531 native Notes checks, actual Edge/Chrome coverage, retained failures, harness
+corrections and review limits. Test-FullApp.ps1 records each subprocess serially.
+The two narrated walkthroughs use live native-window recordings; their source
+and read-only Kokoro reuse instructions are in walkthrough/6.3.0-Heart.
+
+Notes focus notifications must not execute workspace commands or close an
+inspector. The caption excludes every header action from its drag area, and
+open dropdowns handle Enter/Escape before panel-level dismissal. Geometry
+changes queue editor background repainting to clear stale native table borders.

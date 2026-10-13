@@ -7,6 +7,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot 'QaProcess.ps1')
 $projectRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
 $resolvedExe = [IO.Path]::GetFullPath($ExePath)
 $iconBeforePath = Join-Path $projectRoot 'icons\color_b.ico'
@@ -632,10 +633,13 @@ function Open-LauncherClient {
     if ($selectedIndex.ToInt64() -ne $itemIndex.ToInt64()) {
         throw 'Could not select the disposable client.'
     }
+    [void][CtIconQaNative]::SendMessageStringW(
+        [CtIconQaNative]::GetDlgItem($LauncherWindow, 206), 0x000C, [IntPtr]::Zero, $ClientName
+    )
 
     $actualName = [Text.StringBuilder]::new(256)
     [void][CtIconQaNative]::SendMessageTextW(
-        $ComboWindow, 0x000D, [IntPtr]::new($actualName.Capacity), $actualName
+        [CtIconQaNative]::GetDlgItem($LauncherWindow, 206), 0x000D, [IntPtr]::new($actualName.Capacity), $actualName
     )
     if ($actualName.ToString() -ne $ClientName) {
         throw "The client field did not retain the QA name: '$actualName'"
@@ -693,7 +697,7 @@ function Test-ExactProfileCommandLine {
 }
 
 function Get-TestBrowserProcesses {
-    Get-CimInstance Win32_Process -Filter "Name = 'msedge.exe'" `
+    Get-QaProcess Win32_Process -Filter "Name = 'msedge.exe'" `
         -ErrorAction SilentlyContinue | Where-Object {
             Test-ExactProfileCommandLine $_.CommandLine
         }
@@ -712,7 +716,7 @@ function Open-VerifiedTestBrowserProcess {
             return $null
         }
         $null = $ownedProcess.SafeHandle
-        $current = Get-CimInstance Win32_Process -Filter (
+        $current = Get-QaProcess Win32_Process -Filter (
             'ProcessId = ' + [int]$ProfileProcess.ProcessId
         ) -ErrorAction Stop | Select-Object -First 1
         if (-not $current) {
@@ -893,6 +897,8 @@ try {
     Copy-Item -LiteralPath $resolvedExe -Destination (Join-Path $qaDir 'ctSpaces-icon-qa.exe') -Force
     Copy-Item -LiteralPath (Join-Path $projectRoot 'Default.7z') -Destination (Join-Path $qaDir 'Default.7z') -Force
     New-Item -ItemType File -Path (Join-Path $qaDir 'ctSpaces.portable') -Force | Out-Null
+    New-Item -ItemType Directory -Path $dataRoot -Force | Out-Null
+    [IO.File]::WriteAllText((Join-Path $dataRoot 'config.ini'), "[guide]`r`nwelcome_handled=1`r`n", [Text.UTF8Encoding]::new($false))
 
     if (Test-Path -LiteralPath $profilePath) {
         throw "Refusing to use an existing QA profile: $profilePath"
@@ -951,7 +957,7 @@ try {
     $deadline = [DateTime]::UtcNow.AddSeconds(15)
     do {
         Start-Sleep -Milliseconds 100
-        $launcherCim = Get-CimInstance Win32_Process `
+        $launcherCim = Get-QaProcess Win32_Process `
             -Filter "Name = 'ctSpaces-icon-qa.exe'" `
             -ErrorAction SilentlyContinue | Where-Object {
                 $_.ExecutablePath -and

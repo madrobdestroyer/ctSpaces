@@ -1,0 +1,12 @@
+tools/
+media-work/
+temp/
+output/
+*-recording-*/
+*receipt.json
+*-recording.json
+*-job.json
+read-only-resource-baseline.json
+timing.json
+inspect-*.json
+*.log

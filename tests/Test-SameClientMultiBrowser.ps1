@@ -4,6 +4,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot 'QaProcess.ps1')
 $projectRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
 $resolvedExe = [IO.Path]::GetFullPath($ExePath)
 $qaParent = [IO.Path]::GetFullPath((
@@ -422,7 +423,7 @@ function Get-QaOwnedBrowserDiagnostics {
         @{ Image = 'msedge.exe'; Path = $installedEdge; Expected = $edgeProfile },
         @{ Image = 'chrome.exe'; Path = $installedChrome; Expected = $chromeProfile }
     )) {
-        foreach ($process in @(Get-CimInstance Win32_Process -Filter (
+        foreach ($process in @(Get-QaProcess Win32_Process -Filter (
                     "Name = '$($pair.Image)'"
                 ) -ErrorAction SilentlyContinue)) {
             $profileArgument = Get-UserDataDirArgument $process.CommandLine
@@ -501,7 +502,7 @@ function Get-ProfileProcesses {
     )
 
     @(
-        Get-CimInstance Win32_Process -Filter "Name = '$ImageName'" |
+        Get-QaProcess Win32_Process -Filter "Name = '$ImageName'" |
             Where-Object {
                 Test-ExactProfileCommandLine $_.CommandLine $ProfilePath
             }
@@ -528,7 +529,7 @@ function Open-VerifiedProfileProcess {
         # Retain the process handle before re-reading identity. Subsequent Kill
         # therefore cannot target a different process that reuses this PID.
         $null = $ownedProcess.SafeHandle
-        $current = Get-CimInstance Win32_Process -Filter (
+        $current = Get-QaProcess Win32_Process -Filter (
             'ProcessId = ' + [int]$ProfileProcess.ProcessId
         ) -ErrorAction Stop | Select-Object -First 1
         if (-not $current) {

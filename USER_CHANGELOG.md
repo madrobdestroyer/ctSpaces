@@ -1,9 +1,9 @@
 # ctSpaces 6.3 What's New
 
-## 6.3.0.0 Notes review on the cpp branch
+## 6.3.1.0 Notes workspace and whole-app review
 
-This review keeps version 6.3.0.0 while the Notes redesign is being evaluated.
-It has not been published as a new GitHub release.
+This is one deliberate patch release after reviewing the Notes design and testing
+the full app. Intermediate fixes kept the existing version number.
 
 - Open Notes beside Close all, then switch clients with one searchable picker.
   Each notebook stays with its owning client.
@@ -20,7 +20,10 @@ It has not been published as a new GitHub release.
   dimensions. Unused Untitled drafts no longer keep consuming names.
 - The launcher comes forward when started and can optionally minimize to the tray.
 
-## Current 6.2.3.0 Update
+- Fixed delayed browser closure, stale code-box pixels, header click targets and
+  inspector focus/dropdown keyboard behavior during whole-app adversarial review.
+
+## Previous 6.2.3.0 Update
 
 - Fixed notes repainting during resizing and removed the unwanted native outer frame.
 - The highlighter arrow now offers yellow, green, blue, pink, and no highlight.

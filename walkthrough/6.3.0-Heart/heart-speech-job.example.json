@@ -1,0 +1,17 @@
+{
+  "runtime": "C:\\Users\\Rob\\AppData\\Local\\Programs\\Lumen Assistant Acceptance 20260916\\runtime",
+  "python": "C:\\Users\\Rob\\AppData\\Local\\Programs\\Lumen Assistant Acceptance 20260916\\runtime\\python.exe",
+  "model": "C:\\Users\\Rob\\AppData\\Local\\Lumen\\lumen-voice-assets\\voice\\tts\\kokoro-onnx\\kokoro-v1.0.onnx",
+  "voices": "C:\\Users\\Rob\\AppData\\Local\\Lumen\\lumen-voice-assets\\voice\\tts\\kokoro-onnx\\voices-v1.0.bin",
+  "voice": "af_heart",
+  "speed": 1.0,
+  "providers": [
+    "CPUExecutionProvider"
+  ],
+  "intraOpThreads": 2,
+  "interOpThreads": 1,
+  "espeakLibrary": "C:\\Users\\Rob\\AppData\\Local\\Programs\\Lumen Assistant Acceptance 20260916\\runtime\\site-packages\\espeakng_loader\\espeak-ng.dll",
+  "espeakData": "C:\\Users\\Rob\\AppData\\Local\\Programs\\Lumen Assistant Acceptance 20260916\\runtime\\site-packages\\espeakng_loader\\espeak-ng-data",
+  "outputDirectory": "C:\\Projects\\ctSpaces\\walkthrough\\6.3.0-Heart\\media-work",
+  "cues": []
+}

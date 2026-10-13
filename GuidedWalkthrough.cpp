@@ -276,25 +276,30 @@ const std::vector<Topic> kTopics = {
      L"launcher stays open. After confirmation, each browser receives a "
      L"normal close request. Temporary and Default editor windows stay open; "
      L"any session that remains open stays in the launcher."},
-    {L"client_notes", 3, L"Keep notes for a client",
-     L"Selected client's Settings or pinned client menu",
-     L"Select an existing client, then open Client Notes from Settings or "
-     L"open the menu for that client's pin. Notes are local to this client and can "
-     L"use the current light or dark theme. Existing notes open in Notes. "
+    {L"client_notes", 4, L"Keep notes for a client",
+     L"Notes beside Close all; one searchable client picker",
+     L"Click Notes beside Close all, or open Client Notes from a client's menu. "
+     L"Use the searchable client picker to switch notebooks. Notes stay local "
+     L"to their owning client and use the current light or dark theme. "
      L"Use + to open an Untitled tab immediately and double-click a tab to change "
      L"its name. Each tab has separate notes. Use the toolbar for headings, "
      L"font size, bold, italic, underline, highlighting, lists, checklists and links. "
-     L"Click a web link to open it in this client's selected browser space. "
+     L"Web and ticket links open in the PC's default browser, outside client profiles. "
      L"Edits and tab names save automatically after a brief typing pause. "
      L"The top-right X finishes any pending save. A save failure appears in the title; "
-     L"your draft stays open to retry or copy. Notes are local files and are not "
+     L"your draft stays open to retry or copy. Details shows ticket, status and tags. "
+     L"Templates and Snippets can be created and edited directly. All notes finds "
+     L"saved notes; closing a tab does not delete them. Trash restores deleted notes "
+     L"with no automatic expiry. Notes are local files and are not "
      L"encrypted, so avoid putting secrets in them. Notes travel with the "
      L"client when it is renamed, archived, restored, backed up, or restored "
      L"from backup. Deleting the client removes its notes too.",
      kClientNotesCommand, true, L"Client Notes",
      L"Client Notes now lets you close and reopen tabs without losing notes. "
-     L"All notes searches current, archived and recently deleted notes. "
-     L"Use More for templates, history, import/export and draft recovery. "
+     L"Open Notes beside Close all and use one searchable client picker. "
+     L"All notes searches saved notes; Trash offers recovery without automatic expiry. "
+     L"Use Details for ticket, status and tags; templates and snippets have direct editors. "
+     L"Links open in the PC's default browser. More offers searchable actions. "
      L"Edits autosave, undo survives tab switches, and the theme-based editor "
      L"remembers its size without a footer."},
 };

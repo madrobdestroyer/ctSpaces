@@ -100,3 +100,10 @@ ZIP SHA256: `EBFFB46E051465942E883F27B3EFB4ECD895E7728F6C8D82D11DAB8FDF9A86F8`
 ![Reopened Work log at the end of its group](screenshots/notes-tab-order-reopened.jpg)
 
 ![Incomplete code-box outline found after native resize and scrolling](screenshots/notes-code-border-regression.jpg)
+
+## Follow-up, October 13
+
+The code-border defect illustrated above is resolved in 6.3.1.0. Scroll, repeated
+resize and cached-editor pixel regressions pass. See
+[FULL_APP_STRESS_REVIEW_6.3.1.0.md](FULL_APP_STRESS_REVIEW_6.3.1.0.md) for the broader
+application review and additional real-input corrections.

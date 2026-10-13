@@ -366,6 +366,12 @@ static bool g_bClientListNavigated = false;
 static bool g_bSuppressClientSelectionCommit = false;
 static std::vector<std::wstring> g_allClientNames;
 static bool g_bCloseAllClientsPending = false;
+struct PendingClientClose {
+  DWORD pid;
+  std::shared_ptr<void> process; // Holds the process identity until delivery.
+};
+static std::vector<PendingClientClose> g_closeAllAwaitingWindows;
+static ULONGLONG g_closeAllDeadline = 0;
 static bool g_bExitWhenProfilesClose = false;
 static bool g_bClosePendingDuringLaunch = false;
 static bool g_bArchiveTaskInProgress = false;
@@ -506,6 +512,7 @@ IShellLink *shellLink = NULL;
 #define IDC_BTN_CLOSE_ALL 209
 #define IDC_BTN_NOTES 210
 constexpr UINT_PTR kCloseAllCheckTimer = 209;
+static bool RequestSessionCloseNormally(DWORD pid);
 
 // Config menu command IDs
 #define IDM_CTX_SET_PROFILE_ICON 41001
@@ -5882,7 +5889,22 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam,
   }
   case WM_TIMER:
     if (wParam == kCloseAllCheckTimer) {
+      if (!g_bCloseAllClientsPending) return 0;
+      // A tracked process can precede its first browser window. Retry only
+      // requests that have never reached a window, within the original grace
+      // period. Never resend after a browser receives WM_CLOSE: its unsaved
+      // changes prompt and cancellation remain the user's decision.
+      std::erase_if(g_closeAllAwaitingWindows, [](const PendingClientClose &target) {
+        const bool tracked = std::ranges::any_of(g_sessions, [&target](const Session &session) {
+          return session.pid == target.pid;
+        });
+        return !tracked || WaitForSingleObject(target.process.get(),0) != WAIT_TIMEOUT ||
+               RequestSessionCloseNormally(target.pid);
+      });
+      if (g_bCloseAllClientsPending && GetTickCount64() < g_closeAllDeadline)
+        return 0;
       KillTimer(hWnd, kCloseAllCheckTimer);
+      g_closeAllAwaitingWindows.clear();
       g_bCloseAllClientsPending = false;
       SetWindowTextW(g_hBtnCloseAll, L"Close all");
       SetUiState(true);
@@ -16831,8 +16853,12 @@ static LRESULT CALLBACK NotesEditSubclass(HWND edit, UINT message,
     DrawNotesChecklistMarkers(edit, dc);
     if (message == WM_PAINT) ReleaseDC(edit, dc);
   } else if (message == WM_CHAR || message == WM_VSCROLL || message == WM_MOUSEWHEEL ||
+             message == EM_SETSCROLLPOS || message == EM_SETZOOM ||
              message == EM_REPLACESEL || message == EM_SETCHARFORMAT || message == EM_EXSETSEL) {
-    InvalidateRect(edit, nullptr, FALSE);
+    // Native table borders can survive a partial scroll at their old position.
+    // Queue a complete editor background paint for geometry changes only.
+    InvalidateRect(edit, nullptr, message == WM_VSCROLL || message == WM_MOUSEWHEEL ||
+                                 message == EM_SETSCROLLPOS || message == EM_SETZOOM);
   }
   if (message == EM_UNDO || message == EM_REDO || message == WM_UNDO) {
     auto *state = reinterpret_cast<ClientNotesDialogState *>(
@@ -17005,8 +17031,13 @@ static LRESULT CALLBACK NotesWindowSubclass(HWND dialog, UINT message,
       if (bottom) return left ? HTBOTTOMLEFT : right ? HTBOTTOMRIGHT : HTBOTTOM;
       if (left || right) return left ? HTLEFT : HTRIGHT;
     }
-    RECT close{}; GetWindowRect(GetDlgItem(dialog, IDCANCEL), &close);
-    if (PtInRect(&close, point)) return HTCLIENT;
+    for (int control : {IDCANCEL, IDC_NOTES_SWITCH_CLIENT, IDC_NOTES_LIBRARY,
+                        IDC_NOTES_TRASH, IDC_NOTES_MORE, IDC_NOTES_HELP}) {
+      HWND button = GetDlgItem(dialog, control);
+      RECT bounds{};
+      if (button && (GetWindowLongPtrW(button, GWL_STYLE) & WS_VISIBLE) && GetWindowRect(button, &bounds) &&
+          PtInRect(&bounds, point)) return HTCLIENT;
+    }
     if (y < ScaleByDpi(42, GetDpiForWindow(dialog))) return HTCAPTION;
     return HTCLIENT;
   }
@@ -17140,7 +17171,7 @@ static void LayoutClientNotes(HWND dialog, UINT dpi) {
   if (!EqualRect(&previous, &document) || priorEditorBounds.right != document.right + ScaleByDpi(28, dpi)) {
     SendDlgItemMessageW(dialog, IDC_CLIENT_NOTES_TEXT, EM_SETRECT, 0, reinterpret_cast<LPARAM>(&document));
     SendDlgItemMessageW(dialog, IDC_CLIENT_NOTES_TEXT, EM_SETTARGETDEVICE, 0, 0);
-    InvalidateRect(GetDlgItem(dialog, IDC_CLIENT_NOTES_TEXT), nullptr, FALSE);
+    InvalidateRect(GetDlgItem(dialog, IDC_CLIENT_NOTES_TEXT), nullptr, TRUE);
   }
   // Let Windows coalesce resize paints. Child positioning already invalidates
   // changed controls; never synchronously redraw every editor and toolbar here.
@@ -17344,6 +17375,7 @@ static bool LoadNotesPage(HWND dialog, ClientNotesDialogState &state) {
     if (retirePrevious) DestroyWindow(previousEditor);
     // Invalidate after the final visibility swap so the document outline is
     // painted against the new child clipping region, never an intermediate one.
+    if (next) InvalidateRect(next,nullptr,TRUE);
     InvalidateRect(dialog,nullptr,FALSE);
   };
   if (!HasActiveNote(state)) {
@@ -18037,8 +18069,16 @@ static INT_PTR CALLBACK ClientNotesDlgProc(HWND dialog, UINT message,
     break;
   }
   case WM_COMMAND:
-    CloseNotesPanel(*state);
-    if (NotesWorkspaceCommand(dialog, *state, LOWORD(wParam))) return TRUE;
+    if (HIWORD(wParam) == BN_CLICKED) {
+      CloseNotesPanel(*state);
+      if (NotesWorkspaceCommand(dialog, *state, LOWORD(wParam))) return TRUE;
+    } else if (LOWORD(wParam) != IDC_CLIENT_NOTES_TEXT &&
+               LOWORD(wParam) != IDC_NOTES_STYLE && LOWORD(wParam) != IDC_NOTES_SIZE &&
+               LOWORD(wParam) != IDC_NOTES_FIND) {
+      // Owner-drawn buttons also send focus notifications. These must not
+      // execute an action or dismiss a panel that just took keyboard focus.
+      return FALSE;
+    }
     if (LOWORD(wParam) == IDC_NOTES_ADD_TAB || LOWORD(wParam) == IDC_NOTES_RENAME_TAB) {
       const bool adding = LOWORD(wParam) == IDC_NOTES_ADD_TAB;
       if (adding && state->pages.size() >= client_notes::kMaxPages)
@@ -23250,21 +23290,18 @@ static void RequestCloseAllClientsNormally() {
   g_bCloseAllClientsPending = true;
   SetWindowTextW(g_hBtnCloseAll, L"Closing...");
   SetUiState(false);
-  bool allPosted = true;
-  for (DWORD pid : processIds)
-    allPosted = RequestSessionCloseNormally(pid) && allPosted;
-  if (!allPosted) {
-    g_bCloseAllClientsPending = false;
-    SetWindowTextW(g_hBtnCloseAll, L"Close all");
-    SetUiState(true);
-    MessageBoxW(g_hGui,
-                L"At least one client browser could not receive the close "
-                L"request. It remains open; try closing it manually.",
-                L"Close all clients", MB_OK | MB_ICONWARNING);
-    return;
+  g_closeAllAwaitingWindows.clear();
+  g_closeAllDeadline = GetTickCount64() + kBrowserShutdownGraceMs;
+  for (DWORD pid : processIds) {
+    HANDLE handle=OpenProcess(SYNCHRONIZE,FALSE,pid);
+    if (!handle) continue;
+    std::shared_ptr<void> lifetime(handle,[](void *process) { CloseHandle(process); });
+    if (WaitForSingleObject(handle,0)==WAIT_TIMEOUT && !RequestSessionCloseNormally(pid))
+      g_closeAllAwaitingWindows.push_back({pid,std::move(lifetime)});
   }
-  if (!SetTimer(g_hGui, kCloseAllCheckTimer, kBrowserShutdownGraceMs,
+  if (!SetTimer(g_hGui, kCloseAllCheckTimer, 100,
                 nullptr)) {
+    g_closeAllAwaitingWindows.clear();
     g_bCloseAllClientsPending = false;
     SetWindowTextW(g_hBtnCloseAll, L"Close all");
     SetUiState(true);
@@ -23445,6 +23482,7 @@ static void OnSessionEnded(DWORD pid) {
   if (g_bCloseAllClientsPending &&
       !std::ranges::any_of(g_sessions, IsStandardClientSession)) {
     KillTimer(g_hGui, kCloseAllCheckTimer);
+    g_closeAllAwaitingWindows.clear();
     g_bCloseAllClientsPending = false;
     SetWindowTextW(g_hBtnCloseAll, L"Close all");
     SetUiState(true);

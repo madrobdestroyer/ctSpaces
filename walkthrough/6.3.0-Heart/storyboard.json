@@ -1,0 +1,24 @@
+{
+  "version": "6.3.1.0",
+  "voice": "af_heart",
+  "videos": [
+    {"id":"ctSpaces","title":"ctSpaces: everyday client workflows","chapters":[
+      {"id":"app-start","title":"A space for each client","text":"Welcome to C T Spaces. It keeps each client's browser sessions separate, so you can work with several clients without mixing accounts or cookies. This recording uses fictional demo clients and the real Windows application."},
+      {"id":"app-create","title":"Create and open a client","text":"Type a new client name, then choose Create. C T Spaces prepares that client's browser profile and opens the browser. The client becomes available in the launcher, and its open session appears as a tab."},
+      {"id":"app-find","title":"Find clients and pin favorites","text":"For existing clients, type part of the name to filter the list, then choose the match you want. Pin frequently used clients to keep them close. The text you type stays yours until you explicitly choose a result."},
+      {"id":"app-browser","title":"Choose a browser and restore tabs","text":"Choose the browser for the selected client. Edge and Chrome use independent profiles, even for the same client. Restore tabs is remembered for each client and browser pair, so you can decide which sessions should resume next time."},
+      {"id":"app-tools","title":"Settings and built-in guidance","text":"The settings menu brings together themes, client tools, backup and restore, and app guidance. Use the walkthrough when you need an explanation. Client archive hides a client reversibly, while delete removes its data after confirmation. Backups protect the whole collection."},
+      {"id":"app-close","title":"Close sessions and open Notes","text":"Close all asks the tracked client browsers to close while keeping the launcher open. You can cancel before anything closes, and browsers can still ask about unsaved work. Notes has its own button beside Close all, ready for the selected client."}
+    ]},
+    {"id":"Notes","title":"Client Notes: capture, organize and hand over","chapters":[
+      {"id":"notes-start","title":"Client notebooks and autosave","text":"Notes stay with their client. The client name at the top opens a searchable picker, with pinned and recent clients first. Each tab is one note. Start writing immediately, and edits save automatically after a pause, without a footer full of buttons."},
+      {"id":"notes-write","title":"Write, rename and reorder tabs","text":"The plus button opens a blank note without asking for a name. Double click its tab when you are ready to rename it. Use the formatting toolbar for readable headings, emphasis, and checklists. Drag tabs, or use the tab menu, to arrange your working notes."},
+      {"id":"notes-details","title":"Ticket details, status and tags","text":"Details brings together an optional ticket number, ticket link, local work status, and tags. These help you find and organize notes. Status does not synchronize a ticketing system. Ticket links and links in notes open in the PC's default browser, outside client profiles."},
+      {"id":"notes-template","title":"Create and use a template","text":"Templates are reusable starter notes shared across clients. You can create one directly here, give it a name and hint, edit its content, then save and use it. There is no need to create an ordinary note first just to turn it into a template."},
+      {"id":"notes-snippet","title":"Create and insert a snippet","text":"Snippets are smaller reusable blocks, such as a standard handover reminder or a troubleshooting command. Create and edit them in the snippets window, then insert a saved block at the cursor. A hint explains when the block is useful."},
+      {"id":"notes-code","title":"Labeled code boxes and work updates","text":"Choose Code to add a language label and a bordered box for commands, logs, or code. The contents stay editable text and are never executed. Add update inserts a dated work log entry, so progress and the next action stay with the same note."},
+      {"id":"notes-library","title":"Search, sort and recover from Trash","text":"All notes searches titles, text, tickets, status, and tags, including notes whose tabs are closed. Filters and sorting help narrow the list, and you can select several notes for one action. Trash is directly accessible. Deleted notes stay there until you restore them or confirm permanent removal."},
+      {"id":"notes-actions","title":"Search actions and prepare a handover","text":"More opens searchable actions with explanations. Type what you need instead of exploring a long menu. Handover export produces a readable file for sharing the selected note's context and progress. Help and the guided walkthrough are always available when you need to learn a feature."}
+    ]}
+  ]
+}

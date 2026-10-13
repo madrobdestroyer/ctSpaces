@@ -21,7 +21,8 @@ $liveHash = if (Test-Path -LiteralPath $liveConfig -PathType Leaf) {
     (Get-FileHash -LiteralPath $liveConfig).Hash
 } else { 'missing' }
 
-Add-Type -TypeDefinition @'
+. (Join-Path $PSScriptRoot 'QaDrawing.ps1')
+Add-Type -ReferencedAssemblies @(Get-QaDrawingReferences) -TypeDefinition @'
 using System;
 using System.Text;
 using System.Runtime.InteropServices;
@@ -172,7 +173,7 @@ public static class CleanupQa {
         return found;
     }
 }
-'@ -ReferencedAssemblies System.Drawing
+'@
 [CleanupQa]::ScreenshotPath = Join-Path $projectRoot ('build\cleanup-theme-' + $runId.Substring(0, 10) + '.png')
 function Wait-Until([scriptblock]$Check, [string]$Description) {
     $deadline = [DateTime]::UtcNow.AddSeconds(20)

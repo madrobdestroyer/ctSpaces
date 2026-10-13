@@ -249,6 +249,10 @@ static bool ProcessNotesPanelMessage(MSG &message) {
   }
   if (!panel || !IsWindow(panel) || (message.hwnd!=panel && !IsChild(panel,message.hwnd))) return false;
   if (message.message==WM_KEYDOWN && (message.wParam==VK_ESCAPE || message.wParam==VK_RETURN)) {
+    HWND focus=GetFocus();wchar_t kind[32]{};
+    if (focus && GetClassNameW(focus,kind,static_cast<int>(std::size(kind))) &&
+        !_wcsicmp(kind,L"ComboBox") && SendMessageW(focus,CB_GETDROPPEDSTATE,0,0))
+      return IsDialogMessageW(panel,&message)!=FALSE;
     auto *data=reinterpret_cast<NotesPanel *>(GetWindowLongPtrW(panel,DWLP_USER));
     SendMessageW(panel,WM_COMMAND,message.wParam==VK_ESCAPE || (data && data->details) ? IDCANCEL : IDOK,0);return true;
   }

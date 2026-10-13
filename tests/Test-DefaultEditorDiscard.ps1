@@ -5,6 +5,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot 'QaProcess.ps1')
 if ($Cycles -lt 1 -or $Cycles -gt 2) { throw 'Cycles must be 1 or 2.' }
 $projectRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
 $resolvedExe = [IO.Path]::GetFullPath($ExePath)
@@ -104,7 +105,7 @@ function Wait-Until([scriptblock]$Check, [string]$Description, [int]$Seconds = 2
 }
 function Get-ProfileProcesses {
     $needle = [IO.Path]::GetFullPath($data).TrimEnd('\')
-    @(Get-CimInstance Win32_Process -Filter "Name = 'msedge.exe'" -ErrorAction SilentlyContinue |
+    @(Get-QaProcess Win32_Process -Filter "Name = 'msedge.exe'" -ErrorAction SilentlyContinue |
         Where-Object { [string]$_.CommandLine -match [regex]::Escape($needle) })
 }
 function Get-ProfileProcessSnapshot {
@@ -253,7 +254,7 @@ try {
         DisposableDefaultRemoved=$true; ExistingClientMarkerUnchanged=$true;
         LiveConfigUnchanged=$true; LauncherReenabled=$true } | ConvertTo-Json
 } catch {
-    $processSnapshot = @(Get-CimInstance Win32_Process -Filter "Name = 'msedge.exe'" -ErrorAction SilentlyContinue |
+    $processSnapshot = @(Get-QaProcess Win32_Process -Filter "Name = 'msedge.exe'" -ErrorAction SilentlyContinue |
         Where-Object { [string]$_.CommandLine -match [regex]::Escape([IO.Path]::GetFullPath($data)) } |
         ForEach-Object { "pid=$($_.ProcessId) cmd=$($_.CommandLine)" }) -join [Environment]::NewLine
     $dialogSnapshot = ''
@@ -280,7 +281,7 @@ try {
     foreach ($qaBrowserPid in @($ownedBrowserPids)) {
         $process = Get-Process -Id $qaBrowserPid -ErrorAction SilentlyContinue
         if ($process) {
-            $owned = @(Get-CimInstance Win32_Process -Filter "ProcessId = $qaBrowserPid" -ErrorAction SilentlyContinue |
+            $owned = @(Get-QaProcess Win32_Process -Filter "ProcessId = $qaBrowserPid" -ErrorAction SilentlyContinue |
                 Where-Object { [string]$_.CommandLine -match [regex]::Escape([IO.Path]::GetFullPath($data)) })
             if ($owned) { Stop-Process -Id $qaBrowserPid -Force -ErrorAction SilentlyContinue }
         }

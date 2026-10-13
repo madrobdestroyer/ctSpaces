@@ -4,10 +4,12 @@ param(
     [string]$ExePath = (Join-Path $PSScriptRoot '..\dist\x64\Release\ctSpaces.exe'),
     [string]$ArtifactDirectory = (Join-Path $PSScriptRoot '..\build\client-productivity-ui'),
     [switch]$NotesOnly,
-    [switch]$VisualOnly
+    [switch]$VisualOnly,
+    [switch]$LauncherOnly
 )
 
 $ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot 'QaProcess.ps1')
 $root = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
 $exe = [IO.Path]::GetFullPath($ExePath)
 $run = [Guid]::NewGuid().ToString('N').Substring(0,10)
@@ -148,7 +150,7 @@ function Assert-TooltipPalette([uint32]$qaProcessId,[string]$theme,[long]$backgr
 function Save-Shot([IntPtr]$window,[string]$label){New-Item -ItemType Directory -Path $ArtifactDirectory -Force|Out-Null;$r=[ProductivityQa+Rect]::new();Assert([ProductivityQa]::GetWindowRect($window,[ref]$r)) "Cannot size $label screenshot.";$bmp=[Drawing.Bitmap]::new($r.Right-$r.Left,$r.Bottom-$r.Top);$g=[Drawing.Graphics]::FromImage($bmp);$dc=$g.GetHdc();try{Assert([ProductivityQa]::PrintWindow($window,$dc,2)) "Cannot capture $label."}finally{$g.ReleaseHdc($dc);$g.Dispose()};$path=Join-Path $ArtifactDirectory ($run+'-'+$label+'.png');$bmp.Save($path,[Drawing.Imaging.ImageFormat]::Png);$bmp.Dispose();$path}
 function Save-VisibleShot([IntPtr]$window,[string]$label){New-Item -ItemType Directory -Path $ArtifactDirectory -Force|Out-Null;[void][ProductivityQa]::SetForegroundWindow($window);Start-Sleep -Milliseconds 250;$r=[ProductivityQa+Rect]::new();Assert([ProductivityQa]::GetWindowRect($window,[ref]$r)) "Cannot size $label screenshot.";$bmp=[Drawing.Bitmap]::new($r.Right-$r.Left,$r.Bottom-$r.Top);$g=[Drawing.Graphics]::FromImage($bmp);try{$notesDc=$g.GetHdc();try{Assert([ProductivityQa]::PrintWindow($window,$notesDc,2)) 'Cannot render QA window.'}finally{$g.ReleaseHdc($notesDc)};$path=Join-Path $ArtifactDirectory ($run+'-'+$label+'.png');$bmp.Save($path,[Drawing.Imaging.ImageFormat]::Png);$path}finally{$g.Dispose();$bmp.Dispose()}}
 function Save-FilterShot([IntPtr]$main,[IntPtr]$combo){New-Item -ItemType Directory -Path $ArtifactDirectory -Force|Out-Null;Start-Sleep -Milliseconds 250;$r=[ProductivityQa+Rect]::new();Assert([ProductivityQa]::GetWindowRect($main,[ref]$r)) 'Cannot size filter screenshot.';$info=[ProductivityQa+ComboBoxInfo]::new();$info.Size=[Runtime.InteropServices.Marshal]::SizeOf($info);Assert([ProductivityQa]::GetComboBoxInfo($combo,[ref]$info)-and$info.List-ne[IntPtr]::Zero-and[ProductivityQa]::IsWindowVisible($info.List)) 'Filtered suggestion list is not visible for screenshot.';$listRect=[ProductivityQa+Rect]::new();Assert([ProductivityQa]::GetWindowRect($info.List,[ref]$listRect)) 'Cannot size suggestion list.';$r.Left=[Math]::Min($r.Left,$listRect.Left);$r.Top=[Math]::Min($r.Top,$listRect.Top);$r.Right=[Math]::Max($r.Right,$listRect.Right);$r.Bottom=[Math]::Max($r.Bottom,$listRect.Bottom);$bmp=[Drawing.Bitmap]::new($r.Right-$r.Left,$r.Bottom-$r.Top);$g=[Drawing.Graphics]::FromImage($bmp);try{$g.CopyFromScreen($r.Left,$r.Top,0,0,$bmp.Size,[Drawing.CopyPixelOperation]::SourceCopy);$path=Join-Path $ArtifactDirectory ($run+'-filter-and-close-all.png');$bmp.Save($path,[Drawing.Imaging.ImageFormat]::Png);$path}finally{$g.Dispose();$bmp.Dispose()}}
-function Owned-Edge([string]$name){$profile=Join-Path $data ('Sites\'+$name+'\Browsers\edge\Profile');@(Get-CimInstance Win32_Process -Filter "Name='msedge.exe'" -ErrorAction SilentlyContinue|Where-Object{$_.CommandLine-and$_.CommandLine.Contains($profile)})}
+function Owned-Edge([string]$name){$profile=Join-Path $data ('Sites\'+$name+'\Browsers\edge\Profile');@(Get-QaProcess Win32_Process -Filter "Name='msedge.exe'" -ErrorAction SilentlyContinue|Where-Object{$_.CommandLine-and$_.CommandLine.Contains($profile)})}
 function Wait-Notes {Wait-Until{[ProductivityQa]::FindWithChild([uint32]$process.Id,1317)} 'Client Notes dialog did not open.'}
 function Open-Notes([string]$name){Assert([ProductivityQa]::SetWindowTextW([ProductivityQa]::GetDlgItem($main,206),$name)) 'Could not select existing client.';Assert([ProductivityQa]::PostMessageW($main,0x111,[UIntPtr]41020,[IntPtr]::Zero)) 'Could not request Client Notes.';$opened=Wait-Notes;Wait-Saved $opened;$opened}
 function Wait-Saved([IntPtr]$notes){try{Wait-Until{[ProductivityQa]::ControlText([ProductivityQa]::GetDlgItem($notes,1333))-eq'Saved automatically'} 'Notes did not autosave.'|Out-Null}catch{throw ('Notes did not autosave at test line '+$MyInvocation.ScriptLineNumber+': '+[ProductivityQa]::ControlText([ProductivityQa]::GetDlgItem($notes,1333)))}}
@@ -266,6 +268,7 @@ try {
     $legacyFile=Join-Path $data ('Sites\'+$clientA+'\ctSpaces-client-notes.txt')
     [IO.File]::WriteAllText($legacyFile,'Existing legacy reminder',$utf8)
     $legacyHash=Fingerprint $legacyFile
+    if(-not $LauncherOnly) {
     $notes=Open-Notes $clientA
     $notesEdit=[ProductivityQa]::GetDlgItem($notes,1317);Assert($notesEdit-ne[IntPtr]::Zero) 'Notes editor is missing.'
     $firstBounds=[ProductivityQa+Rect]::new();[void][ProductivityQa]::GetWindowRect($notes,[ref]$firstBounds)
@@ -548,6 +551,7 @@ try {
         [pscustomobject]@{NotesAutosave=$true;TicketTabs=$true;ToolbarFormatting=$true;UndoRedo=$true;LargeDocument=$true;FailedSaveRetainsDraft=$true;ResizableEditor=$true;MinimumWidthFitsToolbar=$true;NoteLinksUseClientBrowser=$true;RepeatedLinksUseSameBrowser=$true;ObservedDpis=@($dpiObserved);MarineCapture=$marine;GothicCapture=$gothicShot;DefaultDarkCapture=$defaultDarkShot;EmptyDarkCapture=$blankShot}|ConvertTo-Json
         return
     }
+    }
     $zeroButton=[ProductivityQa]::GetDlgItem($main,209);Assert($zeroButton-ne[IntPtr]::Zero) 'Close all button is missing.'
     Assert(-not[ProductivityQa]::IsWindowEnabled($zeroButton)) 'Close all should be disabled with zero tracked sessions.'
     Assert(-not$process.HasExited) 'Launcher exited with zero sessions.'
@@ -577,10 +581,14 @@ try {
     Confirm-CloseAll
     foreach($name in @($clientA,$clientB)){Wait-Until{@(Owned-Edge $name).Count-eq 0} "Close all left $name running." 25|Out-Null}
     $process.Refresh();Assert(-not$process.HasExited) 'Close all exited the launcher after browser sessions.'
-    Assert((Fingerprint $noteFile)-eq$noteHash) 'Closing browsers changed Client Notes.'
+    if(-not $LauncherOnly) {Assert((Fingerprint $noteFile)-eq$noteHash) 'Closing browsers changed Client Notes.'}
     Assert((Fingerprint $liveConfig)-eq$liveBefore) 'Live ctSpaces configuration changed.'
-    Assert-NotesSizeAfterRestart
+    if(-not $LauncherOnly) {Assert-NotesSizeAfterRestart}
     $completed=$true
+    if($LauncherOnly) {
+        [pscustomobject]@{FilterMatches=2;TypedTextPreserved=$true;SelectionAndClickAway=$true;NewNameCreatedWithoutOpeningExisting=$true;CloseAllZeroOneAndMultiple=$true;CloseAllCancellationPreservesSession=$true;LauncherRetained=$true;LiveConfigUntouched=$true}|ConvertTo-Json
+        return
+    }
     [pscustomobject]@{FilterMatches=2;TypedTextPreserved=$true;SelectionAndClickAway=$true;NewNameCreatedWithoutOpeningExisting=$true;NotesAutosaved=$true;LegacyNotesPreserved=$true;NamedTicketTabs=$true;FormattingSurvivesReopen=$true;DuplicateNamesRejected=$true;FailedAutosaveRetainsDraft=$true;ObservedDpis=@($dpiObserved);CloseAllZeroOneAndMultiple=$true;CloseAllCancellationPreservesSession=$true;LauncherRetained=$true;MarineTooltipCount=$marineTooltipCount;GothicTooltipCount=$gothicTooltipCount;FilterAndLauncherCapture=$filterShot;MarineNotesCapture=$marine;GothicNotesCapture=$gothicShot;DefaultDarkCapture=$defaultDarkShot;EmptyDarkCapture=$blankShot;LiveConfigUntouched=$true}|ConvertTo-Json
 } finally {
     [ProductivityQa]::StopNotesServer()

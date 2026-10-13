@@ -2,11 +2,11 @@
 
 ctSpaces is a small Windows launcher for opening client-specific browser spaces. Each client can have an independent Microsoft Edge, Google Chrome, Brave, and Mozilla Firefox profile, so browser data stays separated both between clients and between browsers for the same client.
 
-The initial 6.0.0.0 milestone consolidated the previously shipped 5.2 and 5.3 work. The 6.1 release added client filtering, local notes, and Close All Clients. The current 6.3.0.0 release turns Client Notes into a complete local notebook: close and reopen tabs, All notes search, archive and Recently deleted, session undo per tab, crash recovery, version history, templates, import/export, and explicit cross-client transfer. The editor keeps the approved theme-based design, slimmer tabs, remembered window size, and autosave without a footer.
+The initial 6.0.0.0 milestone consolidated the previously shipped 5.2 and 5.3 work. The 6.1 release added client filtering, local notes, and Close All Clients. The current 6.3.1.0 release turns Client Notes into a complete local notebook: close and reopen tabs, All notes search, archive and Trash, session undo per tab, crash recovery, version history, templates, import/export, and explicit cross-client transfer. The full-width editor has one searchable client picker, on-demand Details and More panels, direct template/snippet editors, status, tags, work logs, code boxes and readable handovers. It keeps theme colors, slim tabs, remembered size and autosave without a footer. Note links open in the PC default browser.
 
-See [release notes](RELEASE_NOTES_6.3.0.0.md),
+See [release notes](RELEASE_NOTES_6.3.1.0.md),
 [guide help](docs/GUIDED_WALKTHROUGH.md), and the
-[current release validation](docs/RELEASE_VALIDATION_6.3.0.0.md). The
+[current release validation](docs/RELEASE_VALIDATION_6.3.1.0.md). The
 [6.0.0.0 release notes](RELEASE_NOTES_6.0.0.0.md) and
 [validation report](docs/RELEASE_VALIDATION_6.0.0.0.md) remain available as
 historical records.
@@ -18,8 +18,8 @@ original project.
 
 ## Download
 
-Download the application ZIP [`ctSpaces6.3.0.0.zip`](https://github.com/madrobdestroyer/ctSpaces/releases/download/v6.3.0.0/ctSpaces6.3.0.0.zip)
-from [ctSpaces 6.3 / tag v6.3.0.0](https://github.com/madrobdestroyer/ctSpaces/releases/tag/v6.3.0.0),
+Download the application ZIP [`ctSpaces6.3.1.0.zip`](https://github.com/madrobdestroyer/ctSpaces/releases/download/v6.3.1.0/ctSpaces6.3.1.0.zip)
+from [ctSpaces 6.3 / tag v6.3.1.0](https://github.com/madrobdestroyer/ctSpaces/releases/tag/v6.3.1.0),
 extract it to a folder, and run `ctSpaces.exe`. The runtime ZIP contains only
 `ctSpaces.exe`; documentation, release history, source, and license notices
 remain available in this GitHub repository.
