@@ -136,7 +136,6 @@ try {
 } catch {if($process){Write-Output ([VideoUi]::Windows([uint32]$process.Id))};throw} finally {
  if($recorder-and-not$recorder.HasExited){[IO.File]::WriteAllText((Join-Path $run 'stop'),'stop',$utf8);[void]$recorder.WaitForExit(30000)}
  if($notes-ne[IntPtr]::Zero-and[VideoUi]::IsWindow($notes)){[void][VideoUi]::PostMessageW($notes,0x10,[UIntPtr]::Zero,[IntPtr]::Zero)}
- foreach($pidValue in $browserPids){$window=[VideoUi]::Find([uint32]$pidValue,'Chrome_WidgetWin_1',0);if($window-ne[IntPtr]::Zero){[void][VideoUi]::PostMessageW($window,0x10,[UIntPtr]::Zero,[IntPtr]::Zero)}}
  foreach($browserName in @('msedge.exe','chrome.exe')) {foreach($owned in @(Get-QaProcess -Filter ("Name='"+$browserName+"'")|Where-Object{$_.CommandLine-and$_.CommandLine.Contains($data)})) {$window=[VideoUi]::Find([uint32]$owned.ProcessId,'Chrome_WidgetWin_1',0);if($window-ne[IntPtr]::Zero){[void][VideoUi]::PostMessageW($window,0x10,[UIntPtr]::Zero,[IntPtr]::Zero)}}}
  if($main-ne[IntPtr]::Zero){[void][VideoUi]::PostMessageW($main,0x10,[UIntPtr]::Zero,[IntPtr]::Zero)}
  if($process){[void]$process.WaitForExit(8000);if(-not$process.HasExited){$process.Kill()}}

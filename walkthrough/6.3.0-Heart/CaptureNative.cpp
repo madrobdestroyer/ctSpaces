@@ -11,6 +11,8 @@
 #include <vector>
 #include <algorithm>
 #include <chrono>
+#include <map>
+#include <memory>
 #include <stdexcept>
 #include "../../ClientNotes.h"
 using Microsoft::WRL::ComPtr;
@@ -70,8 +72,17 @@ int wmain(int argc,wchar_t **argv) {
     HBRUSH background=CreateSolidBrush(RGB(18,19,23));RECT frame{0,0,width,height};
     const auto begin=std::chrono::steady_clock::now();std::ofstream(ready)<<"ready";
     UINT64 frames=0,changed=0;DWORD previousHash=0;LONGLONG lastTime=0;
+    std::map<DWORD,std::shared_ptr<void>> identities;
     while(!fs::exists(stop) && frames<fps*900) {
-      CaptureWindows collection;std::ifstream owners(allowed);DWORD pid;while(owners>>pid) collection.pids.push_back(pid);
+      CaptureWindows collection;std::ifstream owners(allowed);DWORD pid;
+      while(owners>>pid) {
+        auto identity=identities.find(pid);
+        if(identity==identities.end()) {
+          HANDLE process=OpenProcess(SYNCHRONIZE,FALSE,pid);if(!process)continue;
+          identity=identities.emplace(pid,std::shared_ptr<void>(process,[](void *p){CloseHandle(p);})).first;
+        }
+        if(WaitForSingleObject(identity->second.get(),0)==WAIT_TIMEOUT)collection.pids.push_back(pid);
+      }
       EnumWindows([](HWND window,LPARAM data)->BOOL {auto &c=*reinterpret_cast<CaptureWindows*>(data);DWORD pid=0;GetWindowThreadProcessId(window,&pid);if(IsWindowVisible(window)&&!IsIconic(window)&&std::find(c.pids.begin(),c.pids.end(),pid)!=c.pids.end()) c.windows.push_back(window);return TRUE;},reinterpret_cast<LPARAM>(&collection));
       FillRect(canvas,&frame,background);
       RECT bounds{};bool hasBounds=false;
