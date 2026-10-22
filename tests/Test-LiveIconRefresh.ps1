@@ -3,7 +3,8 @@ param(
     [ValidateRange(0, 25)]
     [int]$ManualIterations = 0,
     [string]$AutoFetchDomain = '',
-    [string]$TaskbarScreenshotPath = ''
+    [string]$TaskbarScreenshotPath = '',
+    [switch]$KeepFixture
 )
 
 $ErrorActionPreference = 'Stop'
@@ -25,6 +26,9 @@ $fileDialog = [IntPtr]::Zero
 $inputDialog = [IntPtr]::Zero
 $successDialog = [IntPtr]::Zero
 $oldDpiContext = [IntPtr]::Zero
+$qaSucceeded = $false
+$testedExecutableHash = $null
+$manualLiveUpdates = 0
 $versionHeader = Get-Content -Raw -LiteralPath (Join-Path $projectRoot 'version.h')
 $displayVersionMatch = [regex]::Match(
     $versionHeader,
@@ -888,6 +892,35 @@ function Close-LauncherMessageBox {
     }
 }
 
+function Wait-ManualIconCompletion {
+    param([uint32]$LauncherProcessId, [string]$Context)
+
+    # GetOpenFileName destroys its picker before GuiSetIcon resumes staging and
+    # atomic commit. Its result confirmation is the application-owned completion
+    # barrier; checking client.ico immediately on picker destruction races it.
+    $deadline = [DateTime]::UtcNow.AddSeconds(10)
+    do {
+        if ($launcherProcess.HasExited) {
+            throw "$Context launcher exited before reporting icon completion."
+        }
+        $dialog = [CtIconQaNative]::FindProcessWindowByClass($LauncherProcessId, '#32770')
+        if ($dialog -ne [IntPtr]::Zero) {
+            $title = [Text.StringBuilder]::new(256)
+            [void][CtIconQaNative]::GetWindowTextW($dialog, $title, $title.Capacity)
+            $body = [CtIconQaNative]::GetDescendantTextByClass($dialog, 'Static')
+            if ($title.ToString() -eq 'Success' -and $body.Contains('Icon has been configured.')) {
+                return $dialog
+            }
+            if ($body -and $title.ToString() -ne 'Open') {
+                throw "$Context reported '$title': $body"
+            }
+        }
+        Start-Sleep -Milliseconds 75
+    } while ([DateTime]::UtcNow -lt $deadline)
+    $windows = [CtIconQaNative]::DescribeProcessWindows($LauncherProcessId)
+    throw "$Context did not report successful icon completion within 10 seconds. Windows: $windows"
+}
+
 try {
     $oldDpiContext = [CtIconQaNative]::SetThreadDpiAwarenessContext(
         [IntPtr]::new(-4)
@@ -895,6 +928,7 @@ try {
 
     New-Item -ItemType Directory -Path $qaDir -Force | Out-Null
     Copy-Item -LiteralPath $resolvedExe -Destination (Join-Path $qaDir 'ctSpaces-icon-qa.exe') -Force
+    $testedExecutableHash = (Get-FileHash -LiteralPath (Join-Path $qaDir 'ctSpaces-icon-qa.exe') -Algorithm SHA256).Hash
     Copy-Item -LiteralPath (Join-Path $projectRoot 'Default.7z') -Destination (Join-Path $qaDir 'Default.7z') -Force
     New-Item -ItemType File -Path (Join-Path $qaDir 'ctSpaces.portable') -Force | Out-Null
     New-Item -ItemType Directory -Path $dataRoot -Force | Out-Null
@@ -1110,23 +1144,14 @@ try {
     }
     $fileDialog = [IntPtr]::Zero
 
+    $successDialog = Wait-ManualIconCompletion `
+        -LauncherProcessId ([uint32]$launcherProcess.Id) -Context 'Set Profile Icon'
+
     $expectedIconHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $iconAfterPath).Hash
     $actualIconHash = (Get-FileHash -Algorithm SHA256 `
         -LiteralPath (Join-Path $profilePath 'client.ico')).Hash
     if ($actualIconHash -ne $expectedIconHash) {
         throw 'The Set Profile Icon picker closed without applying the QA icon.'
-    }
-
-    $deadline = [DateTime]::UtcNow.AddSeconds(10)
-    do {
-        Start-Sleep -Milliseconds 100
-        $successDialog = [CtIconQaNative]::FindProcessWindowByClass(
-            [uint32]$launcherProcess.Id, '#32770'
-        )
-    } while ($successDialog -eq [IntPtr]::Zero -and
-             [DateTime]::UtcNow -lt $deadline)
-    if ($successDialog -eq [IntPtr]::Zero) {
-        throw 'Set Profile Icon did not show its success confirmation.'
     }
 
     $deadline = [DateTime]::UtcNow.AddSeconds(12)
@@ -1140,6 +1165,7 @@ try {
     if (-not $afterIcon -or $afterIcon.SHA256 -eq $beforeIcon.SHA256) {
         throw 'Set Profile Icon did not update the live browser window.'
     }
+    ++$manualLiveUpdates
 
     Close-LauncherMessageBox -Dialog $successDialog `
         -LauncherWindow $launcherWindow
@@ -1166,24 +1192,15 @@ try {
         }
         $fileDialog = [IntPtr]::Zero
 
+        $successDialog = Wait-ManualIconCompletion `
+            -LauncherProcessId ([uint32]$launcherProcess.Id) -Context "Manual icon iteration $iteration"
+
         $expectedIconHash = (Get-FileHash -Algorithm SHA256 `
             -LiteralPath $nextIconPath).Hash
         $actualIconHash = (Get-FileHash -Algorithm SHA256 `
             -LiteralPath (Join-Path $profilePath 'client.ico')).Hash
         if ($actualIconHash -ne $expectedIconHash) {
             throw "Manual icon iteration $iteration did not commit its icon file."
-        }
-
-        $deadline = [DateTime]::UtcNow.AddSeconds(10)
-        do {
-            Start-Sleep -Milliseconds 100
-            $successDialog = [CtIconQaNative]::FindProcessWindowByClass(
-                [uint32]$launcherProcess.Id, '#32770'
-            )
-        } while ($successDialog -eq [IntPtr]::Zero -and
-                 [DateTime]::UtcNow -lt $deadline)
-        if ($successDialog -eq [IntPtr]::Zero) {
-            throw "Manual icon iteration $iteration did not show success."
         }
 
         $deadline = [DateTime]::UtcNow.AddSeconds(12)
@@ -1198,6 +1215,7 @@ try {
             $currentIcon.SHA256 -eq $previousIcon.SHA256) {
             throw "Manual icon iteration $iteration did not update the live window."
         }
+        ++$manualLiveUpdates
 
         Close-LauncherMessageBox -Dialog $successDialog `
             -LauncherWindow $launcherWindow
@@ -1358,7 +1376,10 @@ try {
         $autoFetchChangedLive = $true
     }
 
+    $qaSucceeded = $true
     [pscustomobject]@{
+        Executable = $resolvedExe
+        TestedExecutableSha256 = $testedExecutableHash
         Client = $testName
         ShortcutTaskbarAppId = $observedShortcutAppId
         LauncherStartedThroughClientAppIdShortcut = $true
@@ -1366,7 +1387,9 @@ try {
         LauncherTaskbarAppId = $launcherTaskbarAppId
         WindowIconBefore = $beforeIcon.SHA256
         WindowIconAfter = $afterIcon.SHA256
-        WindowIconChangedLive = $afterIcon.SHA256 -ne $beforeIcon.SHA256
+        WindowIconChangedLive = $manualLiveUpdates -gt 0 -or $afterIcon.SHA256 -ne $beforeIcon.SHA256
+        ManualLiveIconUpdatesObserved = $manualLiveUpdates
+        FinalWindowIconMatchesInitial = $afterIcon.SHA256 -eq $beforeIcon.SHA256
         ChangedThroughSetProfileIcon = $changedThroughSetProfileIcon
         ManualIconChanges = $ManualIterations
         AutoFetchDomain = $AutoFetchDomain
@@ -1380,6 +1403,40 @@ try {
         TaskbarScreenshot = $taskbarScreenshot
         ChangedBeforeSuccessDismissed = $true
     } | ConvertTo-Json
+} catch {
+    $failure = $_
+    try {
+        $dialog = if ($launcherProcess) {
+            [CtIconQaNative]::FindProcessWindowByClass([uint32]$launcherProcess.Id, '#32770')
+        } else { [IntPtr]::Zero }
+        $dialogTitle = [Text.StringBuilder]::new(256)
+        $dialogBody = ''
+        if ($dialog -ne [IntPtr]::Zero) {
+            [void][CtIconQaNative]::GetWindowTextW($dialog, $dialogTitle, $dialogTitle.Capacity)
+            $dialogBody = [CtIconQaNative]::GetDescendantTextByClass($dialog, 'Static')
+        }
+        $failedIconHash = try {
+            (Get-FileHash -LiteralPath (Join-Path $profilePath 'client.ico') -Algorithm SHA256).Hash
+        } catch { 'UNREADABLE: ' + $_.Exception.Message }
+        [pscustomobject]@{
+            Error = $failure.Exception.Message
+            Fixture = $qaDir
+            Executable = $resolvedExe
+            ExecutableSha256 = $testedExecutableHash
+            Client = $testName
+            ExpectedIconPath = $iconAfterPath
+            ExpectedIconSha256 = (Get-FileHash -LiteralPath $iconAfterPath -Algorithm SHA256).Hash
+            ActualIconSha256 = $failedIconHash
+            ApplicationDialogTitle = $dialogTitle.ToString()
+            ApplicationDialogBody = $dialogBody
+            ApplicationWindows = if ($launcherProcess) {
+                [CtIconQaNative]::DescribeProcessWindows([uint32]$launcherProcess.Id)
+            } else { '' }
+        } | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $qaDir 'failure.json')
+    } catch {
+        Write-Warning "Could not record live icon failure: $($_.Exception.Message)"
+    }
+    throw $failure
 } finally {
     if ($successDialog -ne [IntPtr]::Zero) {
         $successButton = [CtIconQaNative]::GetDlgItem($successDialog, 1)
@@ -1398,9 +1455,24 @@ try {
         )
     }
     if ($browserWindow -ne [IntPtr]::Zero) {
-        [void][CtIconQaNative]::PostMessageW(
-            $browserWindow, 0x0010, [IntPtr]::Zero, [IntPtr]::Zero
-        )
+        [uint32]$windowProcessId = 0
+        [void][CtIconQaNative]::GetWindowThreadProcessId($browserWindow, [ref]$windowProcessId)
+        $windowProfileProcess = Get-TestBrowserProcesses | Where-Object {
+            [uint32]$_.ProcessId -eq $windowProcessId
+        } | Select-Object -First 1
+        if ($windowProfileProcess) {
+            $ownedWindowProcess = $null
+            try {
+                $ownedWindowProcess = Open-VerifiedTestBrowserProcess $windowProfileProcess
+                if ($ownedWindowProcess -and -not $ownedWindowProcess.HasExited) {
+                    [void][CtIconQaNative]::PostMessageW(
+                        $browserWindow, 0x0010, [IntPtr]::Zero, [IntPtr]::Zero
+                    )
+                }
+            } finally {
+                if ($ownedWindowProcess) { $ownedWindowProcess.Dispose() }
+            }
+        }
         Start-Sleep -Seconds 2
     }
 
@@ -1442,14 +1514,16 @@ try {
 
     $expectedSitesRoot = [IO.Path]::GetFullPath($sitesRoot)
     $resolvedProfile = [IO.Path]::GetFullPath($profilePath)
-    if ($testName.StartsWith('__ctSpacesIconQA_', [StringComparison]::Ordinal) -and
+    if ($qaSucceeded -and -not $KeepFixture -and
+        $testName.StartsWith('__ctSpacesIconQA_', [StringComparison]::Ordinal) -and
         [IO.Path]::GetFullPath((Split-Path -Parent $resolvedProfile)) -eq $expectedSitesRoot -and
         (Test-Path -LiteralPath $resolvedProfile)) {
         Remove-Item -LiteralPath $resolvedProfile -Recurse -Force
     }
 
     $resolvedQaDir = [IO.Path]::GetFullPath($qaDir)
-    if ((Split-Path -Leaf $resolvedQaDir).StartsWith(
+    if ($qaSucceeded -and -not $KeepFixture -and
+        (Split-Path -Leaf $resolvedQaDir).StartsWith(
             '.qa-icon-refresh-',
             [StringComparison]::Ordinal
         ) -and $resolvedQaDir.StartsWith(
@@ -1469,5 +1543,8 @@ try {
 
     if ($oldDpiContext -ne [IntPtr]::Zero) {
         [void][CtIconQaNative]::SetThreadDpiAwarenessContext($oldDpiContext)
+    }
+    if (-not $qaSucceeded -or $KeepFixture) {
+        Write-Output "Live icon QA fixture retained: $resolvedQaDir"
     }
 }

@@ -26,6 +26,10 @@ static HINSTANCE g_hInst = nullptr;
 static HWND g_hWnd = nullptr;   // owned popup (has caption)
 static HWND g_hBar = nullptr;   // progress bar control
 static HWND g_hOwner = nullptr; // main GUI window
+static HWND g_hDetail = nullptr;
+static HWND g_hItem = nullptr;
+static std::wstring g_details;
+static HFONT g_hLabelFont = nullptr;
 
 static std::wstring g_baseText;
 static int g_lastPercent = 0;
@@ -43,6 +47,16 @@ static const wchar_t *kProgClass = L"ctSpaces.ProgressUI";
 // Forward decl
 static void LayoutControls();
 static void RepositionInOwner(HWND owner, int desiredW, int desiredH);
+static void UpdateLabelFont() {
+  NONCLIENTMETRICSW metrics{sizeof(metrics)};
+  if(!SystemParametersInfoForDpi(SPI_GETNONCLIENTMETRICS,sizeof(metrics),&metrics,0,g_dpi))return;
+  HFONT created=CreateFontIndirectW(&metrics.lfMessageFont);
+  if(!created)return;
+  for(HWND label:{g_hDetail,g_hItem})
+    if(label && IsWindow(label))SendMessageW(label,WM_SETFONT,reinterpret_cast<WPARAM>(created),TRUE);
+  if(g_hLabelFont)DeleteObject(g_hLabelFont);
+  g_hLabelFont=created;
+}
 
 static int ScaleByDpi(int value, UINT dpi) {
   return MulDiv(value, dpi, USER_DEFAULT_SCREEN_DPI);
@@ -92,6 +106,11 @@ static LRESULT CALLBACK ProgressWndProc(HWND hWnd, UINT msg, WPARAM wParam,
     return 0;
   }
 
+  case WM_CTLCOLORSTATIC:
+    SetTextColor(reinterpret_cast<HDC>(wParam),g_crText);
+    SetBkColor(reinterpret_cast<HDC>(wParam),g_crWindow);
+    return reinterpret_cast<LRESULT>(g_hbrWindow?g_hbrWindow:GetSysColorBrush(COLOR_BTNFACE));
+
   case WM_SIZE:
     LayoutControls();
     return 0;
@@ -99,6 +118,7 @@ static LRESULT CALLBACK ProgressWndProc(HWND hWnd, UINT msg, WPARAM wParam,
   case WM_DPICHANGED: {
     const UINT dpi = HIWORD(wParam);
     g_dpi = (dpi ? dpi : USER_DEFAULT_SCREEN_DPI);
+    UpdateLabelFont();
     const RECT *rc = reinterpret_cast<RECT *>(lParam);
     if (rc) {
       SetWindowPos(hWnd, nullptr, rc->left, rc->top, rc->right - rc->left,
@@ -114,6 +134,9 @@ static LRESULT CALLBACK ProgressWndProc(HWND hWnd, UINT msg, WPARAM wParam,
   case WM_NCDESTROY:
     g_hWnd = nullptr;
     g_hBar = nullptr;
+    g_hDetail = nullptr;
+    g_hItem = nullptr;
+    if(g_hLabelFont){DeleteObject(g_hLabelFont);g_hLabelFont=nullptr;}
     return 0;
   }
 
@@ -172,6 +195,11 @@ static void EnsureWindow(HWND owner) {
 
   g_hBar = CreateWindowExW(0, PROGRESS_CLASSW, L"", WS_CHILD | WS_VISIBLE, 0, 0,
                            10, 10, g_hWnd, nullptr, g_hInst, nullptr);
+  g_hDetail = CreateWindowExW(0,L"STATIC",L"",WS_CHILD|SS_LEFT|SS_NOPREFIX|SS_ENDELLIPSIS,
+      0,0,10,10,g_hWnd,nullptr,g_hInst,nullptr);
+  g_hItem = CreateWindowExW(0,L"STATIC",L"",WS_CHILD|SS_LEFT|SS_NOPREFIX|SS_PATHELLIPSIS,
+      0,0,10,10,g_hWnd,nullptr,g_hInst,nullptr);
+  UpdateLabelFont();
 
   SetWindowTheme(g_hBar, L"Explorer", nullptr);
   SendMessageW(g_hBar, PBM_SETBKCOLOR, 0, g_crBarBk);
@@ -243,6 +271,13 @@ static void LayoutControls() {
   int x = padX;
   int y = (h - barH) / 2;
 
+  if(!g_details.empty()){
+    const int padY=ScaleByDpi(9,g_dpi),lineH=ScaleByDpi(19,g_dpi);
+    MoveWindow(g_hDetail,padX,padY,barW,lineH,TRUE);
+    MoveWindow(g_hItem,padX,padY+lineH,barW,lineH,TRUE);
+    y=h-barH-padY;
+  }
+
   MoveWindow(g_hBar, x, y, barW, barH, TRUE);
 }
 
@@ -273,6 +308,8 @@ void ProgressUI_Show(HWND owner, const std::wstring &baseText, int percent) {
   EnsureWindow(owner);
 
   g_baseText = baseText;
+  g_details.clear();
+  ShowWindow(g_hDetail,SW_HIDE);ShowWindow(g_hItem,SW_HIDE);
   g_lastPercent = (percent < 0) ? 0 : (std::clamp)(percent, 0, 100);
 
   // Set *progress window* caption (this fixes "no text in the title")
@@ -294,20 +331,30 @@ void ProgressUI_Show(HWND owner, const std::wstring &baseText, int percent) {
   UpdateWindow(g_hWnd);
 }
 
-void ProgressUI_Update(int percent) { ProgressUI_Update(g_baseText, percent); }
+void ProgressUI_Update(int percent) { ProgressUI_Update(g_baseText, percent,g_details); }
 
 void ProgressUI_Update(const std::wstring &baseText, int percent) {
+  ProgressUI_Update(baseText,percent,L"");
+}
+
+void ProgressUI_Update(const std::wstring &baseText,int percent,const std::wstring &details) {
   if (!g_hWnd || !IsWindow(g_hWnd))
     return;
 
   if (!baseText.empty())
     g_baseText = baseText;
+  g_details=details;
+  const auto separator=details.find(L'\n');
+  SetWindowTextW(g_hDetail,details.substr(0,separator).c_str());
+  SetWindowTextW(g_hItem,separator==std::wstring::npos?L"":details.substr(separator+1).c_str());
+  ShowWindow(g_hDetail,details.empty()?SW_HIDE:SW_SHOWNOACTIVATE);
+  ShowWindow(g_hItem,separator==std::wstring::npos?SW_HIDE:SW_SHOWNOACTIVATE);
 
   // Update caption every time
   SetWindowTextW(g_hWnd, ComposeCaption(g_baseText, percent).c_str());
 
   if (g_hOwner && IsWindow(g_hOwner)) {
-    RepositionInOwner(g_hOwner, 420, 84);
+    RepositionInOwner(g_hOwner, details.empty()?420:520, details.empty()?84:132);
     LayoutControls();
   }
 
@@ -356,9 +403,14 @@ void ProgressUI_PostUpdate(HWND mainWnd, int percent) {
 
 void ProgressUI_PostUpdate(HWND mainWnd, const std::wstring &baseText,
                            int percent) {
+  ProgressUI_PostUpdate(mainWnd,baseText,percent,L"");
+}
+
+void ProgressUI_PostUpdate(HWND mainWnd,const std::wstring &baseText,
+                           int percent,const std::wstring &details) {
   PostProgressPayload(
       mainWnd, WM_APP_PROGRESS_UPDATE,
-      std::make_unique<CtProgressPayload>(percent, baseText));
+      std::make_unique<CtProgressPayload>(percent, baseText,details));
 }
 
 void ProgressUI_PostHide(HWND mainWnd) {

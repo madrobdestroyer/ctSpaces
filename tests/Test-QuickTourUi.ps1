@@ -71,6 +71,8 @@ public static class QuickTourQa {
   [DllImport("user32.dll",CharSet=CharSet.Unicode)] static extern int DrawTextW(IntPtr dc,string text,int count,ref Rect rect,uint format);
   [DllImport("user32.dll",CharSet=CharSet.Unicode)] static extern IntPtr SendMessageW(IntPtr w,uint m,IntPtr p,IntPtr l);
   [DllImport("user32.dll",CharSet=CharSet.Unicode)] static extern bool SendMessageTimeoutW(IntPtr w,uint m,UIntPtr p,IntPtr l,uint f,uint ms,out UIntPtr result);
+  [DllImport("shell32.dll",CharSet=CharSet.Unicode)] static extern IntPtr CommandLineToArgvW(string text,out int count);
+  [DllImport("kernel32.dll")] static extern IntPtr LocalFree(IntPtr value);
   public static string Text(IntPtr w){var b=new StringBuilder(32768);GetWindowTextW(w,b,b.Capacity);return b.ToString();}
   public static string ControlText(IntPtr w){var b=new StringBuilder(32768);ReadText(w,0xD,(IntPtr)b.Capacity,b);return b.ToString();}
   static IntPtr CreateUiFont(IntPtr w,bool strong){return CreateFontW(-MulDiv(10,(int)GetDpiForWindow(w),72),0,0,0,strong?600:400,0,0,0,1,0,0,5,2|32,"Segoe UI Variable Text");}
@@ -80,6 +82,16 @@ public static class QuickTourQa {
   public static Rect ChildRect(IntPtr parent,int id){Rect r;if(!GetWindowRect(GetDlgItem(parent,id),out r))throw new Exception("missing control "+id);MapWindowPoints(IntPtr.Zero,parent,ref r,2);return r;}
   public static bool CopyData(IntPtr w,string value){IntPtr text=Marshal.StringToHGlobalUni(value),data=IntPtr.Zero;try{var c=new CopyDataStruct{Tag=new UIntPtr(0x43545350u),Bytes=checked((uint)((value.Length+1)*2)),Text=text};data=Marshal.AllocHGlobal(Marshal.SizeOf(typeof(CopyDataStruct)));Marshal.StructureToPtr(c,data,false);UIntPtr result;return SendMessageTimeoutW(w,0x4A,UIntPtr.Zero,data,3,5000,out result)&&result!=UIntPtr.Zero;}finally{if(data!=IntPtr.Zero)Marshal.FreeHGlobal(data);Marshal.FreeHGlobal(text);}}
   public static void ClosePidWindows(uint pid){EnumWindows((w,p)=>{uint owner;GetWindowThreadProcessId(w,out owner);if(owner==pid)PostMessageW(w,0x10,UIntPtr.Zero,IntPtr.Zero);return true;},IntPtr.Zero);}
+  public static bool UsesExactProfile(string text,string expected){
+    if(String.IsNullOrEmpty(text)||String.IsNullOrEmpty(expected))return false;
+    int count;IntPtr argv=CommandLineToArgvW(text,out count);if(argv==IntPtr.Zero)return false;
+    bool found=false;try{for(int i=1;i<count;i++){
+      string arg=Marshal.PtrToStringUni(Marshal.ReadIntPtr(argv,i*IntPtr.Size))??"",path=null;
+      if(arg.Equals("--user-data-dir",StringComparison.OrdinalIgnoreCase)){if(i+1>=count)return false;path=Marshal.PtrToStringUni(Marshal.ReadIntPtr(argv,(++i)*IntPtr.Size));}
+      else if(arg.StartsWith("--user-data-dir=",StringComparison.OrdinalIgnoreCase))path=arg.Substring(16);
+      if(path!=null){if(found||String.IsNullOrEmpty(path)||!System.IO.Path.IsPathRooted(path)||!System.IO.Path.GetFullPath(path).TrimEnd('\\','/').Equals(System.IO.Path.GetFullPath(expected).TrimEnd('\\','/'),StringComparison.OrdinalIgnoreCase))return false;found=true;}
+    }return found;}finally{LocalFree(argv);}
+  }
 }
 '@
 $oldDpiContext = [QuickTourQa]::SetThreadDpiAwarenessContext([IntPtr]::new(-4))
@@ -100,11 +112,86 @@ function Stop-QaApp {
     if($script:process){[void]$script:process.WaitForExit(5000);if(-not$script:process.HasExited){$script:process.Kill();[void]$script:process.WaitForExit(5000)};$script:process.Dispose()}
     $script:process=$null;$script:main=[IntPtr]::Zero
 }
-function Find-Tour([int]$Seconds=10){Wait-Until{[QuickTourQa]::Find([uint32]$process.Id,'#32770','ctSpaces Quick Tour')} 'Quick Tour did not open.' $Seconds}
+function Bind-OwnedQaBrowsers($Snapshots,[string]$Profile) {
+    $entries=[Collections.Generic.List[object]]::new()
+    try {
+    foreach($snapshot in @($Snapshots)) {
+        $bound=$null
+        try {
+            $bound=[Diagnostics.Process]::GetProcessById([int]$snapshot.ProcessId)
+            $null=$bound.SafeHandle # A retained handle prevents PID reuse during later cleanup.
+            if($bound.HasExited){continue}
+            $entry=[pscustomobject]@{Process=$bound;Start=$bound.StartTime.ToUniversalTime();Image=[IO.Path]::GetFullPath([string]$snapshot.ExecutablePath);Profile=[IO.Path]::GetFullPath($Profile)}
+            if($entry.Start.Ticks-ne([DateTime]$snapshot.CreationDate).ToUniversalTime().Ticks-or
+               -not([IO.Path]::GetFullPath($bound.MainModule.FileName)).Equals($entry.Image,[StringComparison]::OrdinalIgnoreCase)-or
+               -not[QuickTourQa]::UsesExactProfile($snapshot.CommandLine,$entry.Profile)) {
+                throw "Refusing to own mismatched browser PID $($snapshot.ProcessId)."
+            }
+            if(Confirm-OwnedQaBrowser $entry){$entries.Add($entry);$bound=$null}
+        } catch [ArgumentException] {
+            # The queried browser exited before the process handle was bound.
+        } catch [InvalidOperationException] {
+            if(-not$bound-or-not$bound.HasExited){throw}
+        } catch [ComponentModel.Win32Exception] {
+            if(-not$bound-or-not$bound.HasExited){throw}
+        } finally {if($bound){$bound.Dispose()}}
+    }
+    } catch {foreach($entry in $entries){$entry.Process.Dispose()};throw}
+    $entries.ToArray()
+}
+function Confirm-OwnedQaBrowser($Entry) {
+    $bound=$Entry.Process
+    if($bound.HasExited){return $false}
+    $fresh=Get-QaProcess Win32_Process -Filter ('ProcessId = '+$bound.Id) -ErrorAction Stop|Select-Object -First 1
+    if($bound.HasExited){return $false}
+    # A child can disappear from command-line inspection while Windows is still
+    # completing teardown. Only a signaled bound handle permits skipping it.
+    if(-not$fresh-and$bound.WaitForExit(250)){return $false}
+    if(-not$fresh-or([string]$fresh.Name)-ine'msedge.exe'-or
+       $bound.StartTime.ToUniversalTime().Ticks-ne$Entry.Start.Ticks-or
+       ([DateTime]$fresh.CreationDate).ToUniversalTime().Ticks-ne$Entry.Start.Ticks-or
+       -not([IO.Path]::GetFullPath($bound.MainModule.FileName)).Equals($Entry.Image,[StringComparison]::OrdinalIgnoreCase)-or
+       -not([IO.Path]::GetFullPath([string]$fresh.ExecutablePath)).Equals($Entry.Image,[StringComparison]::OrdinalIgnoreCase)-or
+       -not[QuickTourQa]::UsesExactProfile($fresh.CommandLine,$Entry.Profile)) {
+        throw "Refusing to close unverified or reused browser PID $($bound.Id)."
+    }
+    return $true
+}
+function Close-OwnedQaBrowserWindows {
+    foreach($entry in @($script:owned)) {
+        if(Confirm-OwnedQaBrowser $entry){[QuickTourQa]::ClosePidWindows([uint32]$entry.Process.Id)}
+    }
+}
+function Wait-TourLayout([IntPtr]$tour,[int]$Seconds=5){
+    $ready=@{Signature='';Stable=0}
+    Wait-Until {
+        if(-not[QuickTourQa]::IsWindowVisible($tour)-or[QuickTourQa]::IsWindowEnabled($main)-or[QuickTourQa]::GetDpiForWindow($tour)-ne[QuickTourQa]::GetDpiForWindow($main)){$ready.Stable=0;return $false}
+        $client=[QuickTourQa+Rect]::new();[void][QuickTourQa]::GetClientRect($tour,[ref]$client)
+        $signature="$($client.Right),$($client.Bottom)"
+        foreach($id in @(1310,1311,1312,1313,1,2,1314)){
+            $control=[QuickTourQa]::GetDlgItem($tour,$id)
+            if(-not[QuickTourQa]::IsWindowVisible($control)){continue}
+            $bounds=[QuickTourQa]::ChildRect($tour,$id)
+            if($bounds.Left-lt 0-or$bounds.Top-lt 0-or$bounds.Right-gt$client.Right-or$bounds.Bottom-gt$client.Bottom){$ready.Stable=0;return $false}
+            $signature+=";$id=$($bounds.Left),$($bounds.Top),$($bounds.Right),$($bounds.Bottom)"
+        }
+        if($signature-eq$ready.Signature){$ready.Stable++}else{$ready.Signature=$signature;$ready.Stable=0}
+        $ready.Stable-ge 1
+    } 'Quick Tour did not finish its visible, DPI-matched layout.' $Seconds | Out-Null
+}
+function Find-Tour([int]$Seconds=10){
+    $tour=Wait-Until {
+        $window=[QuickTourQa]::Find([uint32]$process.Id,'#32770','ctSpaces Quick Tour')
+        if($window-ne[IntPtr]::Zero-and[QuickTourQa]::IsWindowVisible($window)-and[QuickTourQa]::ControlText([QuickTourQa]::GetDlgItem($window,1310))-eq$expectedSteps[0].Title-and[QuickTourQa]::ControlText([QuickTourQa]::GetDlgItem($window,1312))-eq("1 / "+$expectedSteps.Count)){$window}
+    } 'Quick Tour did not finish opening its first step.' $Seconds
+    Wait-TourLayout $tour $Seconds
+    $tour
+}
 function Find-Frame([int]$Seconds=10){Wait-Until{[QuickTourQa]::Find([uint32]$process.Id,'ctSpacesQuickTourHighlight','')} 'Quick Tour highlight did not open.' $Seconds}
 function Open-Tour {[void][QuickTourQa]::PostMessageW($main,0x111,[UIntPtr]41019,[IntPtr]::Zero);Find-Tour}
 function Assert-InBounds([IntPtr]$tour,[int]$id){$c=[QuickTourQa+Rect]::new();[void][QuickTourQa]::GetClientRect($tour,[ref]$c);$r=[QuickTourQa]::ChildRect($tour,$id);Assert($r.Left-ge 0-and$r.Top-ge 0-and$r.Right-le$c.Right-and$r.Bottom-le$c.Bottom) "Quick Tour control $id is outside the dialog."}
 function Assert-TourLayout([IntPtr]$tour){
+    Wait-TourLayout $tour
     Assert(-not[QuickTourQa]::IsWindowEnabled($main)) 'Main launcher remained enabled while Quick Tour was open.'
     foreach($id in @(1310,1311,1312,1313,1,2)){Assert-InBounds $tour $id}
     if([QuickTourQa]::IsWindowVisible([QuickTourQa]::GetDlgItem($tour,1314))){Assert-InBounds $tour 1314}
@@ -164,14 +251,14 @@ $expectedSteps=@(
     [pscustomobject]@{Title='Rename a client';Needles=@('every slot for that client to be closed','preserving browser slots','pinned position','Restore tabs choices','verified managed shortcut');Demo='Illustration only — no actions performed. Options > Rename Client. Client A becomes Client North; browser data and managed settings are kept.';Slug='rename-client'},
     [pscustomobject]@{Title='Archive and restore a client';Needles=@('hides a closed client without deleting browser data','Archived Clients','normal picker','not a backup');Demo='Illustration only — no actions performed. Options > Archive Client hides Client A. Options > Archived Clients restores Client A.';Slug='archive-restore'},
     [pscustomobject]@{Title='Put client names first';Needles=@('Client name first in window titles','browser and Alt+Tab titles','windows already open');Demo='Illustration only — no actions performed. Options > Client name first in window titles. Example: Client A — Browser.';Slug='client-first-titles'},
-    [pscustomobject]@{Title='Keep Client Notes';Needles=@('existing client','Settings > Client Notes','open its pin menu','Edits save automatically','Close finishes pending saves','does not open or edit');Demo='Illustration only: no actions performed. Select Client A, then Settings > Client Notes or open its pin menu. Add named ticket tabs with separate formatted notes. Edits save automatically.';Slug='client-notes'},
+    [pscustomobject]@{Title='Keep Client Notes';Needles=@('Notes beside Close all','search for a client in its picker','blank tab or use a template','Edits save automatically','Close finishes pending saves','does not open or edit');Demo='Illustration only: no actions performed. Notes beside Close all > Choose client. Start with a blank tab or template. Edits save automatically; problems are reported.';Slug='client-notes'},
     [pscustomobject]@{Title='Clean up inactive clients';Needles=@('three calendar months','Unknown history begins a fresh tracking period','Archived clients can appear','selection, acknowledgement, and fresh safety checks','permanently deletes','Cannot be undone','back up first');Demo='Illustration only — no actions performed. Clean Up Inactive Clients... Select Client A/B, acknowledge, Delete Selected.';Slug='inactive-cleanup'},
     [pscustomobject]@{Title='Delete multiple clients now';Needles=@('no inactivity wait','archived clients','recheck open/safety state','all browser data','existing backups are retained','permanently deletes','Cannot be undone','back up first');Demo='Illustration only — no actions performed. Delete Multiple Clients... Select Client A/B, acknowledge, Delete Selected.';Slug='manual-delete'},
     [pscustomobject]@{Title='Open Options';Needles=@('client management','backup and restore','full guide','Quick tour');Demo='';Slug='options'}
 )
 $pinStepTitles=@('Pin favorite clients',"Use a pinned client's menu",'Open a copied link','Create a Desktop shortcut','Reorder pinned clients')
 $sessionStepTitles=@('Switch between open sessions','Reorder session tabs')
-$anchorByTitle=@{'Choose or name a client'=205;'Find clients while typing'=205;'Create, Open, or Show'=1;'Close all browser sessions'=209;'Choose whether to restore tabs'=207;'Open a temporary profile'=200;'Save or discard Default changes'=201;'Rename a client'=201;'Archive and restore a client'=201;'Put client names first'=201;'Keep Client Notes'=201;'Clean up inactive clients'=201;'Delete multiple clients now'=201;'Open Options'=201}
+$anchorByTitle=@{'Choose or name a client'=205;'Find clients while typing'=205;'Create, Open, or Show'=1;'Close all browser sessions'=209;'Choose whether to restore tabs'=207;'Open a temporary profile'=200;'Save or discard Default changes'=201;'Rename a client'=201;'Archive and restore a client'=201;'Put client names first'=201;'Keep Client Notes'=210;'Clean up inactive clients'=201;'Delete multiple clients now'=201;'Open Options'=201}
 
 function Assert-CurrentStep([IntPtr]$tour,$step,[int]$index,[bool]$expectPinned,[bool]$expectSession){
     $title=Wait-Until{$value=[QuickTourQa]::ControlText([QuickTourQa]::GetDlgItem($tour,1310));if($value){$value}} "Quick Tour title $index did not become ready."
@@ -257,7 +344,10 @@ try {
     # the overlay, then the reopened tour must recognize the populated session.
     $tour=Open-Tour;Assert([QuickTourQa]::CopyData($main,('--client "'+$client+'" --browser edge'))) 'Quick-Tour-time WM_COPYDATA launch was rejected.'
     Wait-TourClosed $tour 'WM_COPYDATA did not dismiss Quick Tour before launch handoff.'
-    $owned=Wait-Until{@(Get-QaProcess Win32_Process -Filter "Name='msedge.exe'" -ErrorAction SilentlyContinue|Where-Object{$_.CommandLine-and$_.CommandLine-match[regex]::Escape($profile)})} 'WM_COPYDATA did not launch the exact isolated Edge profile.' 20
+    $owned=Wait-Until{
+        $snapshots=@(Get-QaProcess Win32_Process -Filter "Name='msedge.exe'" -ErrorAction SilentlyContinue|Where-Object{[QuickTourQa]::UsesExactProfile($_.CommandLine,$profile)})
+        @(Bind-OwnedQaBrowsers $snapshots $profile)
+    } 'WM_COPYDATA did not launch the exact isolated Edge profile.' 20
     Wait-Until{[QuickTourQa]::IsWindowEnabled($main)} 'Launcher did not finish the isolated Edge handoff.' 15|Out-Null
     $sessionConfigBefore=Get-StableFingerprint $config;$tour=Open-Tour
     $sessionIndex=[array]::IndexOf(@($expectedSteps|ForEach-Object{$_.Title}),'Switch between open sessions')
@@ -267,8 +357,10 @@ try {
     [void](Assert-CurrentStep $tour $expectedSteps[$sessionIndex+1] ($sessionIndex+1) $true $true);[void][QuickTourQa]::PostMessageW($tour,0x111,[UIntPtr]2,[IntPtr]::Zero);Wait-TourClosed $tour 'Populated session tour did not close.'
     Assert((Get-StableFingerprint $config)-eq$sessionConfigBefore) 'Populated-session tour changed preferences or pinned order.'
     $otherClients=@(Get-ChildItem -LiteralPath (Join-Path $data 'Sites') -Directory|Where-Object{$_.Name-ne$client-and$_.Name-ne$clientB});Assert($otherClients.Count-eq 0) 'Quick Tour or handoff created an unexpected client profile.'
-    foreach($edgeProcess in @($owned)){[QuickTourQa]::ClosePidWindows([uint32]$edgeProcess.ProcessId)}
-    Wait-Until{@(Get-QaProcess Win32_Process -Filter "Name='msedge.exe'" -ErrorAction SilentlyContinue|Where-Object{$_.CommandLine-and$_.CommandLine-match[regex]::Escape($profile)}).Count-eq 0} 'Owned Edge profile did not close normally.' 15|Out-Null
+    Close-OwnedQaBrowserWindows
+    Wait-Until{@(Get-QaProcess Win32_Process -Filter "Name='msedge.exe'" -ErrorAction SilentlyContinue|Where-Object{[QuickTourQa]::UsesExactProfile($_.CommandLine,$profile)}).Count-eq 0} 'Owned Edge profile did not close normally.' 15|Out-Null
+    foreach($entry in @($owned)){Assert($entry.Process.WaitForExit(3000)) 'A bound fixture browser remained alive after normal close.'}
+    foreach($entry in @($owned)){$entry.Process.Dispose()};$owned=@()
     Stop-QaApp
 
     Assert((Get-Fingerprint $liveConfig)-eq$liveConfigBefore) 'Live ctSpaces configuration changed.'
@@ -277,7 +369,14 @@ try {
 } catch {
     New-Item -ItemType Directory -Path $artifactRoot -Force|Out-Null;[IO.File]::WriteAllText((Join-Path $artifactRoot ($run+'-failure.txt')),$_.Exception.ToString(),$utf8);throw
 } finally {
-    foreach($edgeProcess in @($owned)){try{[QuickTourQa]::ClosePidWindows([uint32]$edgeProcess.ProcessId)}catch{}}
+    foreach($entry in @($owned)){
+        try{
+            if(Confirm-OwnedQaBrowser $entry){
+                [QuickTourQa]::ClosePidWindows([uint32]$entry.Process.Id)
+                if(-not$entry.Process.WaitForExit(3000)-and(Confirm-OwnedQaBrowser $entry)){$entry.Process.Kill();[void]$entry.Process.WaitForExit(3000)}
+            }
+        }catch{Write-Warning "Fixture browser cleanup was refused: $_"}finally{$entry.Process.Dispose()}
+    };$owned=@()
     if($process){try{Stop-QaApp}catch{}}
     if($completed-and(Test-Path -LiteralPath $qa)){Remove-Item -LiteralPath $qa -Recurse -Force}elseif(Test-Path -LiteralPath $qa){Write-Warning "Preserved Quick Tour failure fixture: $qa"}
     if($oldDpiContext-ne[IntPtr]::Zero){[void][QuickTourQa]::SetThreadDpiAwarenessContext($oldDpiContext)}

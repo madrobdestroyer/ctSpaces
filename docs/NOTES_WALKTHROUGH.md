@@ -77,14 +77,16 @@ leaves an empty workspace with **+** and **All notes** available.
 
 ## 5. Link a note to a ticket, if useful
 
-1. Open the note, then choose **Actions > Ticket details (optional)**.
-2. Enter a ticket number, such as `44553`, and click **OK**. The number labels the
+1. Open the note, then choose **Details**.
+2. Enter a ticket number, such as `T20260921.0622`. Changes save automatically; click
+   outside the panel to close it. The number labels the
    note in All notes and can be searched.
 3. Enter an HTTP/HTTPS ticket URL to enable **Open ticket link** in All notes and
-   Actions. It opens in your default browser, using your regular sign-in and
-   keeping the ticketing session separate from client browser profiles.
-4. Use the top **Status** button to set the note's work status and tags. Its label
-   reflects the selected status. These are local labels, with no ticket-system sync.
+   More. **Details > Open links in**, below the ticket URL, chooses the regular PC browser for note and ticket
+   links, keeping the ticketing session separate from client browser profiles.
+4. Use **Details** to set the note's work status and tags. A small status icon and
+   label beside Details reflect the selected status. **No status** hides the
+   indicator. These are local labels, with no ticket-system sync.
 
 These fields contain a label and address you supply. They do not fetch ticket
 messages, import ticket data, or synchronize with a ticket system. Both are optional.
@@ -163,6 +165,11 @@ trash is empty, and it works even when your current search has no matching resul
 ## 10. Recover, export and keep working
 
 1. Use **Ctrl+F** to find text in the open note, or **Ctrl+H** to replace it.
+   The temporary search rows include Match case, Whole word, Wrap and a match
+   count. Replace all is one Undo action; Escape returns the rows' space to the
+   document. Search **More** for Word wrap, Go to line (**Ctrl+G**), Document
+   information, Check spelling (**F7**), Print/PDF (**Ctrl+P**), Markdown
+   import/export or Insert table. These tools appear on demand.
 2. **Actions > Version history** previews earlier text and formatting before restoring
    them. It is a bounded recovery history, not a complete record of every keystroke.
 3. If the title reports a failed save, keep the window open. Use **Actions > Retry

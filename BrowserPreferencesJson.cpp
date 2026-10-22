@@ -1,14 +1,18 @@
 #include "BrowserPreferencesJson.h"
+#include "ConfigPersistence.h"
 
 #define WIN32_LEAN_AND_MEAN
 #include <Windows.h>
+#include <objbase.h>
 
 #include <algorithm>
-#include <atomic>
+#include <array>
 #include <cstdint>
 #include <limits>
 #include <utility>
 #include <vector>
+
+#pragma comment(lib, "Ole32.lib")
 
 namespace browser_preferences {
 namespace {
@@ -41,6 +45,34 @@ struct Targets {
   bool unsafe = false;
 };
 
+struct TabLayoutTargets {
+  std::array<std::string_view, 3> keys{};
+  size_t length = 0;
+  // The root plus each ancestor of the boolean leaf.
+  std::array<ObjectSpan, 3> objects{};
+  Span value;
+  bool unsafe = false;
+};
+constexpr size_t kOutsideTabLayout = (std::numeric_limits<size_t>::max)();
+
+bool SetTabLayoutPath(TabLayoutBrowser browser, TabLayoutTargets &targets) {
+  switch (browser) {
+  case TabLayoutBrowser::Edge:
+    targets.keys = {"edge", "vertical_tabs", "opened"};
+    targets.length = 3;
+    return true;
+  case TabLayoutBrowser::Chrome:
+    targets.keys = {"vertical_tabs", "enabled", {}};
+    targets.length = 2;
+    return true;
+  case TabLayoutBrowser::Brave:
+    targets.keys = {"brave", "tabs", "vertical_tabs_enabled"};
+    targets.length = 3;
+    return true;
+  }
+  return false;
+}
+
 enum class Scope { other, root, session, profile };
 
 class JsonScanner {
@@ -59,21 +91,31 @@ public:
     SkipWhitespace();
     if (position_ >= text_.size() || text_[position_] != '{')
       return false;
-    if (!ParseObject(0, Scope::root, &targets.root))
+    if (!ParseObject(0, Scope::root, &targets.root,
+                     layout_ ? 0 : kOutsideTabLayout))
       return false;
     SkipWhitespace();
     return position_ == text_.size();
   }
 
+  bool ScanTabLayout(TabLayoutTargets &layout) {
+    layout_ = &layout;
+    Targets unusedStartupTargets;
+    const bool valid = Scan(unusedStartupTargets);
+    layout.objects[0] = unusedStartupTargets.root;
+    return valid;
+  }
+
 private:
   bool ParseValue(unsigned depth, Scope objectScope = Scope::other,
-                  ObjectSpan *objectSpan = nullptr) {
+                  ObjectSpan *objectSpan = nullptr,
+                  size_t layoutLevel = kOutsideTabLayout) {
     if (depth > kMaximumJsonDepth || position_ >= text_.size())
       return false;
 
     switch (text_[position_]) {
     case '{':
-      return ParseObject(depth, objectScope, objectSpan);
+      return ParseObject(depth, objectScope, objectSpan, layoutLevel);
     case '[':
       return ParseArray(depth);
     case '"':
@@ -89,7 +131,8 @@ private:
     }
   }
 
-  bool ParseObject(unsigned depth, Scope scope, ObjectSpan *objectSpan) {
+  bool ParseObject(unsigned depth, Scope scope, ObjectSpan *objectSpan,
+                   size_t layoutLevel = kOutsideTabLayout) {
     if (depth > kMaximumJsonDepth || position_ >= text_.size() ||
         text_[position_] != '{') {
       return false;
@@ -123,6 +166,21 @@ private:
       Scope childScope = Scope::other;
       ObjectSpan *childObject = nullptr;
       Span *targetValue = nullptr;
+      Span *layoutValue = nullptr;
+      ObjectSpan *layoutObject = nullptr;
+      size_t childLayoutLevel = kOutsideTabLayout;
+
+      if (layout_ && layoutLevel < layout_->length &&
+          key == layout_->keys[layoutLevel]) {
+        if (layoutLevel + 1 == layout_->length) {
+          layoutValue = &layout_->value;
+          if (++layoutValue->occurrences != 1) layout_->unsafe = true;
+        } else {
+          layoutObject = &layout_->objects[layoutLevel + 1];
+          if (++layoutObject->occurrences != 1) layout_->unsafe = true;
+          childLayoutLevel = layoutLevel + 1;
+        }
+      }
 
       if (scope == Scope::root && key == "session") {
         childScope = Scope::session;
@@ -151,7 +209,9 @@ private:
       if (targetValue && ++targetValue->occurrences != 1)
         targets_->unsafe = true;
 
-      if (!ParseValue(depth + 1, childScope, childObject))
+      if (!ParseValue(depth + 1, childScope,
+                      layoutObject ? layoutObject : childObject,
+                      childLayoutLevel))
         return false;
 
       if (targetValue) {
@@ -160,6 +220,11 @@ private:
       }
       if (childObject && !childObject->isObject)
         targets_->unsafe = true;
+      if (layoutValue) {
+        layoutValue->start = valueStart;
+        layoutValue->end = position_;
+      }
+      if (layoutObject && !layoutObject->isObject) layout_->unsafe = true;
 
       SkipWhitespace();
       if (position_ >= text_.size())
@@ -434,6 +499,7 @@ private:
   std::string_view text_;
   size_t position_ = 0;
   Targets *targets_ = nullptr;
+  TabLayoutTargets *layout_ = nullptr;
 };
 
 struct Edit {
@@ -453,6 +519,7 @@ public:
   ScopedHandle(const ScopedHandle &) = delete;
   ScopedHandle &operator=(const ScopedHandle &) = delete;
   HANDLE get() const { return handle_; }
+  void close() { if (handle_ != INVALID_HANDLE_VALUE) CloseHandle(handle_); handle_ = INVALID_HANDLE_VALUE; }
 
 private:
   HANDLE handle_;
@@ -501,25 +568,6 @@ bool ReadAll(HANDLE file, std::string &text) {
     readTotal += bytesRead;
   }
   return true;
-}
-
-std::filesystem::path CreateStagingPath(const std::filesystem::path &path,
-                                        HANDLE &handle) {
-  static std::atomic_uint64_t sequence{0};
-  for (unsigned attempt = 0; attempt < 32; ++attempt) {
-    std::filesystem::path staged = path;
-    staged += L".ctspaces-startup." + std::to_wstring(GetCurrentProcessId()) +
-              L"." + std::to_wstring(++sequence) + L".tmp";
-    handle = CreateFileW(staged.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW,
-                         FILE_ATTRIBUTE_TEMPORARY, nullptr);
-    if (handle != INVALID_HANDLE_VALUE)
-      return staged;
-    if (GetLastError() != ERROR_FILE_EXISTS &&
-        GetLastError() != ERROR_ALREADY_EXISTS) {
-      break;
-    }
-  }
-  return {};
 }
 
 } // namespace
@@ -575,6 +623,13 @@ JsonEditResult EditStartupPreferencesJson(std::string_view input,
     for (const Edit &edit : edits)
       output.replace(edit.start, edit.end - edit.start, edit.replacement);
 
+    // A successful update must remain readable by this same helper on the
+    // next launch, including when a missing startup preference is inserted.
+    if (output.size() > kMaximumPreferencesJsonBytes) {
+      output.assign(input);
+      return JsonEditResult::unsafe_target;
+    }
+
     Targets validationTargets;
     JsonScanner validationScanner(output);
     if (!validationScanner.Scan(validationTargets) || validationTargets.unsafe) {
@@ -588,9 +643,80 @@ JsonEditResult EditStartupPreferencesJson(std::string_view input,
   }
 }
 
-FileUpdateResult UpdateStartupPreferencesFile(
-    const std::filesystem::path &path, bool restoreTabs,
-    bool ensureSessionPreference) noexcept {
+JsonEditResult EditTabLayoutPreferencesJson(
+    std::string_view input, TabLayoutBrowser browser, bool vertical,
+    std::string &output) noexcept {
+  try {
+    TabLayoutTargets targets;
+    if (input.size() > kMaximumPreferencesJsonBytes ||
+        !SetTabLayoutPath(browser, targets)) {
+      output.assign(input);
+      return JsonEditResult::unsafe_target;
+    }
+    JsonScanner scanner(input);
+    if (!scanner.ScanTabLayout(targets)) {
+      output.assign(input);
+      return JsonEditResult::invalid_json;
+    }
+    if (targets.unsafe) {
+      output.assign(input);
+      return JsonEditResult::unsafe_target;
+    }
+    const std::string_view desired = vertical ? "true" : "false";
+    std::string candidate(input);
+    if (targets.value.occurrences) {
+      const auto old = input.substr(targets.value.start,
+                                     targets.value.end - targets.value.start);
+      if (old != "true" && old != "false") {
+        output.assign(input);
+        return JsonEditResult::unsafe_target;
+      }
+      if (old == desired) {
+        output.swap(candidate);
+        return JsonEditResult::unchanged;
+      }
+      candidate.replace(targets.value.start,
+                          targets.value.end - targets.value.start, desired);
+    } else {
+      size_t parent = 0;
+      while (parent + 1 < targets.length &&
+             targets.objects[parent + 1].occurrences) ++parent;
+      std::string inserted(desired);
+      for (size_t key = targets.length; key-- > parent;) {
+        inserted = "\"" + std::string(targets.keys[key]) + "\":" + inserted;
+        if (key != parent) inserted = "{" + inserted + "}";
+      }
+      if (!targets.objects[parent].empty) inserted += ",";
+      candidate.insert(targets.objects[parent].open + 1, inserted);
+    }
+    if (candidate.size() > kMaximumPreferencesJsonBytes) {
+      output.assign(input);
+      return JsonEditResult::unsafe_target;
+    }
+    TabLayoutTargets verified;
+    SetTabLayoutPath(browser, verified);
+    JsonScanner validation(candidate);
+    if (!validation.ScanTabLayout(verified) || verified.unsafe ||
+        verified.value.occurrences != 1 ||
+        std::string_view(candidate).substr(verified.value.start,
+            verified.value.end - verified.value.start) != desired) {
+      output.assign(input);
+      return JsonEditResult::invalid_json;
+    }
+    output.swap(candidate);
+    return JsonEditResult::updated;
+  } catch (...) {
+    // No native or output edit is published until a complete candidate exists.
+    try { output.assign(input); } catch (...) { output.clear(); }
+    return JsonEditResult::invalid_json;
+  }
+}
+
+template <typename Editor>
+static FileUpdateResult UpdatePreferencesFile(
+    const std::filesystem::path &path, const Editor &edit,
+    std::wstring *errorDetails) noexcept {
+  if (errorDetails) errorDetails->clear();
   try {
     ScopedHandle inputHandle(CreateFileW(
         path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_DELETE, nullptr,
@@ -623,8 +749,7 @@ FileUpdateResult UpdateStartupPreferencesFile(
       return FileUpdateResult::io_error;
 
     std::string output;
-    const JsonEditResult editResult = EditStartupPreferencesJson(
-        input, restoreTabs, ensureSessionPreference, output);
+    const JsonEditResult editResult = edit(input, output);
     switch (editResult) {
     case JsonEditResult::unchanged:
       return FileUpdateResult::unchanged;
@@ -636,29 +761,45 @@ FileUpdateResult UpdateStartupPreferencesFile(
       break;
     }
 
-    HANDLE stagedHandle = INVALID_HANDLE_VALUE;
-    const std::filesystem::path stagedPath =
-        CreateStagingPath(path, stagedHandle);
-    if (stagedPath.empty() || stagedHandle == INVALID_HANDLE_VALUE)
+    inputHandle.close();
+    const bool published = config_persistence::MutateRawFileAtomically(
+        path, [&](const std::filesystem::path &stagedPath, std::wstring &) {
+          ScopedHandle stage(CreateFileW(stagedPath.c_str(), GENERIC_READ | GENERIC_WRITE,
+              0, nullptr, OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT, nullptr));
+          LARGE_INTEGER size{};
+          if (stage.get() == INVALID_HANDLE_VALUE ||
+              !GetFileSizeEx(stage.get(), &size) || size.QuadPart != static_cast<LONGLONG>(input.size()))
+            return false;
+          std::string stagedInput(input.size(), '\0');
+          if (!ReadAll(stage.get(), stagedInput) || stagedInput != input)
+            return false;
+          LARGE_INTEGER start{};
+          return SetFilePointerEx(stage.get(), start, nullptr, FILE_BEGIN) &&
+                 SetEndOfFile(stage.get()) && WriteAll(stage.get(), output);
+        }, kMaximumPreferencesJsonBytes, false, errorDetails);
+    if (!published)
       return FileUpdateResult::io_error;
-
-    const bool writeSucceeded = WriteAll(stagedHandle, output) &&
-                                FlushFileBuffers(stagedHandle) != FALSE;
-    const bool closeSucceeded = CloseHandle(stagedHandle) != FALSE;
-    if (!writeSucceeded || !closeSucceeded) {
-      DeleteFileW(stagedPath.c_str());
-      return FileUpdateResult::io_error;
-    }
-
-    if (!ReplaceFileW(path.c_str(), stagedPath.c_str(), nullptr, 0, nullptr,
-                      nullptr)) {
-      DeleteFileW(stagedPath.c_str());
-      return FileUpdateResult::io_error;
-    }
     return FileUpdateResult::updated;
   } catch (...) {
     return FileUpdateResult::io_error;
   }
+}
+
+FileUpdateResult UpdateStartupPreferencesFile(
+    const std::filesystem::path &path, bool restoreTabs,
+    bool ensureSessionPreference, std::wstring *errorDetails) noexcept {
+  return UpdatePreferencesFile(path, [&](std::string_view input, std::string &output) {
+    return EditStartupPreferencesJson(input, restoreTabs,
+                                       ensureSessionPreference, output);
+  }, errorDetails);
+}
+
+FileUpdateResult UpdateTabLayoutPreferencesFile(
+    const std::filesystem::path &path, TabLayoutBrowser browser, bool vertical,
+    std::wstring *errorDetails) noexcept {
+  return UpdatePreferencesFile(path, [&](std::string_view input, std::string &output) {
+    return EditTabLayoutPreferencesJson(input, browser, vertical, output);
+  }, errorDetails);
 }
 
 } // namespace browser_preferences

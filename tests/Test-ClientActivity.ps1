@@ -12,7 +12,7 @@ foreach ($guard in @('client_activity::Write(activityRoot',
     'HandleCleanupDialogTheme(dialog, message, wParam, lParam)',
     'ApplyCleanupDialogTheme(dialog)',
     'ShowCleanupResult(summary, L"Cleanup Complete")',
-    'DeleteEntireClient(client.name, true, expectedActivity, outcome)')) {
+    'DeleteEntireClient(client.name, true, expectedActivity, outcome, client.directory)')) {
     if (-not $source.Contains($guard)) { throw "Missing cleanup guard: $guard" }
 }
 if ($source -notmatch '(?s)ProbeClientProfilesInUse\s*\(\s*name,\s*details,\s*&cancellation\s*\)' -or
@@ -32,3 +32,19 @@ $msbuild = 'C:\Program Files (x86)\Microsoft Visual Studio\18\BuildTools\MSBuild
 if ($LASTEXITCODE -ne 0) { throw 'Client activity test build failed' }
 & (Join-Path $root 'build\tests\x64\Release\ClientActivityTests.exe')
 if ($LASTEXITCODE -ne 0) { throw 'Client activity tests failed' }
+
+# These filesystem-only regressions cover publication ownership and the exact
+# post-check deletion boundary used by cleanup. Keep them in the regular Core
+# ClientActivity entry so a passing history/calendar suite cannot omit them.
+foreach ($case in @(
+    @{ Name='ClientActivityBoundary'; Project='ClientActivityBoundaryTests'; Modes=@('0','1','2') },
+    @{ Name='ClientDeleteWriterBoundary'; Project='ClientDeleteWriterBoundaryTests'; Modes=@('') }
+)) {
+    & $msbuild (Join-Path $PSScriptRoot ($case.Project+'.vcxproj')) /m:1 /nodeReuse:false /p:Configuration=Release /p:Platform=x64 /v:minimal
+    if ($LASTEXITCODE -ne 0) { throw ($case.Name+' test build failed') }
+    $native = Join-Path $root ('build\tests\'+$case.Name+'\x64\Release\'+$case.Project+'.exe')
+    foreach ($mode in $case.Modes) {
+        if ($mode -eq '') { & $native } else { & $native $mode }
+        if ($LASTEXITCODE -ne 0) { throw ($case.Name+' test failed; its disposable fixture is retained') }
+    }
+}

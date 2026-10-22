@@ -6,6 +6,8 @@ $sourcePath = Join-Path $projectRoot 'ctSpaces.cpp'
 $source = Get-Content -Raw -LiteralPath $sourcePath
 $stageNameHeader = Get-Content -Raw -LiteralPath `
     (Join-Path $projectRoot 'SiblingStageName.h')
+$namespaceHeader = Get-Content -Raw -LiteralPath `
+    (Join-Path $projectRoot 'ClientDeletionSafety.h')
 $failures = [System.Collections.Generic.List[string]]::new()
 
 function Assert-TransactionCheck {
@@ -133,7 +135,9 @@ $directoryMoveHelper = [regex]::Match(
 Assert-TransactionCheck $directoryMoveHelper.Success 'The case-only directory move helper could not be inspected.'
 if ($directoryMoveHelper.Success) {
     $body = $directoryMoveHelper.Groups['body'].Value
-    Assert-TransactionCheck ($body -match 'TryMakeUniqueSiblingStagePath\([^;]*intermediatePath[\s\S]*?IsTreeTargetWithinLegacyPathBudget\(\s*\r?\n?\s*source,\s*intermediatePath[\s\S]*?preMoveGuard\(guardDetails\)[\s\S]*?MoveFileExW\(source\.c_str\(\),\s*intermediatePath\.c_str\(\)') 'Case-only rename can move into an over-budget GUID intermediate or mutate after its final guard has gone stale.'
+    Assert-TransactionCheck ($body -match 'TryMakeUniqueSiblingStagePath\([^;]*intermediatePath[\s\S]*?IsTreeTargetWithinLegacyPathBudget\(\s*\r?\n?\s*source,\s*intermediatePath[\s\S]*?preMoveGuard\(guardDetails\)[\s\S]*?originalNamespace\.MoveRoot\(intermediatePath,\s*errorDetails\)' -and
+        $body -match 'originalNamespace\.IsAt\(source\)' -and
+        $body -notmatch 'MoveFileExW\(') 'Case-only rename is not routed through its captured original directory handle after path-budget and browser-use checks.'
     Assert-TransactionCheck (([regex]::Matches($body, 'preMoveGuard\s*\(\s*guardDetails\s*\)').Count) -eq 1) 'The logical-name guard must run exactly once before the first two-hop move; rerunning it after the logical root disappears blocks every valid case-only commit or rollback.'
 }
 
@@ -192,12 +196,17 @@ Assert-TransactionCheck $renameBody.Success `
 if ($renameBody.Success) {
     $body = $renameBody.Groups['body'].Value
     Assert-TransactionCheck `
-        ($body -match 'caseOnlyRollbackGuard[\s\S]*?ProbeClientProfilesInUse\(newName,[\s\S]*?MoveDirectoryThroughUniqueSibling\(\s*\r?\n?\s*newPath,\s*oldPath,\s*L"rename-rollback",\s*rollbackDetails,\s*\r?\n?\s*caseOnlyRollbackGuard\)' -and
-         $body -match 'caseOnlyForwardGuard[\s\S]*?ProbeClientProfilesInUse\(oldName,[\s\S]*?MoveDirectoryThroughUniqueSibling\(\s*\r?\n?\s*oldPath,\s*newPath,\s*L"rename-stage",\s*moveDetails,\s*\r?\n?\s*caseOnlyForwardGuard\)') `
+        ($body -match 'caseOnlyRollbackGuard[\s\S]*?ProbeClientProfilesInUse\(newName,[\s\S]*?MoveDirectoryThroughUniqueSibling\(\s*\r?\n?\s*newPath,\s*oldPath,\s*L"rename-rollback",\s*rollbackDetails,\s*\r?\n?\s*originalNamespace,\s*caseOnlyRollbackGuard\)' -and
+         $body -match 'caseOnlyForwardGuard[\s\S]*?ProbeClientProfilesInUse\(oldName,[\s\S]*?MoveDirectoryThroughUniqueSibling\(\s*\r?\n?\s*oldPath,\s*newPath,\s*L"rename-stage",\s*moveDetails,\s*\r?\n?\s*originalNamespace,\s*caseOnlyForwardGuard\)') `
         'Case-only forward and rollback helpers do not receive guards bound to the correct logical client names.'
     Assert-TransactionCheck `
-        ($body -match 'std::wstring\s+rollbackProfileUseError;\s*if\s*\(ProbeClientProfilesInUse\(newName,[\s\S]*?MoveFileExW\(newPath\.c_str\(\),\s*oldPath\.c_str\(\)' -and
-         $body -match 'std::wstring\s+immediateMoveProfileUseError;\s*if\s*\(ProbeClientProfilesInUse\(oldName,[\s\S]*?MoveFileExW\(oldPath\.c_str\(\),\s*newPath\.c_str\(\)') `
+        ($body -match 'std::wstring\s+rollbackProfileUseError;\s*if\s*\(ProbeClientProfilesInUse\(newName,[\s\S]*?originalNamespace\.MoveRoot\(oldPath,\s*rollbackDetails\)' -and
+         $body -match 'std::wstring\s+immediateMoveProfileUseError;\s*if\s*\(ProbeClientProfilesInUse\(oldName,[\s\S]*?originalNamespace\.MoveRoot\(newPath,\s*errorMessage\)' -and
+         $body -match 'originalNamespace\.CaptureNamespace\(oldPath,\s*errorMessage\)[\s\S]*?PrepareNotesForClientChange\(oldName\)' -and
+         $namespaceHeader -match 'rename->ReplaceIfExists=FALSE' -and
+         $namespaceHeader -match 'SetFileInformationByHandle\(root->directory,FileRenameInfo' -and
+         $namespaceHeader -match 'FILE_READ_ATTRIBUTES \| \(directory \? FILE_LIST_DIRECTORY : 0\) \| \(directory && directoryDeleteAccess \? DELETE : 0\)' -and
+         $namespaceHeader -match 'SameObject\(info,root->identity\)') `
         'Normal rename forward or rollback can mutate after its final logical-client process probe has gone stale.'
     Assert-TransactionCheck `
         ($body -match 'oldCanonicalPath\s*=\s*GetClientDesktopShortcutPath\(oldName\)' -and
@@ -224,7 +233,7 @@ Assert-TransactionCheck $archiveBody.Success `
 if ($archiveBody.Success) {
     $body = $archiveBody.Groups['body'].Value
     Assert-TransactionCheck `
-        ($body -match 'SaveConfigMutations\(L"archived and pinned client lists"' -and
+        ($body -match 'SaveClientPreferenceDelta\(clientName,\s*false,\s*true\)' -and
          $body -match 'must not restore memory[\s\S]*?UpdateClientsComboBox' -and
          $body -match 'was archived and its settings were saved') `
         'Archive post-commit UI failure can still roll memory back against committed configuration.'
@@ -239,8 +248,8 @@ Assert-TransactionCheck $restoreBody.Success `
 if ($restoreBody.Success) {
     $body = $restoreBody.Groups['body'].Value
     Assert-TransactionCheck `
-        ($body -match 'originalArchivedClients' -and
-         $body -match 'SaveArchivedClients\(\)' -and
+        ($body -match 'const\s+std::wstring\s+restoredClientName\s*=\s*restoredName' -and
+         $body -match 'SaveClientPreferenceDelta\(restoredClientName,\s*std::nullopt,\s*false\)' -and
          $body -match 'committed above[\s\S]*?must never put memory back[\s\S]*?UpdateClientsComboBox' -and
          $body -match 'was restored and its settings were saved') `
         'Restore can still roll memory back after config commit or lose post-commit UI warnings.'

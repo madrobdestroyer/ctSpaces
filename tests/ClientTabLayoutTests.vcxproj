@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup Label="ProjectConfigurations">
+    <ProjectConfiguration Include="Release|x64"><Configuration>Release</Configuration><Platform>x64</Platform></ProjectConfiguration>
+  </ItemGroup>
+  <PropertyGroup Label="Globals">
+    <VCProjectVersion>17.0</VCProjectVersion><Keyword>Win32Proj</Keyword>
+    <ProjectGuid>{A57D6F34-AB78-4AD6-AE02-6E520201D474}</ProjectGuid>
+    <RootNamespace>ClientTabLayoutTests</RootNamespace><WindowsTargetPlatformVersion>10.0</WindowsTargetPlatformVersion>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
+  <PropertyGroup Label="Configuration">
+    <ConfigurationType>Application</ConfigurationType><UseDebugLibraries>false</UseDebugLibraries>
+    <PlatformToolset>v145</PlatformToolset><CharacterSet>Unicode</CharacterSet>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+  <PropertyGroup>
+    <OutDir>$(ProjectDir)..\build\tests\ClientTabLayout\$(Platform)\$(Configuration)\</OutDir>
+    <IntDir>$(ProjectDir)..\build\tests\obj\ClientTabLayout\$(Platform)\$(Configuration)\</IntDir>
+  </PropertyGroup>
+  <ItemDefinitionGroup>
+    <ClCompile>
+      <WarningLevel>Level4</WarningLevel><SDLCheck>true</SDLCheck><ConformanceMode>true</ConformanceMode>
+      <LanguageStandard>stdcpp20</LanguageStandard><RuntimeLibrary>MultiThreaded</RuntimeLibrary>
+      <Optimization>MaxSpeed</Optimization><AdditionalOptions>/utf-8 %(AdditionalOptions)</AdditionalOptions>
+      <PreprocessorDefinitions>CTSPACES_CONFIG_TEST_HOOKS;CTSPACES_CLIENT_TAB_LAYOUT_TEST_HOOKS;NOMINMAX;NDEBUG;_CONSOLE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+    </ClCompile>
+    <Link><SubSystem>Console</SubSystem><GenerateDebugInformation>true</GenerateDebugInformation><AdditionalDependencies>ole32.lib;user32.lib;%(AdditionalDependencies)</AdditionalDependencies></Link>
+  </ItemDefinitionGroup>
+  <ItemGroup><ClCompile Include="ClientTabLayoutTests.cpp" /><ClCompile Include="..\ConfigPersistence.cpp" /></ItemGroup>
+  <ItemGroup><ClInclude Include="..\ClientTabLayout.h" /><ClInclude Include="..\ConfigPersistence.h" /><ClInclude Include="..\ClientDeletionSafety.h" /><ClInclude Include="..\SiblingStageName.h" /><ClInclude Include="DirectoryJunctionFixture.h" /><ClInclude Include="RetainedFixture.h" /></ItemGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+</Project>

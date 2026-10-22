@@ -1,4 +1,11 @@
+#include <windows.h>
+static BOOL WINAPI PublicationReplaceFile(LPCWSTR,LPCWSTR,LPCWSTR,DWORD,LPVOID,LPVOID);
+static BOOL WINAPI PublicationSetFileInformation(HANDLE,FILE_INFO_BY_HANDLE_CLASS,LPVOID,DWORD);
+#define ReplaceFileW PublicationReplaceFile
+#define SetFileInformationByHandle PublicationSetFileInformation
 #include "../ClientNotes.h"
+#undef ReplaceFileW
+#undef SetFileInformationByHandle
 #include <richedit.h>
 #include <filesystem>
 #include <fstream>
@@ -23,6 +30,7 @@ static void PutBytes(const fs::path &path, const std::string &bytes) {
   file.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
   Check(file.good(), "Write byte fixture");
 }
+#include "NotesPublicationTests.inl"
 
 static void TestWorkspaceStorage(const fs::path &base) {
   using namespace client_notes;
@@ -32,7 +40,8 @@ static void TestWorkspaceStorage(const fs::path &base) {
   note.cursor=41; note.scroll=99; note.zoom=140; note.ticket=L"CASE-42";
   note.ticketUrl=L"https://example.com/tickets/42";
   note.links={{L"Support",L"https://example.com/support"}};
-  RememberRevision(note,"{\\rtf1 Earlier}",true);
+  const std::vector<std::pair<std::wstring,std::wstring>> earlierLinks;
+  RememberRevision(note,"{\\rtf1 Earlier}",true,&earlierLinks);
   std::string bytes; std::vector<NotePage> parsed;
   Check(SerializeNotebook({note},bytes) && ParseNotebook(bytes,parsed),"V2 notebook metadata round trip");
   const auto &copy=parsed.front();
@@ -213,18 +222,61 @@ static void TestNotebook(const fs::path &base) {
             inheritedPlain.pages[0].text == L"Legacy TXT" &&
             !fs::exists(legacy / client_notes::kNotebookFileName),
         "Legacy TXT lazily becomes Notes tab");
-  Check(client_notes::WriteNotebook(legacy, pages, inheritedPlain) &&
-            client_notes::Read(legacy).text == L"Legacy TXT",
+  Check(Save(legacy, L"Changed TXT before migration"),
+        "Change legacy TXT before first canonical notebook save");
+  Check(!client_notes::WriteNotebook(legacy, pages, inheritedPlain) &&
+            !fs::exists(legacy / client_notes::kNotebookFileName) &&
+            client_notes::Read(legacy).text == L"Changed TXT before migration",
+        "Stale first migration preserves the newer TXT source and creates no CTN");
+  const auto currentPlain = client_notes::ReadNotebook(legacy);
+  Check(client_notes::WriteNotebook(legacy, pages, currentPlain) &&
+            client_notes::Read(legacy).text == L"Changed TXT before migration",
         "Notebook save preserves legacy TXT");
   const auto beforeTxtChange = client_notes::ReadNotebook(legacy);
   Check(Save(legacy, L"Changed TXT"), "Change legacy TXT after notebook");
-  Check(!client_notes::WriteNotebook(legacy, pages, beforeTxtChange),
-        "Legacy TXT change invalidates notebook editor");
+  const auto modifiedTxtBytes = client_notes::ReadFileSnapshot(
+      legacy, client_notes::kFileName, client_notes::kMaxBytes).bytes;
+  auto afterTxtPages = pages;
+  afterTxtPages[0].ticket = L"Canonical change after obsolete TXT edit";
+  Check(client_notes::WriteNotebook(legacy, afterTxtPages, beforeTxtChange) &&
+            client_notes::Read(legacy).text == L"Changed TXT" &&
+            client_notes::ReadFileSnapshot(legacy, client_notes::kFileName,
+                                           client_notes::kMaxBytes).bytes ==
+                modifiedTxtBytes &&
+            client_notes::ReadNotebook(legacy).pages.size() == pages.size() &&
+            client_notes::ReadNotebook(legacy).pages[0].ticket == afterTxtPages[0].ticket,
+        "Canonical save ignores obsolete TXT changes and preserves their exact content");
   PutBytes(rtfPath, rtf);
   const auto beforeRtfChange = client_notes::ReadNotebook(legacy);
   PutBytes(rtfPath, "{\\rtf1 changed}");
-  Check(!client_notes::WriteNotebook(legacy, pages, beforeRtfChange),
-        "Legacy RTF change invalidates notebook editor");
+  auto afterRtfPages = pages;
+  afterRtfPages[0].ticket = L"Canonical change after obsolete RTF edit";
+  Check(client_notes::WriteNotebook(legacy, afterRtfPages, beforeRtfChange) &&
+            client_notes::ReadFileSnapshot(legacy, client_notes::kRichFileName,
+                                           client_notes::kMaxRichBytes).bytes ==
+                "{\\rtf1 changed}" &&
+            client_notes::ReadNotebook(legacy).pages.size() == pages.size() &&
+            client_notes::ReadNotebook(legacy).pages[0].ticket == afterRtfPages[0].ticket,
+        "Canonical save ignores obsolete RTF changes and preserves their exact bytes");
+  {
+    const fs::path pendingRich = base / L"Sites" / L"NotebookPendingRich";
+    fs::create_directory(pendingRich);
+    const fs::path pendingRtf = pendingRich / client_notes::kRichFileName;
+    PutBytes(pendingRtf, rtf);
+    const auto staleRich = client_notes::ReadNotebook(pendingRich);
+    const std::string newerRich = "{\\rtf1 Newer source before migration}";
+    PutBytes(pendingRtf, newerRich);
+    Check(!client_notes::WriteNotebook(pendingRich, pages, staleRich) &&
+              !fs::exists(pendingRich / client_notes::kNotebookFileName) &&
+              client_notes::ReadFileSnapshot(pendingRich, client_notes::kRichFileName,
+                                             client_notes::kMaxRichBytes).bytes ==
+                  newerRich,
+          "Stale first migration preserves the newer RTF source and creates no CTN");
+    const auto freshRich = client_notes::ReadNotebook(pendingRich);
+    Check(client_notes::WriteNotebook(pendingRich, pages, freshRich) &&
+              client_notes::ReadNotebook(pendingRich).pages.size() == pages.size(),
+          "Fresh RTF migration succeeds after rejecting the stale source");
+  }
   Check(client_notes::ReadNotebook(legacy).pages.size() == 2,
         "Canonical notebook takes precedence over legacy files");
   const fs::path legacyNotebook = legacy / client_notes::kNotebookFileName;
@@ -366,6 +418,7 @@ int main() {
           "Failed root revalidation preserves prior contents");
 
     TestWorkspaceStorage(base);
+    TestPublicationBoundaries(base);
     TestNotebook(base);
 
     const fs::path richClient = base / L"Sites" / L"Rich";

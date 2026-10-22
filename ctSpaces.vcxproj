@@ -166,10 +166,19 @@
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClInclude Include="BackupEngine.h" />
+    <ClInclude Include="BackupProgressUi.h" />
+    <ClInclude Include="BackupSelectionUi.inl" />
     <ClInclude Include="BrowserTitle.h" />
     <ClInclude Include="BrowserPreferencesJson.h" />
+    <ClInclude Include="BrowserTabLayoutUi.inl" />
+    <ClInclude Include="FirefoxPreferences.h" />
+    <ClInclude Include="BrowserProcessExit.h" />
+    <ClInclude Include="TransientProfileIdentity.h" />
     <ClInclude Include="ClientShortcutName.h" />
+    <ClInclude Include="ClientNameComparison.h" />
+    <ClInclude Include="ClientPreferenceEncoding.h" />
     <ClInclude Include="ClientActivity.h" />
+    <ClInclude Include="ClientTabLayout.h" />
     <ClInclude Include="ClientNotes.h" />
     <ClInclude Include="ConfigPersistence.h" />
     <ClInclude Include="GuidedWalkthrough.h" />
@@ -177,7 +186,17 @@
     <ClInclude Include="CleanupResultPages.h" />
     <ClInclude Include="OwnerDrawUi.h" />
     <ClInclude Include="NotesEditorUi.h" />
+    <ClInclude Include="NotesFindModel.h" />
+    <ClInclude Include="NotesUndo.h" />
+    <ClInclude Include="NotesFindUi.inl" />
+    <ClInclude Include="NotesSpelling.h" />
+    <ClInclude Include="NotesSpellingUi.inl" />
+    <ClInclude Include="NotesMarkdown.h" />
+    <ClInclude Include="NotesMarkdownUi.inl" />
+    <ClInclude Include="NotesTextTools.h" />
+    <ClInclude Include="NotesEditingExtras.inl" />
     <ClInclude Include="NotesWorkspaceUi.inl" />
+    <ClInclude Include="NotesAppTransaction.inl" />
     <ClInclude Include="NotesInspectorUi.inl" />
     <ClInclude Include="NotesProductivityUi.inl" />
     <ClInclude Include="NotesCodeUi.inl" />

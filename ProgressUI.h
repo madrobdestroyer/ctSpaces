@@ -13,7 +13,8 @@
 struct CtProgressPayload{
     int percent;            // 0..100, or -1 for marquee
     std::wstring text;      // base message, e.g. "Applying default profile..."
-    CtProgressPayload(int p,std::wstring t): percent(p),text(std::move(t)){}
+    std::wstring details;   // optional metadata and current relative path
+    CtProgressPayload(int p,std::wstring t,std::wstring d={}): percent(p),text(std::move(t)),details(std::move(d)){}
 };
 
 void ProgressUI_Init(HINSTANCE hInst);
@@ -21,10 +22,12 @@ void ProgressUI_SetTheme(COLORREF crWindow,COLORREF crText,COLORREF crBar,COLORR
 void ProgressUI_Show(HWND owner,const std::wstring& baseText,int percent);
 void ProgressUI_Update(int percent);          // uses last baseText
 void ProgressUI_Update(const std::wstring& baseText,int percent);
+void ProgressUI_Update(const std::wstring& baseText,int percent,const std::wstring& details);
 void ProgressUI_Hide();
 
 // Thread-safe helpers
 void ProgressUI_PostShow(HWND mainWnd,const std::wstring& baseText,int percent);
 void ProgressUI_PostUpdate(HWND mainWnd,int percent); // percent only
 void ProgressUI_PostUpdate(HWND mainWnd,const std::wstring& baseText,int percent);
+void ProgressUI_PostUpdate(HWND mainWnd,const std::wstring& baseText,int percent,const std::wstring& details);
 void ProgressUI_PostHide(HWND mainWnd);

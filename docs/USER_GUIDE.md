@@ -1,4 +1,4 @@
-﻿# ctSpaces User Guide
+# ctSpaces User Guide
 
 Applies to ctSpaces 6.3, including the Notes design review on the cpp branch.
 
@@ -72,20 +72,32 @@ offers four sort orders, and lets you select several notes for one action. The
 [Notes productivity guide](NOTES_PRODUCTIVITY.md) explains these flows and their scope.
 
 The main window has a **Notes** button beside **Close all**. It opens the selected
-client or returns to your last notebook. Inside Notes, there is one client picker:
+client or returns to your last notebook. Notes uses the launcher's themed rounded
+controls, client icons and accent colour. Small action icons keep their text labels.
+Inside Notes, there is one client picker:
 click the client name, then type to search every active client. Pinned and recent
 clients appear first, with up to eight matches. Use arrow keys and Enter, or click
 a client. Switching saves the original notebook before opening the destination;
 a failed save keeps the original notebook and its draft open.
 
-The full-width editor has slim tabs, a document heading and ticket/tag context.
-One compact row below the heading contains **Find**, **Snippets**, **Templates**,
-**Details**, **Status**, **Link/Open ticket**, and **Add update**.
+The full-width editor has slim tabs. The selected tab names the note; double-click
+it to rename it, or hover for its full name. Ticket/tag context appears on a small
+separate line only when supplied. Notes without that metadata get the space back.
+One compact row above the editor contains **Find**, **Snippets**, **Templates**,
+**Add update**, **Format**, and **Details**. A small status icon and label appear
+beside Details: a magnifier for Investigating, a clock for Waiting, a flag for
+Follow-up, or a circled check for Resolved. The indicator is read-only; use
+**Details** to change status, tags or ticket information. **No status** hides it.
+The ticket reference above the row opens a linked ticket when it has a URL.
+A number without a URL is plain read-only information; edit it in **Details**.
+An unlinked note has no redundant Link ticket control.
 Normal autosave has no status message; only save problems or invalid details are
 shown. **Details** combines ticket number, ticket URL, local status, and tags.
 Valid changes save automatically. Status organizes work locally and does not
 synchronize a ticketing system. **Open ticket** opens a linked URL in the PC's
-default browser outside client profiles.
+chosen regular PC browser outside client profiles. In **Details**, use **Open links in**
+directly below the ticket URL to choose that browser once for all note links.
+The dropdown shows the current choice; **More > Link browser** is also available.
 
 **Switch client**, **Details**, and **More …** are temporary panels. Click outside
 one or press Escape to dismiss it without resizing the editor. More supports
@@ -126,7 +138,7 @@ Choose **Help > Step-by-step walkthrough**, or **More > Notes walkthrough**, for
 
 **+** or **Ctrl+T** opens an Untitled note immediately. Double-click a tab to rename it when useful. Each tab has its own **X**; closing a tab preserves the note in **All notes**. **Ctrl+W** closes the current tab and **Ctrl+Shift+T** reopens the last closed tab in this session. Untouched, empty Untitled drafts are discarded when their tab or the Notes window closes, so their numbers become available again. Renamed notes, written content, and notes with metadata remain saved. Existing saved notes still reserve their names; the next blank note uses the lowest available Untitled number. Closing every tab leaves an empty workspace; **+** and **All notes** remain available.
 
-Right-click a tab to rename, duplicate, pin/unpin, close, close others, close all, archive, or move it to Trash. Drag tabs to reorder within the pinned or unpinned group; an accent line marks where the tab will land. **Move tab left/right** in the right-click menu, or **Ctrl+Shift+PgUp / Ctrl+Shift+PgDn**, moves the active tab one position. Reopening a closed note from All notes or with Ctrl+Shift+T puts it at the end of its group. Choosing an already-open note leaves its position unchanged. Scroll over tabs or use **Ctrl+Tab / Ctrl+Shift+Tab** to navigate; hover for the full name and a reordering hint. Names are unique, up to 64 characters. Open, closed, archived and deleted notes together count toward the 10,000-note limit.
+Right-click a tab to rename, duplicate, pin/unpin, close, close others, close all, archive, or move it to Trash. Drag tabs to reorder within the pinned or unpinned group; an accent line marks where the tab will land. **Move tab left/right** in the right-click menu, or **Ctrl+Shift+PgUp / Ctrl+Shift+PgDn**, moves the active tab one position. Reopening a closed note from All notes or with Ctrl+Shift+T puts it at the end of its group. Choosing an already-open note leaves its position unchanged. When the row fills, the left and right arrows scroll through your open tabs; adding a note reveals its tab without closing earlier notes. Scroll over tabs or use **Ctrl+Tab / Ctrl+Shift+Tab** to navigate; hover for the full name and a reordering hint. Names are unique, up to 64 characters. Open, closed, archived and deleted notes together count toward the 10,000-note limit.
 
 **All notes** and **Trash** remember their separate window dimensions and start in
 **This client** scope. The **All clients — search only** scope searches titles,
@@ -140,11 +152,26 @@ Deleting one client leaves other clients' notebooks untouched.
 
 Trash is this client's trash bin: notes remain indefinitely, with no automatic expiry, until you explicitly confirm **Delete forever** for one note or **Empty trash…** for every deleted note. Empty trash shows the total count and client before confirmation, includes deleted notes hidden by the current search, and permanently removes their revision histories. It leaves current notes, archived notes and other clients' notebooks intact. **No** is the default confirmation choice; a failed save blocks the operation before erasing notes. Deleted notes still count toward the 10,000-note limit. **More > All formatting and window commands** can enable checklist progress in the preview information.
 
-The toolbar provides normal text, headings, subheadings, labeled code blocks, font size, bold, italic, underline, highlighting, bullets, numbering, checklists, links, undo/redo and clearing formatting. The highlighter arrow shows color swatches and the selection's current highlight; the marker applies or removes the chosen color. Click a checklist box to toggle completion and strike through its text. Enter continues a checklist with an unchecked item; Enter on an empty item exits it. Tab and Shift+Tab adjust list indentation. Pasting inserts plain text.
+Select text to show a compact formatting palette beside it, or press **Format** to open it at your typing position. The palette provides normal text, headings, subheadings, labeled code blocks, font size, bold, italic, underline, highlighting, bullets, numbering, checklists, links, undo/redo and clearing formatting. It preserves your selection when you use a control. **Escape**, an outside click or scrolling dismisses it; resizing or switching notes also clears it. Formatting takes no permanent space above the document, and **Ctrl+B / Ctrl+I / Ctrl+U** work while the palette is hidden. The highlighter arrow shows color swatches and the selection's current highlight; the marker applies or removes the chosen color. Click a checklist box to toggle completion and strike through its text. Enter continues a checklist with an unchecked item; Enter on an empty item exits it. Tab and Shift+Tab adjust list indentation. Pasting inserts plain text.
 
-**More > All formatting and window commands** adds strikethrough, a timestamp, code style, copying the entire note, and templates for ticket investigations, maintenance, contacts and handover. **Ticket details (optional)** shows creation/edit dates and explains the ticket number and HTTP/HTTPS URL fields. The number labels the note in All notes and can be searched; the URL enables Open ticket link in All notes and Actions. These fields do not fetch or synchronize ticket data. **Always on top** and optional checklist progress are remembered settings. **Ctrl++ / Ctrl+- / Ctrl+0**, or Ctrl+mouse wheel, change view zoom without changing font sizes. Undo/redo history survives switching or closing/reopening tabs while the window stays open. The active note, cursor, scroll and zoom persist across window openings.
+**More > All formatting and window commands** adds strikethrough, a timestamp, code style, copying the entire note, and templates for ticket investigations, maintenance, contacts and handover. **Ticket details (optional)** shows creation/edit dates and explains the ticket number and HTTP/HTTPS URL fields. The number labels the note in All notes and can be searched; the URL enables Open ticket link in All notes and Actions. These fields do not fetch or synchronize ticket data. **Always on top** and optional checklist progress are remembered settings. **Ctrl++ / Ctrl+- / Ctrl+0**, or Ctrl+mouse wheel, change view zoom without changing font sizes. Undo/redo history stays with the active note and the 15 most recently visited open notes. Closing a tab releases its editor and undo history; reopening restores its saved content and cursor. Older open notes restore their document, selection, scroll and zoom when revisited, but start a fresh undo history. This keeps long sessions within Windows' native window-resource limit. The active note, cursor, scroll and zoom persist across window openings.
 
-Use **Ctrl+F** to find text in the active note, **F3 / Shift+F3** for next/previous, and **Ctrl+H** for replacement of the next match or all matches. Escape closes the find row. Right-click the document, or press the Menu key / Shift+F10, for Undo, Redo, Cut, Copy, Paste, and Select all. Paste inserts plain text. For a labeled web link, select text and choose Link, then enter its label and address. Select that label again to edit it, or use **More > Remove selected link / Copy selected link address**. Repeated identical labels in one note share the same address. Detected HTTP/HTTPS URLs work directly. **All note links**, including tickets, pasted URLs, and labeled links, ask before opening in your PC's default browser with your regular sign-in, outside client profiles.
+Use **Ctrl+F** to find text in the active note, **F3 / Shift+F3** for next/previous, and **Ctrl+H** for replacement of the next match or all matches. The temporary search rows offer Match case, Whole word and Wrap, with a match count and inline feedback. Typing a query does not move the caret; Replace all is one Undo action. Escape closes the rows and returns their space to the editor. Right-click the document, or press the Menu key / Shift+F10, for Undo, Redo, Cut, Copy, Paste, and Select all. Right-click directly on a detected URL or labeled link to also see **Open link** and **Copy link address**. Copy link address copies the destination, even when the visible label is different. The ticket link at the top has the same menu. With the caret or selection in a link, the Menu key / Shift+F10 offers these link commands too. Paste inserts plain text. For a labeled web link, select text and choose Link, then enter its label and address. Select that label again to edit it, or use **More > Remove selected link / Copy selected link address**. Repeated identical labels in one note share the same address. Detected HTTP/HTTPS URLs work directly. **All note links**, including tickets, pasted URLs, and labeled links, ask before opening in your chosen regular PC browser, outside client profiles. **More > Link browser** remembers one choice for every client notebook: System default, Microsoft Edge, Google Chrome, Brave or Firefox. Only installed browsers can be selected. This does not change your Windows default browser or the browsers used for client profiles. For example, choose Edge for work links while leaving Chrome as your personal default. If the chosen browser becomes unavailable, ctSpaces reports it rather than opening the link in a different browser.
+
+The searchable **More** panel contains these editing tools. Type a tool's name to find it without adding controls to the main toolbar:
+
+| Tool | Use |
+| --- | --- |
+| Word wrap | Switch between wrapped prose and horizontally scrolling logs. The remembered choice changes the view, not saved text. |
+| Go to line — Ctrl+G | Jump to a logical line number, including deliberate soft breaks and lines within code boxes, independent of visual wrapping. |
+| Document information | Read word, character, logical-line and selected-character counts. Counts also appear in Details. |
+| Check spelling — F7 | Review prose using installed Windows dictionaries. Select text to limit the review. Corrections require an explicit Change; code, native tables, links and technical tokens are skipped. Also available by right-clicking the document. |
+| Print or save as PDF — Ctrl+P | Print the note or its selected text. Choose Microsoft Print to PDF in the Windows printer dialog for PDF output. A separate print copy uses black text on white paper. The native Windows print host does not provide an in-dialog preview for this app. |
+| Import Markdown | Preview a UTF-8 .md or .markdown file, then create a separate note in this client. The preview explains unsupported conversions. |
+| Export Markdown | Save supported headings, emphasis, lists, checklists, inline code and web links as a portable copy. The preview explains formatting that Markdown cannot retain. Native tables and boxed code require a disclosed text copy. Use RTF for exact formatting or notebook export for metadata and history. |
+| Insert table | Add a simple editable table, up to 12 rows and 12 columns. Tab and Shift+Tab move between existing cells without adding rows. Native tables remain intact in RTF and notebook exports. |
+
+Automatic URL detection follows the Windows rich-text editor. If only part of a pasted URL is clickable, use the Link command to save the complete address explicitly; labeled links and ticket URLs retain their full destinations, including Unicode query text.
 
 Text, formatting and note changes save automatically after a brief typing pause. Switching tabs and closing the window flush pending edits. A failed save leaves the draft open and reports the failure in the title. **More > Retry saving**, **Copy entire note**, **Export this note**, and **Resolve save conflict** provide recovery actions. Conflict resolution can preview the latest saved notebook or keep changed drafts as separate recovered copies alongside it. A client rename/archive/delete/restore closes its notes safely first; a failed save blocks that operation.
 
@@ -156,7 +183,7 @@ Crash snapshots are written while editing. On the next opening, ctSpaces offers 
 
 Each note allows 32 MiB of UTF-8 text and 64 MiB of RTF; the complete notebook, including history, is limited to 256 MiB. Existing version-1 notebooks and legacy TXT/RTF notes remain readable. Saving with 6.3 upgrades the notebook format; older releases cannot read the new format. Keep a full backup before downgrading, or export individual notes as TXT/RTF. Opening untouched legacy content alone creates no new notebook.
 
-Notes stay with their client through rename, client archive, and full backup. Deleting the entire client deletes its notes and recovery files. Notes are local, unencrypted files. Images, attachments, tables, reminders, cloud sync, collaboration and password storage are saved for later in the notes roadmap and are not part of this release.
+Notes stay with their client through rename, client archive, and full backup. Deleting the entire client deletes its notes and recovery files. Notes are local, unencrypted files. Images, attachments, reminders, cloud sync, collaboration and password storage are saved for later in the notes roadmap and are not part of this release.
 
 ## Choose Whether A Browser Slot Restores Tabs
 
@@ -166,6 +193,24 @@ Notes stay with their client through rename, client archive, and full backup. De
 The choice is saved separately for each client/browser pair and affects that slot's next launch. Chrome and Firefox may therefore have different Restore tabs settings for the same client. Turning it off does not clear cookies, sign-ins, bookmarks, history, extensions, site data, or saved browser-session files. New slots, the Default editor, and temporary profiles always start fresh, so the switch stays off and unavailable for them.
 
 For a pinned favorite, first choose the intended browser, then right-click its shortcut and check or uncheck `Restore tabs` for that browser slot before opening it. `Select client` places it in the editable Client field without launching it. Right-click the pinned overflow control to select one of the hidden favorites and use the main switch.
+
+## Choose Vertical Or Horizontal Browser Tabs
+
+Open Settings and choose **Tab layout - all clients**:
+
+- **Keep browser's choice** is the default. ctSpaces does not enforce a layout.
+- **Vertical tabs** requests the browser's native vertical tab layout.
+- **Horizontal tabs** explicitly requests vertical tabs off for new windows.
+
+To make an exception, select an existing client and choose Settings > **Tab layout - this client**, or right-click its pinned shortcut and choose **Tab layout**. Select **Follow global setting**, **Vertical tabs**, or **Horizontal tabs**. The client override applies to all of that client's browser slots. For example, all clients can use vertical tabs while one client uses horizontal tabs. Switching that client back to Follow global immediately saves the inheritance choice for its next launch.
+
+ctSpaces prepares the new-window layout preference the next time that browser profile launches. Open browsers are not restarted or edited. Temporary browsers use the global choice; the Default profile editor keeps its own layout. Normal PC browsers used outside ctSpaces, including the regular browser used for Notes links, are unaffected. This setting does not clear sessions, sign-ins, bookmarks, extensions or notes.
+
+**Known Edge Restore tabs limitation:** Edge can restore the previous window's vertical/horizontal layout instead of using this preference. Live checks reproduced this in both directions. If you want session restore to keep a particular layout, change the layout in Edge itself before closing that window, then leave **Restore tabs** on. The ctSpaces setting does not force an already-running or restored window to change layout. Session files and saved tabs remain intact; no forced override is provided.
+
+The override is stored with the client, so it follows client rename, archive, backup and restore and disappears when that entire client is deleted. Keep browser's choice stops enforcement; it does not restore a historical layout that a previous choice replaced. For Firefox, ctSpaces also removes its own layout override from `user.js`, while preserving the user's other preference text.
+
+This uses each browser's native preference, with separate handling for Edge, Chrome, Brave and Firefox. The browser must support native vertical tabs, and organization policies or experimental browser modes can prevent the requested layout. These conditions are not overridden by ctSpaces.
 
 ## Pin Favorite Clients
 
@@ -318,13 +363,16 @@ Do not sign into a real client account while editing the Default profile. Accoun
 
 ## Back Up All Clients
 
-1. Close every supported browser process using a ctSpaces client profile, including one started manually with a ctSpaces profile path.
-2. Open Settings and select `Back Up All Client Data`.
-3. Choose where to save the `.7z` backup.
+1. Open Settings and select `Back Up All Client Data`.
+2. Every client starts checked, including archived clients. Uncheck any clients you want to leave out. Search to find names quickly; searching keeps your selections. While filtered, **Select shown** and **Clear shown** affect only the visible results.
+3. Close browsers using the selected clients, including any started manually with a ctSpaces profile path. Browsers for excluded clients may remain open.
+4. Choose **Choose location...** and save the `.7z` backup. At least one client must be selected; Cancel starts no backup.
 
-Backup is blocked if ctSpaces detects any supported browser process using a profile below `Sites`, or if a relevant process cannot be inspected reliably.
+Backup is blocked if a selected client's browser is using its profile, or if relevant process inspection is uncertain. The selection applies to this backup only; it does not delete, archive, or change any client's data.
 
-The default filename includes the date and time. ctSpaces writes the backup to a temporary file, verifies its manifest and archive integrity, and only then places it at the selected location. The backup contains the full `Sites` collection and may contain sensitive client browser data. Store it appropriately.
+The default filename includes the date and time. Each selected client includes its Notes and full browser profile data, including caches and stored site data. A few clients can therefore contain many files and take time to back up. The progress window identifies scanning, compression, source rechecking, archive integrity verification, and final saving. Compression and verification have their own percentages; scanning shows the number of items and bytes found. Elapsed time is shown while reports arrive.
+
+ctSpaces writes to a temporary file, verifies the selected client list, manifest, and archive integrity, and only then places the verified backup at the selected location. An existing destination stays intact if creation or validation fails. Backups may contain sensitive client browser data. Store them appropriately.
 
 ## Restore A Backup
 
@@ -336,6 +384,8 @@ Restore is blocked if ctSpaces detects any supported browser process using a pro
 
 Before replacing the current `Sites` folder, ctSpaces checks the archive paths and size, extracts into a staging folder, verifies the embedded manifest and profile count, and moves the current data to a timestamped `Sites_PreRestore_...` safety folder. A damaged or invalid backup never replaces the current `Sites` folder.
 
+Restore replaces the active client collection with the clients in the backup; it does not merge collections. If you left clients out of that backup, those clients will be absent from the restored active list. Their current data remains in the pre-restore safety folder with the rest of the previous collection. The confirmation explains this before restore starts.
+
 Browser security can tie some passwords or cookies to a Windows user or computer. A ctSpaces backup preserves the files but cannot guarantee that every protected sign-in will work on a different computer.
 
 ## Close ctSpaces
@@ -345,12 +395,14 @@ restores the existing launcher, including when it is hidden in the tray.
 
 Enable **Gear menu > Minimize to tray** to hide the launcher in the Windows
 notification area when you minimize it. Click its ctSpaces icon to restore it,
-or right-click the icon for **Show ctSpaces** and **Exit ctSpaces**. The option is
+or right-click the icon for **Show launcher** and **Exit ctSpaces and Notes**. The option is
 remembered and starts off. Turning it off keeps ordinary taskbar minimization.
 If Windows cannot register the tray icon, the window remains accessible through
-the taskbar. Closing the window still exits; tray mode affects Minimize only.
+the taskbar.
 
-If no clients are open, closing ctSpaces exits immediately.
+Notes has its own taskbar window. Minimizing or closing the launcher while Notes is open leaves Notes available and autosaving. Closing the launcher sends it to the tray in this case, with ordinary taskbar minimization as a fallback if Windows cannot register the tray icon. Closing the last Notes window leaves the hidden launcher available in the tray. Use **Exit ctSpaces and Notes** to close the entire application; pending Notes changes must save successfully first.
+
+If Notes and all client browsers are closed, closing the launcher exits immediately.
 
 If clients are open, ctSpaces asks whether it should close all client browser windows and exit. Choosing Yes requests a normal browser shutdown so session and sign-in data can finish writing. Choosing No leaves ctSpaces and the clients open.
 

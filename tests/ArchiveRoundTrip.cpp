@@ -9,8 +9,20 @@
 #include <iostream>
 #include <string>
 #include <vector>
+#include <winioctl.h>
+#include <cstring>
 
 namespace fs = std::filesystem;
+
+static std::vector<DWORD> forcedBackupGuids;
+HRESULT CtBackupTestCreateGuid(GUID *identity) {
+  const HRESULT hr = CoCreateGuid(identity);
+  if (SUCCEEDED(hr) && !forcedBackupGuids.empty()) {
+    identity->Data1 = forcedBackupGuids.front();
+    forcedBackupGuids.erase(forcedBackupGuids.begin());
+  }
+  return hr;
+}
 
 struct ProgressState {
   unsigned highestPercent = 0;
@@ -19,6 +31,7 @@ struct ProgressState {
 struct DeleteDuringCompressionState {
   fs::path filePath;
   bool attempted = false;
+  bool deleted = false;
 };
 
 struct ReplaceDuringExtractionState {
@@ -56,7 +69,7 @@ static void DeleteDuringCompression(void *user, _7zOp operation, unsigned,
     return;
   state->attempted = true;
   std::error_code error;
-  fs::remove(state->filePath, error);
+  state->deleted=fs::remove(state->filePath, error);
 }
 
 static void AttemptArchiveReplacement(void *user, _7zOp operation,
@@ -129,6 +142,483 @@ static std::vector<unsigned char> ReadBytes(const fs::path &path) {
   return data;
 }
 
+static bool CreateFixtureJunction(const fs::path &link, const fs::path &target,DWORD sharing=0) {
+  fs::create_directory(link);
+  const std::wstring print = fs::absolute(target).wstring();
+  const std::wstring substitute = L"\\??\\" + print;
+  struct MountPoint {
+    DWORD tag; WORD length, reserved;
+    WORD substituteOffset, substituteLength, printOffset, printLength;
+    wchar_t names[1];
+  };
+  const size_t namesBytes = (substitute.size() + print.size() + 2) * sizeof(wchar_t);
+  std::vector<unsigned char> buffer(offsetof(MountPoint, names) + namesBytes, 0);
+  auto *mount = reinterpret_cast<MountPoint *>(buffer.data());
+  mount->tag = IO_REPARSE_TAG_MOUNT_POINT;
+  mount->length = static_cast<WORD>(8 + namesBytes);
+  mount->substituteLength = static_cast<WORD>(substitute.size() * sizeof(wchar_t));
+  mount->printOffset = static_cast<WORD>((substitute.size() + 1) * sizeof(wchar_t));
+  mount->printLength = static_cast<WORD>(print.size() * sizeof(wchar_t));
+  std::memcpy(mount->names, substitute.data(), mount->substituteLength);
+  std::memcpy(reinterpret_cast<unsigned char *>(mount->names) + mount->printOffset,
+              print.data(), mount->printLength);
+  HANDLE handle = CreateFileW(link.c_str(), GENERIC_WRITE, sharing, nullptr, OPEN_EXISTING,
+      FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
+  if (handle == INVALID_HANDLE_VALUE) return false;
+  DWORD returned = 0;
+  const bool success = DeviceIoControl(handle, FSCTL_SET_REPARSE_POINT, buffer.data(),
+      static_cast<DWORD>(buffer.size()), nullptr, 0, &returned, nullptr) != FALSE;
+  CloseHandle(handle);
+  return success;
+}
+
+struct RestoreMutation {
+  fs::path target, destination;
+  unsigned mode = 0;
+  bool called = false, attempted = false;
+  DWORD error = ERROR_SUCCESS;
+};
+static bool MutateRestoreDuringGuard(void *user, std::wstring &) {
+  auto &mutation = *static_cast<RestoreMutation *>(user);
+  mutation.called = true;
+  if (mutation.mode == 1) {
+    HANDLE file = CreateFileW(mutation.target.c_str(), GENERIC_WRITE | FILE_WRITE_ATTRIBUTES,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, 0, nullptr);
+    if (file == INVALID_HANDLE_VALUE) return false;
+    FILETIME creation{}, access{}, write{};
+    GetFileTime(file, &creation, &access, &write);
+    const char changed[] = "EVIL";
+    DWORD written = 0;
+    mutation.attempted = WriteFile(file, changed, 4, &written, nullptr) && written == 4 &&
+        SetFileTime(file, &creation, &access, &write);
+    CloseHandle(file);
+  } else if (mutation.mode == 2) {
+    mutation.attempted = WriteBytes(mutation.target, {'A', 'D', 'D'});
+  } else if (mutation.mode == 3) {
+    mutation.attempted = CreateDirectoryW(mutation.target.c_str(), nullptr) != FALSE;
+  } else if (mutation.mode == 4) {
+    mutation.attempted = MoveFileExW(mutation.target.c_str(), mutation.destination.c_str(), 0) != FALSE;
+    mutation.error = mutation.attempted ? ERROR_SUCCESS : GetLastError();
+    return false; // Test that the bound roots cannot be replaced while guarded.
+  } else if (mutation.mode == 5) {
+    fs::rename(mutation.target, mutation.destination);
+    mutation.attempted = CreateFixtureJunction(mutation.target, mutation.destination);
+  }
+  return mutation.attempted;
+}
+
+static void MutateRestoreDuringRenameRetry(void *user) {
+  auto &mutation = *static_cast<RestoreMutation *>(user);
+  mutation.called = true;
+  if (mutation.mode == 3) {
+    mutation.attempted = CreateDirectoryW(mutation.target.c_str(), nullptr) != FALSE;
+    if (mutation.attempted)
+      mutation.attempted = WriteBytes(mutation.target / L"foreign.bin", {'K','E','E','P'});
+  } else {
+    mutation.attempted = MoveFileExW(mutation.target.c_str(), mutation.destination.c_str(), 0) != FALSE;
+    mutation.error = mutation.attempted ? ERROR_SUCCESS : GetLastError();
+  }
+}
+
+static void CheckRestoreIdentity(const fs::path &root) {
+  unsigned checks = 0;
+  const auto check = [&](bool passed, const char *description) {
+    if (!passed) throw std::runtime_error(description);
+    ++checks; std::cout << "PASS " << description << '\n';
+  };
+  const std::vector<unsigned char> stagedBytes{'S','A','F','E'}, liveBytes{'L','I','V','E'}, outsideBytes{'O','U','T','S'};
+  unsigned fixtureNumber = 0;
+  const auto run = [&](unsigned mode, const char *description) {
+    const fs::path fixture = root / std::to_wstring(++fixtureNumber);
+    CtBackup::StagedRestore staged{fixture / L"stage", fixture / L"stage" / L"Sites", 1};
+    const fs::path live = fixture / L"live" / L"Sites", recovery = fixture / L"recovery";
+    const fs::path outside = fixture / L"outside" / L"Sites";
+    fs::create_directories(staged.payloadDir / L"Alpha" / L"Default");
+    fs::create_directories(live / L"Keep");
+    fs::create_directories(outside / L"Alpha" / L"Default");
+    const fs::path stagedFile = staged.payloadDir / L"Alpha" / L"Default" / L"state.bin";
+    check(WriteBytes(stagedFile, stagedBytes) && WriteBytes(live / L"Keep" / L"state.bin", liveBytes) &&
+          WriteBytes(outside / L"Alpha" / L"Default" / L"state.bin", outsideBytes), "Identity fixture has three distinct sentinels");
+    check(CtBackup::CaptureStagedRestoreIdentity(staged).ok() && staged.validation != nullptr,
+          "Manual legacy-shaped stage seals its original real tree");
+    RestoreMutation mutation;
+    CtBackup::RestoreCommitGuard guard = nullptr;
+    fs::path junction;
+    if (mode == 0) staged.validation.reset();
+    if (mode == 1 || mode == 11 || mode == 12) {
+      const fs::path original = fixture / L"original";
+      const fs::path replaced = mode == 11 ? staged.stagingRoot : mode == 12 ?
+          staged.payloadDir / L"Alpha" / L"Default" : staged.payloadDir;
+      fs::rename(replaced, original);
+      fs::copy(original, replaced, fs::copy_options::recursive);
+    } else if (mode == 2 || mode == 3 || mode == 4) {
+      junction = mode == 2 ? staged.payloadDir : mode == 3 ? staged.stagingRoot : staged.payloadDir / L"Alpha" / L"Default";
+      fs::rename(junction, fixture / L"original");
+      const fs::path target = mode == 2 ? outside : mode == 3 ? fixture / L"outside" : outside / L"Alpha" / L"Default";
+      check(CreateFixtureJunction(junction, target), "Sealed object is replaced by an NTFS junction to disposable outside data");
+    } else if (mode >= 5 && mode <= 9) {
+      guard = MutateRestoreDuringGuard;
+      if (mode == 5) mutation = {stagedFile, {}, 1};
+      if (mode == 6) mutation = {stagedFile.parent_path() / L"added.bin", {}, 2};
+      if (mode == 7) mutation = {recovery, {}, 3};
+      if (mode == 8) mutation = {staged.payloadDir, fixture / L"guard-original", 4};
+      if (mode == 9) mutation = {stagedFile.parent_path(), fixture / L"guard-original", 5};
+    } else if (mode == 10) CtBackup::FailRestoreRenameForTest(2);
+    const CtBackup::Result result = CtBackup::CommitStagedRestore(staged, live, recovery, guard, &mutation);
+    check(!result.ok(), description);
+    check(ReadBytes(live / L"Keep" / L"state.bin") == liveBytes &&
+          ReadBytes(outside / L"Alpha" / L"Default" / L"state.bin") == outsideBytes,
+          "Rejected commit preserves original live and outside data");
+    check(mode == 7 ? fs::is_directory(recovery) && fs::is_empty(recovery) : !fs::exists(recovery),
+          "Rejected commit preserves the recovery namespace without overwriting another item");
+    if (guard) {
+      check(mutation.called, "Mutation happens inside the final precommit guard");
+      check(mode == 8 ? !mutation.attempted && mutation.error == ERROR_SHARING_VIOLATION : mutation.attempted,
+            "Guard mutation is observed or bound root replacement is prevented");
+    }
+    if (mode == 10) {
+      check(ReadBytes(stagedFile) == stagedBytes && fs::exists(staged.stagingRoot),
+            "Actual injected second move failure rolls back and keeps the sealed payload");
+      const auto retry = CtBackup::CommitStagedRestore(staged, live, recovery);
+      check(retry.ok() && ReadBytes(live / L"Alpha" / L"Default" / L"state.bin") == stagedBytes &&
+            ReadBytes(recovery / L"Keep" / L"state.bin") == liveBytes && !fs::exists(staged.stagingRoot),
+            "Rolled-back bound directory move can retry successfully with original recovery intact");
+    }
+    if (!junction.empty()) check(RemoveDirectoryW(junction.c_str()) != FALSE,
+                                "Junction fixture cleanup removes only the link object");
+    if (mode == 9) check(RemoveDirectoryW(stagedFile.parent_path().c_str()) != FALSE,
+                         "Guard junction cleanup removes only its link");
+  };
+  run(0, "Reconstructed unsealed stage cannot bypass validation");
+  run(1, "Identical contents in a replacement payload object are rejected");
+  run(2, "Sealed payload root junction substitution is rejected");
+  run(3, "Sealed staging root junction substitution is rejected");
+  run(4, "Sealed child directory junction substitution is rejected");
+  run(5, "Guard-time equal-length mutation with restored timestamps is rejected by SHA-256");
+  run(6, "Guard-time newly added file is rejected");
+  run(7, "Guard-time recovery destination creation is rejected without overwrite");
+  run(8, "Bound payload root rejects guard-time rename and preserves the sealed object");
+  run(9, "Guard-time child junction substitution is rejected");
+  run(10, "Actual second bound directory move failure exercises recovery rollback");
+  run(11, "Identical contents in a replacement staging root object are rejected");
+  run(12, "Identical contents in a replacement child directory object are rejected");
+  const fs::path collisionFixture = root / L"occupied-stage";
+  const fs::path collisionSource = collisionFixture / L"source" / L"Sites";
+  fs::create_directories(collisionSource / L"Alpha" / L"Default");
+  check(WriteBytes(collisionSource / L"Alpha" / L"Default" / L"state.bin", stagedBytes),
+        "Occupied-stage fixture source written");
+  const fs::path archive = collisionFixture / L"backup.7z";
+  check(CtBackup::CreateValidated7zBackup(collisionSource, archive, CTSPACES_VERSION_TEXT, nullptr, nullptr).ok(),
+        "Occupied-stage fixture creates a verified archive");
+  const fs::path occupied = collisionFixture / L"stage";
+  fs::create_directory(occupied);
+  check(WriteBytes(occupied / L"unrelated.bin", outsideBytes), "Occupied stage has unrelated bytes before extraction");
+  CtBackup::StagedRestore rejected;
+  check(!CtBackup::StageValidated7zRestore(archive, occupied, nullptr, nullptr, rejected).ok() &&
+        ReadBytes(occupied / L"unrelated.bin") == outsideBytes && !fs::exists(occupied / L"Sites") &&
+        rejected.stagingRoot.empty(), "Native staging refuses a nonempty existing location without deleting its data");
+  const fs::path linkedStage = collisionFixture / L"linked-stage";
+  check(CreateFixtureJunction(linkedStage, occupied), "Occupied staging root junction fixture created");
+  check(!CtBackup::StageValidated7zRestore(archive, linkedStage, nullptr, nullptr, rejected).ok() &&
+        ReadBytes(occupied / L"unrelated.bin") == outsideBytes,
+        "Native staging refuses a root junction without deleting its link or outside target");
+  check(RemoveDirectoryW(linkedStage.c_str()) != FALSE, "Occupied stage junction cleanup removes only the link object");
+  for (unsigned scenario = 0; scenario < 4; ++scenario) {
+    // Stay inside the product's reserved new-client Win32 path budget even
+    // when the host TEMP directory is longer than the project fixture root.
+    const fs::path fixture = root / (L"t" + std::to_wstring(scenario));
+    CtBackup::StagedRestore staged{fixture / L"stage", fixture / L"stage" / L"Sites", 1};
+    const fs::path live = fixture / L"live" / L"Sites", recovery = fixture / L"recovery";
+    const fs::path stagedFile = staged.payloadDir / L"Alpha" / L"Default" / L"state.bin";
+    fs::create_directories(stagedFile.parent_path()); fs::create_directories(live / L"Keep");
+    check(WriteBytes(stagedFile, stagedBytes) && WriteBytes(live / L"Keep" / L"state.bin", liveBytes),
+          "Rename-retry fixture stores distinct staged and live bytes");
+    check(CtBackup::CaptureStagedRestoreIdentity(staged).ok(), "Rename-retry fixture seals its exact real tree");
+    RestoreMutation mutation;
+    if (scenario == 0) CtBackup::DenyRestoreRenameAttemptsForTest(2, 3);
+    if (scenario == 1) CtBackup::DenyRestoreRenameAttemptsForTest(2, 32);
+    if (scenario == 2) {
+      mutation = {recovery, {}, 3};
+      CtBackup::DenyRestoreRenameAttemptsForTest(1, 1, MutateRestoreDuringRenameRetry, &mutation);
+    }
+    if (scenario == 3) {
+      mutation = {staged.payloadDir, fixture / L"moved-payload", 4};
+      CtBackup::DenyRestoreRenameAttemptsForTest(2, 1, MutateRestoreDuringRenameRetry, &mutation);
+    }
+    const auto result = CtBackup::CommitStagedRestore(staged, live, recovery);
+    if (scenario == 0 || scenario == 3) {
+      check(result.ok() && ReadBytes(live / L"Alpha" / L"Default" / L"state.bin") == stagedBytes &&
+            ReadBytes(recovery / L"Keep" / L"state.bin") == liveBytes && !fs::exists(staged.stagingRoot),
+            "Transient access denial retries promotion with exact installed and recovery bytes");
+      check(CtBackup::RestoreRenameAttemptsForTest() >= (scenario == 0 ? 4u : 2u) &&
+            CtBackup::RestoreRenameAttemptsForTest() <= 8,
+            "Bound restore rename uses at most eight attempts");
+      if (scenario == 3)
+        check(mutation.called && !mutation.attempted && mutation.error == ERROR_SHARING_VIOLATION &&
+              !fs::exists(mutation.destination), "Source root remains protected against namespace replacement during retry backoff");
+    } else if (scenario == 1) {
+      check(!result.ok() && result.code == HRESULT_FROM_WIN32(ERROR_ACCESS_DENIED) &&
+            CtBackup::RestoreRenameAttemptsForTest() == 8,
+            "Persistent access denial exhausts the bounded attempts and preserves its exact error");
+      check(ReadBytes(live / L"Keep" / L"state.bin") == liveBytes && ReadBytes(stagedFile) == stagedBytes &&
+            !fs::exists(recovery), "Exhausted second promotion retries roll back exact old live and keep the sealed staged payload");
+      CtBackup::DenyRestoreRenameAttemptsForTest(0, 0);
+      check(CtBackup::CommitStagedRestore(staged, live, recovery).ok() &&
+            ReadBytes(live / L"Alpha" / L"Default" / L"state.bin") == stagedBytes &&
+            ReadBytes(recovery / L"Keep" / L"state.bin") == liveBytes,
+            "An exhausted promotion can later retry the same valid sealed payload safely");
+    } else {
+      check(mutation.called && mutation.attempted && !result.ok() &&
+            result.code == HRESULT_FROM_WIN32(ERROR_ALREADY_EXISTS) && CtBackup::RestoreRenameAttemptsForTest() == 1,
+            "A destination created during backoff rejects before a second native move attempt");
+      check(ReadBytes(recovery / L"foreign.bin") == std::vector<unsigned char>{'K','E','E','P'} &&
+            ReadBytes(live / L"Keep" / L"state.bin") == liveBytes && ReadBytes(stagedFile) == stagedBytes,
+            "Retry never replaces newly occupied destination bytes or disturbs original live/staged data");
+    }
+  }
+  CtBackup::DenyRestoreRenameAttemptsForTest(0, 0);
+  std::cout << "Restore identity regressions: " << checks << " checks passed.\n";
+}
+
+static void CheckBackupStaging(const fs::path &root, const fs::path &sites) {
+  unsigned checks = 0;
+  const auto check = [&](bool passed, const char *description) {
+    if (!passed)
+      throw std::runtime_error(description);
+    ++checks;
+    std::cout << "PASS " << description << '\n';
+  };
+  const fs::path output = root / L"bounded-staging";
+  fs::create_directories(output);
+  const std::vector<unsigned char> sentinel{'O', 'L', 'D'};
+  const fs::path finalNameCollision = output / L"deadbeef.7z";
+  forcedBackupGuids = {0xDEADBEEF, 0x22222222, 0x33333333};
+  auto forcedResult = CtBackup::CreateValidated7zBackup(
+      sites, finalNameCollision, CTSPACES_VERSION_TEXT, nullptr, nullptr);
+  check(forcedResult.ok() && fs::is_regular_file(finalNameCollision),
+        "Final-name GUID collision cannot let manifest cleanup delete the completed backup");
+  _7zArchiveInfo collisionInfo{};
+  check(SUCCEEDED(_7zInspect7z(finalNameCollision.c_str(), &collisionInfo)),
+        "Backup with a deliberately colliding final filename remains a valid archive");
+  fs::remove(finalNameCollision);
+  const fs::path stagedCollision = output / L"11111111.7z";
+  check(WriteBytes(stagedCollision, sentinel), "Deterministic staging collision sentinel created");
+  forcedBackupGuids = {0x11111111, 0x22222222, 0x11111111, 0x33333333};
+  forcedResult = CtBackup::CreateValidated7zBackup(
+      sites, output / L"forced-collision.7z", CTSPACES_VERSION_TEXT, nullptr, nullptr);
+  check(forcedResult.ok() && ReadBytes(stagedCollision) == sentinel &&
+            !fs::exists(output / L"22222222.7z") && !fs::exists(output / L"33333333.7z"),
+        "Manifest and archive GUID collisions retry without deleting unrelated files");
+  forcedBackupGuids.clear();
+  fs::remove(stagedCollision);
+  fs::remove(output / L"forced-collision.7z");
+  for (const size_t length : {size_t{249}, size_t{259}}) {
+    const fs::path destination = output /
+        (std::wstring(length - output.native().size() - 4, L'x') + L".7z");
+    check(destination.native().size() == length &&
+              WriteBytes(destination, sentinel),
+          "Existing near-MAX_PATH backup target is valid");
+    auto result = CtBackup::CreateValidated7zBackup(
+        sites, destination, CTSPACES_VERSION_TEXT, nullptr, nullptr);
+    check(result.ok() && ReadBytes(destination) != sentinel,
+          "Valid near-MAX_PATH backup succeeds and replaces sentinel");
+    CtBackup::StagedRestore staged;
+    const fs::path stage = root / L"long-target-stage";
+    result = CtBackup::StageValidated7zRestore(destination, stage, nullptr,
+                                            nullptr, staged);
+    check(result.ok() && staged.profileCount == 2,
+          "Near-MAX_PATH backup verifies and restores both clients");
+    fs::remove_all(stage);
+  }
+  const fs::path deepBase = output / L"deep";
+  const fs::path deep = deepBase /
+      std::wstring(CtBackup::Detail::kLegacyMaximumDirectoryPathCharacters -
+                       deepBase.native().size() - 1, L'd');
+  fs::create_directories(deep);
+  const fs::path deepBackup = deep / L"x.7z";
+  auto result = CtBackup::CreateValidated7zBackup(
+      sites, deepBackup, CTSPACES_VERSION_TEXT, nullptr, nullptr);
+  check(result.ok() && fs::is_regular_file(deepBackup),
+        "Backup stages safely beside a maximum-budget directory");
+  check(std::distance(fs::directory_iterator(deep),
+                      fs::directory_iterator{}) == 1,
+        "Successful long-directory backup leaves no manifest or staging file");
+
+  const fs::path tooLong = output /
+      (std::wstring(260 - output.native().size() - 4, L'z') + L".7z");
+  result = CtBackup::CreateValidated7zBackup(
+      sites, tooLong, CTSPACES_VERSION_TEXT, nullptr, nullptr);
+  check(result.code == HRESULT_FROM_WIN32(ERROR_FILENAME_EXCED_RANGE) &&
+            result.details.find(L"too long") != std::wstring::npos,
+        "Over-budget output reports its actual path-length failure");
+
+  const fs::path ordinary = output / L"ordinary.7z";
+  result = CtBackup::CreateValidated7zBackup(
+      sites, ordinary, CTSPACES_VERSION_TEXT, nullptr, nullptr);
+  check(result.ok(), "Backup failure-cleanup fixture created");
+  const auto saved = ReadBytes(ordinary);
+  const auto itemCount = std::distance(fs::directory_iterator(output),
+                                       fs::directory_iterator{});
+  HANDLE locked = CreateFileW(ordinary.c_str(), GENERIC_READ, 0, nullptr,
+                              OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+  check(locked != INVALID_HANDLE_VALUE, "Previous backup locked against replacement");
+  result = CtBackup::CreateValidated7zBackup(
+      sites, ordinary, CTSPACES_VERSION_TEXT, nullptr, nullptr);
+  CloseHandle(locked);
+  check(!result.ok() && ReadBytes(ordinary) == saved,
+        "Failed replacement preserves previous backup bytes");
+  check(std::distance(fs::directory_iterator(output),
+                      fs::directory_iterator{}) == itemCount,
+        "Failed replacement removes owned archive and manifest");
+
+  const fs::path sourceFile = sites / L"Alpha" / L"Default" / L"state.bin";
+  locked = CreateFileW(sourceFile.c_str(), GENERIC_READ, 0, nullptr,
+                      OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+  check(locked != INVALID_HANDLE_VALUE, "Backup source file locked unreadable");
+  result = CtBackup::CreateValidated7zBackup(
+      sites, ordinary, CTSPACES_VERSION_TEXT, nullptr, nullptr);
+  CloseHandle(locked);
+  check(!result.ok() && ReadBytes(ordinary) == saved,
+        "Partial compression failure preserves previous backup");
+  check(std::distance(fs::directory_iterator(output),
+                      fs::directory_iterator{}) == itemCount,
+        "Partial compression failure removes its owned staging file");
+
+  const fs::path manifest = output / L"ownership.manifest";
+  check(WriteBackupManifest(manifest, 2), "Collision ownership manifest created");
+  const fs::path collision = output / L"collision.7z";
+  check(WriteBytes(collision, sentinel), "Existing staging collision sentinel created");
+  bool created = true;
+  const HRESULT collisionResult = _7zCompress7zWithExtraFile(
+      collision.c_str(), sites.c_str(), true, manifest.c_str(),
+      L"ctSpacesBackup.manifest", nullptr, nullptr, &created);
+  check(FAILED(collisionResult) && !created && ReadBytes(collision) == sentinel,
+        "Atomic output collision reports no ownership and preserves bytes");
+  const fs::path owned = output / L"owned.7z";
+  const HRESULT ownedResult = _7zCompress7zWithExtraFile(
+      owned.c_str(), sites.c_str(), true, manifest.c_str(),
+      L"ctSpacesBackup.manifest", nullptr, nullptr, &created);
+  check(SUCCEEDED(ownedResult) && created && fs::is_regular_file(owned),
+        "Successful compression reports ownership of newly created output");
+  fs::remove(manifest);
+  fs::remove(collision);
+  fs::remove(owned);
+  const fs::path hardlink = output / L"hardlink.7z";
+  const auto sourceBytes = ReadBytes(sourceFile);
+  check(CreateHardLinkW(hardlink.c_str(), sourceFile.c_str(), nullptr) != FALSE,
+        "Backup destination hardlink fixture created");
+  result = CtBackup::CreateValidated7zBackup(
+      sites, hardlink, CTSPACES_VERSION_TEXT, nullptr, nullptr);
+  check(result.ok() && ReadBytes(sourceFile) == sourceBytes &&
+            ReadBytes(hardlink) != sourceBytes,
+        "Replacing a destination hardlink leaves linked client source bytes intact");
+  fs::remove(hardlink);
+  const fs::path linkTarget = output / L"link-target.bin";
+  const fs::path symbolic = output / L"symbolic.7z";
+  check(WriteBytes(linkTarget, sentinel), "Backup destination symlink target fixture created");
+  if (CreateSymbolicLinkW(symbolic.c_str(), linkTarget.c_str(),
+                          SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE)) {
+    result = CtBackup::CreateValidated7zBackup(
+        sites, symbolic, CTSPACES_VERSION_TEXT, nullptr, nullptr);
+    check(result.ok() && ReadBytes(linkTarget) == sentinel &&
+              (GetFileAttributesW(symbolic.c_str()) & FILE_ATTRIBUTE_REPARSE_POINT) == 0,
+          "Backup replaces the destination symlink entry without overwriting its target");
+    fs::remove(symbolic);
+  } else {
+    std::cout << "SKIP destination file symlink: Win32 " << GetLastError() << '\n';
+  }
+  fs::remove(linkTarget);
+  for (unsigned iteration = 0; iteration < 20; ++iteration) {
+    result = CtBackup::CreateValidated7zBackup(
+        sites, ordinary, CTSPACES_VERSION_TEXT, nullptr, nullptr);
+    check(result.ok(), "Repeated bounded sibling backup remains valid");
+  }
+  check(std::distance(fs::directory_iterator(output),
+                      fs::directory_iterator{}) == itemCount,
+        "Repeated backups leave no staged archives or manifest files");
+  std::cout << "Backup staging: " << checks << " regression checks passed.\n";
+}
+
+static void CheckBackupFailures(const fs::path &root, const fs::path &sites,
+                                const fs::path &validArchive) {
+  unsigned checks = 0;
+  const auto check = [&](bool passed, const char *description) {
+    if (!passed) throw std::runtime_error(description);
+    ++checks; std::cout << "PASS " << description << '\n';
+  };
+  const fs::path fixture = root / L"failure-stress";
+  fs::create_directory(fixture);
+  const auto original = ReadBytes(validArchive);
+  for (unsigned i = 0; i < 55; ++i) {
+    const fs::path truncated = fixture / L"truncated.7z";
+    check(WriteBytes(truncated, std::vector<unsigned char>(original.begin(),
+              original.begin() + original.size() * i / 55)),
+          "Truncated archive stress fixture written");
+    CtBackup::StagedRestore staged;
+    const fs::path stage = fixture / L"truncated-stage";
+    const auto result = CtBackup::StageValidated7zRestore(
+        truncated, stage, nullptr, nullptr, staged);
+    check(!result.ok() && staged.stagingRoot.empty(),
+          "Truncated archive rejects restore without a commit-ready result");
+    check(!fs::exists(stage), "Rejected truncation removes extraction staging");
+  }
+  const fs::path manifest = fixture / L"manifest";
+  const fs::path malformed = fixture / L"malformed.7z";
+  for (const std::string &count : {std::string("0"),
+          std::string("18446744073709551616"), std::string("-1"),
+          std::string("3"), std::string("2\nprofileCount=2")}) {
+    const std::string fields =
+        "format=ctSpaces-backup\nformatVersion=1\nappVersion="
+        CTSPACES_VERSION_TEXT "\ncreatedUtc=2026-10-14T00:00:00Z\n"
+        "payload=Sites\nprofileCount=" + count + "\n";
+    check(WriteBytes(manifest, std::vector<unsigned char>(fields.begin(), fields.end())),
+          "Malformed manifest stress fixture written");
+    fs::remove(malformed);
+    check(SUCCEEDED(_7zCompress7zWithExtraFile(malformed.c_str(), sites.c_str(),
+          true, manifest.c_str(), L"ctSpacesBackup.manifest", nullptr, nullptr)),
+          "Malformed manifest compressed into otherwise valid archive");
+    CtBackup::StagedRestore staged;
+    const fs::path stage = fixture / L"manifest-stage";
+    const auto result = CtBackup::StageValidated7zRestore(
+        malformed, stage, nullptr, nullptr, staged);
+    check(!result.ok() && !fs::exists(stage) && staged.stagingRoot.empty(),
+          "Invalid or mismatched profile count rejects restore and cleans staging");
+  }
+  CtBackup::StagedRestore staged;
+  auto result = CtBackup::StageValidated7zRestore(validArchive,
+      fixture / L"rollback-stage", nullptr, nullptr, staged);
+  check(result.ok(), "Restore swap-failure fixture stages a valid backup");
+  const fs::path live = fixture / L"live" / L"Sites";
+  const fs::path keep = live / L"Keep" / L"state.bin";
+  fs::create_directories(keep.parent_path());
+  const std::vector<unsigned char> sentinel{'L','I','V','E'};
+  check(WriteBytes(keep, sentinel), "Restore rollback fixture preserves distinct live data");
+  HANDLE lock = CreateFileW(staged.payloadDir.c_str(), GENERIC_READ,
+      FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING,
+      FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+  check(lock != INVALID_HANDLE_VALUE, "Staged payload locked against its second swap rename");
+  const fs::path recovery = fixture / L"recovery";
+  result = CtBackup::CommitStagedRestore(staged, live, recovery);
+  CloseHandle(lock);
+  check(!result.ok() && ReadBytes(keep) == sentinel && !fs::exists(recovery),
+        "Locked payload is rejected before moving the original Sites");
+  check(fs::is_regular_file(staged.payloadDir / L"Alpha" / L"Default" / L"state.bin"),
+        "Failed directory swap keeps the complete verified restore payload");
+  result = CtBackup::CommitStagedRestore(staged, live, recovery);
+  if (!result.ok()) std::wcerr << L"Retry failure: " << std::hex << result.code << L" " << result.details << L"\n";
+  check(result.ok() && ReadBytes(recovery / L"Keep" / L"state.bin") == sentinel,
+        "Restore retries successfully after the lock is released and retains recovery");
+  check(fs::is_regular_file(live / L"Alpha" / L"Default" / L"state.bin") &&
+            !fs::exists(staged.stagingRoot),
+        "Successful retry installs the backup and removes extraction staging");
+  std::cout << "Backup failure stress: " << checks << " checks passed.\n";
+}
+
+#include "ArchiveSourceIsolationTests.inl"
+#include "BackupPublicationTests.inl"
+#include "BackupProfileCountTests.inl"
+#include "ArchiveOutputOwnershipTests.inl"
+
 int wmain(int argc, wchar_t **argv) {
   const fs::path root =
       fs::temp_directory_path() /
@@ -140,13 +630,24 @@ int wmain(int argc, wchar_t **argv) {
 
   struct Cleanup {
     fs::path path;
+    bool passed = false;
     ~Cleanup() {
+      if (!passed) {
+        std::wcerr << L"Failed archive fixture retained: " << path << L'\n';
+        return;
+      }
       std::error_code error;
       fs::remove_all(path, error);
     }
   } cleanup{root};
 
   try {
+    if(argc==2 && std::wstring(argv[1])==L"--output-inventory") {
+      TestArchiveOutputOwnership(root/L"oi");cleanup.passed=true;return 0;
+    }
+    if(argc==2 && std::wstring(argv[1])==L"--profile-count") {
+      TestBackupProfileCountReconciliation(root/L"pc");cleanup.passed=true;return 0;
+    }
     fs::create_directories(source / L"nested" / L"empty");
 
     const std::vector<unsigned char> rootData = {
@@ -163,6 +664,12 @@ int wmain(int argc, wchar_t **argv) {
     }
 
     _7zSetHInstance(GetModuleHandleW(nullptr));
+    TestArchiveSourceIsolation(root/L"source-isolation");
+    TestRestoreDestinationParentBindings(root);
+    TestOwnedExtractionCleanupRetries(root);
+    TestArchiveOutputOwnership(root/L"oi");
+    TestBackupProfileCountReconciliation(root/L"pc");
+    TestBackupPublicationOwnership(root/L"output-ownership");
 
     const std::vector<std::wstring> invalidClientNames = {
         L"",          L" Default", L"Client ", L"Client.",
@@ -256,6 +763,7 @@ int wmain(int argc, wchar_t **argv) {
     }
     CtBackup::StagedRestore overBudgetRestore{
         budgetRestoreStage, budgetRestorePayload, 1};
+    if (!CtBackup::CaptureStagedRestoreIdentity(overBudgetRestore).ok()) return 48;
     const CtBackup::Result overBudgetCommit =
         CtBackup::CommitStagedRestore(overBudgetRestore, budgetLiveSites,
                                       budgetRecovery);
@@ -281,6 +789,7 @@ int wmain(int argc, wchar_t **argv) {
     }
     RestoreGuardState guardState;
     CtBackup::StagedRestore guardedRestore{guardStage, guardPayload, 1};
+    if (!CtBackup::CaptureStagedRestoreIdentity(guardedRestore).ok()) return 50;
     const CtBackup::Result guardResult = CtBackup::CommitStagedRestore(
         guardedRestore, guardLiveSites, guardRecovery, RejectRestoreCommit,
         &guardState);
@@ -324,6 +833,7 @@ int wmain(int argc, wchar_t **argv) {
     }
     CtBackup::StagedRestore recoveryBudgetRestore{
         recoveryStage, recoveryPayload, 1};
+    if (!CtBackup::CaptureStagedRestoreIdentity(recoveryBudgetRestore).ok()) return 54;
     RestoreGuardState recoveryGuardState;
     const CtBackup::Result recoveryBudgetResult =
         CtBackup::CommitStagedRestore(
@@ -614,6 +1124,9 @@ int wmain(int argc, wchar_t **argv) {
     }
 
     CtBackup::StagedRestore stagedRestore;
+    CheckBackupStaging(root, backupSites);
+    CheckRestoreIdentity(root / L"identity");
+    CheckBackupFailures(root, backupSites, validatedBackup);
     const fs::path replacementBackup = root / L"replacement.7z";
     fs::copy_file(validatedBackup, replacementBackup);
     ReplaceDuringExtractionState replacementState{
@@ -766,15 +1279,16 @@ int wmain(int argc, wchar_t **argv) {
     HRESULT incompleteResult = _7zCompress7z(
         incompleteArchive.c_str(), disappearingSource.c_str(), false,
         DeleteDuringCompression, &deleteState);
-    if (!deleteState.attempted || SUCCEEDED(incompleteResult)) {
-      std::wcerr << L"A skipped source file was incorrectly reported as a "
-                    L"successful backup.\n";
+    if (!deleteState.attempted || deleteState.deleted || FAILED(incompleteResult) ||
+        ReadBytes(disappearingFile)!=binaryData) {
+      std::wcerr << L"The bound backup source did not prevent a concurrent deletion.\n";
       return 17;
     }
 
     std::wcout
         << L"In-process archive, validated backup, corruption, and restore "
            L"tests passed.\n";
+    cleanup.passed = true;
     return 0;
   } catch (const std::exception &error) {
     std::cerr << "Archive round-trip threw: " << error.what() << '\n';

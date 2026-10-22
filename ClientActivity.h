@@ -1,5 +1,6 @@
 #pragma once
 
+#include "ClientDeletionSafety.h"
 #include <windows.h>
 #include <algorithm>
 #include <charconv>
@@ -7,6 +8,7 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <vector>
 
 // Deliberate application activity, never NTFS access/modified timestamps.
 // Kept at the whole-client root so rename preserves it and deletion removes it.
@@ -110,7 +112,12 @@ inline std::optional<Record> Read(const std::filesystem::path &root) {
 inline bool Write(const std::filesystem::path &root, const Record &record,
                   bool onlyIfMissing = false) {
   std::lock_guard<std::mutex> lock(mutex);
-  if (!SafeDirectory(root))
+  // Updating inactivity history must remain attached to the original client.
+  // An attribute check alone cannot prevent a different client being moved
+  // into the same pathname before the staging file is created.
+  client_deletion_safety::BoundTree clientNamespace;
+  std::wstring namespaceError;
+  if (!clientNamespace.CaptureNamespace(root, namespaceError))
     return false;
   const auto path = root / kFileName;
   const DWORD attributes = GetFileAttributesW(path.c_str());
@@ -124,34 +131,79 @@ inline bool Write(const std::filesystem::path &root, const Record &record,
     return false;
   }
   const std::string contents = Encode(record);
+  if (Decode(contents) != std::optional<Record>(record))
+    return false;
   for (unsigned attempt = 0; attempt < 16; ++attempt) {
     const auto stage = root /
         (L".ctSpaces-activity-" + std::to_wstring(GetCurrentProcessId()) + L"-" +
          std::to_wstring(GetTickCount64()) + L"-" + std::to_wstring(attempt));
-    HANDLE file = CreateFileW(stage.c_str(), GENERIC_WRITE, 0, nullptr,
-                              CREATE_NEW, FILE_ATTRIBUTE_NORMAL |
-                              FILE_FLAG_WRITE_THROUGH, nullptr);
+    HANDLE file = CreateFileW(stage.c_str(), GENERIC_READ | GENERIC_WRITE | DELETE,
+                              FILE_SHARE_READ, nullptr, CREATE_NEW,
+                              FILE_ATTRIBUTE_NORMAL | FILE_FLAG_WRITE_THROUGH |
+                              FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
     if (file == INVALID_HANDLE_VALUE) {
       if (GetLastError() == ERROR_FILE_EXISTS ||
           GetLastError() == ERROR_ALREADY_EXISTS)
         continue;
       return false;
     }
+    struct OwnedOutput {
+      HANDLE file;
+      bool published = false;
+      ~OwnedOutput() {
+        if (!published) {
+          // A pathname can be substituted after close. Remove only the held
+          // CREATE_NEW object, and leave any unrelated object untouched.
+          FILE_DISPOSITION_INFO remove{TRUE};
+          SetFileInformationByHandle(file, FileDispositionInfo, &remove,
+                                      sizeof(remove));
+        }
+        CloseHandle(file);
+      }
+    } output{file};
     DWORD written = 0;
     const bool saved = WriteFile(file, contents.data(),
                                  static_cast<DWORD>(contents.size()),
                                  &written, nullptr) &&
         written == contents.size() && FlushFileBuffers(file);
-    const bool closed = CloseHandle(file) != FALSE;
-    const bool moved = saved && closed && SafeDirectory(root) &&
-        MoveFileExW(stage.c_str(), path.c_str(),
-                    MOVEFILE_WRITE_THROUGH |
-                    (onlyIfMissing ? 0 : MOVEFILE_REPLACE_EXISTING));
-    if (!moved) {
-      DeleteFileW(stage.c_str());
+    if (!saved || !clientNamespace.Verify(namespaceError))
       return false;
-    }
-    return Read(root) == std::optional<Record>(record);
+
+    // Verify the same exclusively writable output before publishing it. Keep
+    // its handle through the move so no close/reopen handoff can replace its
+    // contents or turn a failed write's cleanup into deletion of foreign data.
+    BY_HANDLE_FILE_INFORMATION info{};
+    char buffer[96]{};
+    DWORD read = 0;
+    LARGE_INTEGER beginning{};
+    if (!GetFileInformationByHandle(file, &info) ||
+        (info.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY |
+                                 FILE_ATTRIBUTE_REPARSE_POINT)) != 0 ||
+        info.nNumberOfLinks != 1 || info.nFileSizeHigh != 0 ||
+        info.nFileSizeLow != contents.size() ||
+        info.nFileSizeLow >= sizeof(buffer) ||
+        !SetFilePointerEx(file, beginning, nullptr, FILE_BEGIN) ||
+        !ReadFile(file, buffer, info.nFileSizeLow, &read, nullptr) ||
+        read != info.nFileSizeLow || std::string(buffer, read) != contents)
+      return false;
+
+    const auto target = std::filesystem::absolute(path).lexically_normal();
+    const auto name = target.native();
+    const size_t bytes = name.size() * sizeof(wchar_t);
+    const size_t size = offsetof(FILE_RENAME_INFO, FileName) + bytes + sizeof(wchar_t);
+    if (size > MAXDWORD)
+      return false;
+    std::vector<unsigned char> storage(size);
+    auto *rename = reinterpret_cast<FILE_RENAME_INFO *>(storage.data());
+    rename->ReplaceIfExists = !onlyIfMissing;
+    rename->RootDirectory = nullptr;
+    rename->FileNameLength = static_cast<DWORD>(bytes);
+    memcpy(rename->FileName, name.data(), bytes);
+    if (!SetFileInformationByHandle(file, FileRenameInfo, rename,
+                                    static_cast<DWORD>(size)))
+      return false;
+    output.published = true;
+    return true;
   }
   return false;
 }

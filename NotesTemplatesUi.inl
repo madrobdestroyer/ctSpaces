@@ -1,6 +1,14 @@
 // The template library owns its editor draft independently of client notes.
 // Explicit Save/Use and guarded navigation keep failed or conflicting saves
 // from silently replacing a reusable starter.
+static void NotesTemplateLinkContext(HWND edit,NotesTemplates &library,ClientNotesDialogState &context) {
+  context.pages.resize(1);context.pages[0].id=1;context.pages[0].open=true;
+  context.attachedPageId=1;context.attachedEditor=edit;
+  context.editorLinks[1]=std::move(library.linkRegistry);
+}
+static void NotesTemplateKeepLinkContext(NotesTemplates &library,ClientNotesDialogState &context) {
+  library.linkRegistry=std::move(context.editorLinks[1]);
+}
 static void NotesTemplateEditorState(HWND dialog,NotesTemplates &library) {
   SetDlgItemTextW(dialog,IDC_NOTES_TEMPLATE_SAVE_STATE,
       library.snippets ? (library.dirty ? L"Unsaved snippet changes" : library.draft.id ? L"Saved snippet - inserted copies stay unchanged" : L"New snippet - write here, then save or insert it") :
@@ -12,7 +20,7 @@ static void NotesTemplateEditorState(HWND dialog,NotesTemplates &library) {
 static std::wstring NotesNewTemplateName(const NotesTemplates &library,const std::wstring &base) {
   std::wstring name=base;
   for (size_t suffix=2;std::any_of(library.pages.begin(),library.pages.end(),[&](const auto &p){return client_notes::SamePageName(p.name,name);});++suffix)
-    name=base.substr(0,54)+L" "+std::to_wstring(suffix);
+    name=NotesNamePrefix(base,54)+L" "+std::to_wstring(suffix);
   return name;
 }
 static void NotesTemplateEditorFill(HWND dialog,NotesTemplates &library) {
@@ -47,15 +55,20 @@ static bool NotesTemplateEditorLoad(HWND dialog,NotesTemplates &library,client_n
   NotesStream stream{library.draft.rich ? library.draft.rtf : NotesPlainRtf(library.draft.text)};
   EDITSTREAM data{reinterpret_cast<DWORD_PTR>(&stream),0,NotesStreamIn};
   SendMessageW(edit,EM_STREAMIN,SF_RTF,reinterpret_cast<LPARAM>(&data));
-  ApplyNotesTextColors(edit);
+  library.linkRegistry={};
+  ClientNotesDialogState context;NotesTemplateLinkContext(edit,library,context);
+  client_notes::NotePage bindings;bindings.id=1;bindings.links=library.draft.links;bindings.linkRanges=library.draft.linkRanges;bindings.linkRangesKnown=library.draft.linkRangesKnown;
+  const bool linksOk=NotesRestoreMappedLinks(edit,context,bindings);
+  if(linksOk) ApplyNotesTextColors(edit);
+  NotesTemplateKeepLinkContext(library,context);
   SendMessageW(edit,EM_EMPTYUNDOBUFFER,0,0);
   SendMessageW(edit,EM_SETMODIFY,FALSE,0);
   SendMessageW(edit,WM_SETREDRAW,TRUE,0);
   InvalidateRect(edit,nullptr,FALSE);
-  library.loading=false; library.dirty=false;library.editorValid=!data.dwError;
+  library.loading=false; library.dirty=false;library.editorValid=!data.dwError && linksOk;
   SendDlgItemMessageW(dialog,IDC_NOTES_STYLE,CB_SETCURSEL,0,0);
   NotesTemplateEditorFill(dialog,library); NotesTemplateEditorState(dialog,library);
-  if (data.dwError) {
+  if (data.dwError || !linksOk) {
     library.draft=prior;
     MessageBoxW(dialog,L"This template could not be loaded completely. Close this window and reopen the library before saving.",L"Templates",MB_OK|MB_ICONWARNING);
     EnableWindow(GetDlgItem(dialog,IDC_NOTES_RESTORE),FALSE); EnableWindow(GetDlgItem(dialog,IDC_NOTES_TEMPLATE_USE),FALSE);
@@ -96,6 +109,13 @@ static bool NotesTemplateEditorSave(HWND dialog,NotesTemplates &library) {
   if (!exported) {
     MessageBoxW(dialog,L"This reusable entry is too large to save safely. Shorten its content and try again. Your draft stays open.",library.snippets ? L"Save snippet" : L"Save template",MB_OK|MB_ICONWARNING); return false;
   }
+  ClientNotesDialogState context;NotesTemplateLinkContext(edit,library,context);
+  client_notes::NotePage bindings;bindings.id=1;bindings.links=page.links;
+  NotesRestoreCookieLinks(edit,context);
+  const bool linksOk=NotesCaptureLinkMappings(edit,context,bindings);
+  NotesTemplateKeepLinkContext(library,context);
+  if(!linksOk) {MessageBoxW(dialog,L"This entry's links could not be saved safely. Your draft stays open.",L"Reusable links",MB_OK|MB_ICONWARNING);return false;}
+  page.links=std::move(bindings.links);page.linkRanges=std::move(bindings.linkRanges);page.linkRangesKnown=bindings.linkRangesKnown;
   page.rich=true;page.text.clear();page.modified=client_notes::Now();
   auto pages=library.pages;
   auto existing=std::find_if(pages.begin(),pages.end(),[&](const auto &p){return p.id==page.id;});
@@ -180,7 +200,25 @@ static LRESULT CALLBACK NotesTemplateTextSubclass(HWND edit,UINT message,WPARAM 
     if (command) {SendMessageW(dialog,WM_COMMAND,command,0);return 0;}
   }
   if (message==WM_NCDESTROY) RemoveWindowSubclass(edit,NotesTemplateTextSubclass,id);
-  return DefSubclassProc(edit,message,wParam,lParam);
+  auto *library=reinterpret_cast<NotesTemplates *>(GetWindowLongPtrW(dialog,DWLP_USER));
+  const bool live=library && !library->loading && !library->linkRegistry.urls.empty();
+  ClientNotesDialogState context;
+  if(live) {
+    NotesTemplateLinkContext(edit,*library,context);
+    if(message==EM_REPLACESEL || (message==EM_STREAMIN && (wParam&SFF_SELECTION)) || message==WM_CUT || message==WM_CLEAR || message==WM_CHAR || (message==WM_KEYDOWN && wParam==VK_DELETE)) {
+      CHARRANGE affected{};NotesSelection(edit,affected);
+      if(affected.cpMin==affected.cpMax && message==WM_CHAR && wParam==VK_BACK && affected.cpMin>0) --affected.cpMin;
+      if(affected.cpMin==affected.cpMax && message==WM_KEYDOWN && wParam==VK_DELETE) ++affected.cpMax;
+      if(affected.cpMin!=affected.cpMax) NotesTouchRangeCookies(edit,context,affected);
+    }
+    if(message==EM_REPLACESEL || (message==WM_CHAR && (wParam>=32 || wParam==VK_RETURN || wParam==VK_TAB))) NotesPrepareLinkTyping(edit,context);
+  }
+  const LRESULT result=DefSubclassProc(edit,message,wParam,lParam);
+  if(live) {
+    if(message==EM_UNDO || message==EM_REDO || message==WM_UNDO || message==EM_REPLACESEL || message==WM_CHAR || message==WM_CUT || message==WM_CLEAR || (message==WM_KEYDOWN && wParam==VK_DELETE)) NotesRestoreCookieLinks(edit,context);
+    NotesTemplateKeepLinkContext(*library,context);
+  }
+  return result;
 }
 static INT_PTR CALLBACK NotesTemplateEditorProc(HWND dialog,UINT message,WPARAM wParam,LPARAM lParam) {
   auto *library=reinterpret_cast<NotesTemplates *>(GetWindowLongPtrW(dialog,DWLP_USER));

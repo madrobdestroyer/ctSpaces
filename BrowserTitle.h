@@ -90,4 +90,41 @@ inline std::wstring Format(const std::wstring &pageTitle,
   return pageTitle + L" - " + sessionLabel + L" - " + appAlias;
 }
 
+// A page may itself start or end with the client label. Once we apply a title,
+// its two supported layouts are therefore not always distinguishable by their
+// text alone. Keep the original page text while this exact confirmed output
+// remains on the same window; a browser navigation supplies a fresh title.
+class AppliedTitleState {
+public:
+  std::optional<std::wstring> Resolve(const std::wstring &currentTitle,
+                                     const std::wstring &sessionLabel,
+                                     const std::wstring &appAlias,
+                                     bool isMicrosoftEdge) const {
+    if (last_ && last_->formatted == currentTitle &&
+        last_->session == sessionLabel && last_->alias == appAlias &&
+        last_->edge == isMicrosoftEdge)
+      return last_->page;
+    return GetPageTitle(currentTitle, sessionLabel, appAlias, isMicrosoftEdge);
+  }
+
+  // Call only after the target window confirms the title write succeeded.
+  void RememberApplied(const std::wstring &pageTitle,
+                       const std::wstring &formattedTitle,
+                       const std::wstring &sessionLabel,
+                       const std::wstring &appAlias, bool isMicrosoftEdge) {
+    last_ = Applied{pageTitle, formattedTitle, sessionLabel, appAlias,
+                    isMicrosoftEdge};
+  }
+
+private:
+  struct Applied {
+    std::wstring page;
+    std::wstring formatted;
+    std::wstring session;
+    std::wstring alias;
+    bool edge;
+  };
+  std::optional<Applied> last_;
+};
+
 } // namespace browser_title

@@ -2,11 +2,14 @@
 
 ctSpaces is a small Windows launcher for opening client-specific browser spaces. Each client can have an independent Microsoft Edge, Google Chrome, Brave, and Mozilla Firefox profile, so browser data stays separated both between clients and between browsers for the same client.
 
-The initial 6.0.0.0 milestone consolidated the previously shipped 5.2 and 5.3 work. The 6.1 release added client filtering, local notes, and Close All Clients. The current 6.3.3.0 release turns Client Notes into a complete local notebook: close and reopen tabs, All notes search, archive and Trash, session undo per tab, crash recovery, version history, templates, import/export, and explicit cross-client transfer. The full-width editor has one searchable client picker, on-demand Details and More panels, direct template/snippet editors, status, tags, work logs, code boxes and readable handovers. It keeps theme colors, slim tabs, remembered size and autosave without a footer. Note links open in the PC default browser.
+The current **6.3.4.0** release brings together the changes since the team's 6.1.1.0 baseline. Client Notes is a complete local notebook with saved notes separate from open tabs, All notes search, archive and Trash, snapshots, version history, templates, import/export and explicit cross-client transfer. Its full-width editor has one searchable client picker, on-demand Details and More panels, editable template/snippet libraries, status, tags, work logs, code boxes and handovers. It keeps theme colors, slim tabs, remembered size and quiet autosave. Notes stays available when the launcher is minimized or closed to the tray. Note links open in a chosen regular PC browser, outside client profiles.
 
-See [release notes](RELEASE_NOTES_6.3.3.0.md),
+Everyday editing includes temporary Find/Replace rows with match options and counts, remembered word wrap, Go to line, document/selection statistics, on-demand Windows spelling review, printing/PDF, previewed Markdown interchange and simple editable tables. Global and per-client browser layout choices request vertical or horizontal tabs for new windows. **Edge with Restore tabs can retain the saved window's previous layout:** set the desired layout in Edge before closing that window when using session restore. Backups offer client exclusions and progress by stage. Search More for note tools; shortcuts and conversion limits are described in the [user guide](docs/USER_GUIDE.md).
+
+See [what changed since 6.1.1.0](docs/CHANGES_SINCE_6.1.1.0.md),
+[release notes](RELEASE_NOTES_6.3.4.0.md),
 [guide help](docs/GUIDED_WALKTHROUGH.md), and the
-[current release validation](docs/RELEASE_VALIDATION_6.3.3.0.md). The
+[current release validation](docs/RELEASE_VALIDATION_6.3.4.0.md). The
 [6.0.0.0 release notes](RELEASE_NOTES_6.0.0.0.md) and
 [validation report](docs/RELEASE_VALIDATION_6.0.0.0.md) remain available as
 historical records.
@@ -18,11 +21,16 @@ original project.
 
 ## Download
 
-Download the application ZIP [`ctSpaces6.3.3.0.zip`](https://github.com/madrobdestroyer/ctSpaces/releases/download/v6.3.3.0/ctSpaces6.3.3.0.zip)
-from [ctSpaces 6.3 / tag v6.3.3.0](https://github.com/madrobdestroyer/ctSpaces/releases/tag/v6.3.3.0),
+Download the application ZIP [`ctSpaces6.3.4.0.zip`](https://github.com/madrobdestroyer/ctSpaces/releases/download/v6.3.4.0/ctSpaces6.3.4.0.zip)
+from [ctSpaces 6.3.4.0 / tag v6.3.4.0](https://github.com/madrobdestroyer/ctSpaces/releases/tag/v6.3.4.0),
 extract it to a folder, and run `ctSpaces.exe`. The runtime ZIP contains only
 `ctSpaces.exe`; documentation, release history, source, and license notices
 remain available in this GitHub repository.
+
+Edge, Chrome, Brave and Firefox are supported application choices. That does not
+certify every browser version, organization policy or SSO setup. The validation
+record identifies the browsers actually exercised and the remaining visible,
+physical and integration-test boundaries.
 
 ## What It Is Used For
 
@@ -53,6 +61,7 @@ The app itself installs and stores shared settings under:
 - Close All Clients requests normal closure of tracked client browsers while keeping ctSpaces open.
 - Persistent sign-ins, cookies, bookmarks, history, site data, and sessions for each saved client.
 - Per-client/browser `Restore tabs` switch. Leave it on to reopen that browser slot's previous tabs, or turn it off to start that slot on a normal new tab while keeping sign-ins and other profile data.
+- Global and per-client native tab layout: Keep browser's choice, Vertical or Horizontal. Horizontal explicitly sets the new-window vertical-tab preference to off. Edge can restore the old layout with Restore tabs on; this setting does not force restored windows. Temp follows global, while the Default editor keeps its own layout.
 - Browser selector for Microsoft Edge, Google Chrome, Brave, and Mozilla Firefox. Choosing another browser opens that client's independent slot rather than reusing another browser's data.
 - Pinned favorite clients with customer logos, one-click open/switch behavior, and saved drag ordering.
 - Pinned-client right-click actions for selection, tab restore, opening a copied website link, and creating one customer-icon Desktop shortcut per client. Its visible label is exactly the client name (`Client.lnk`), it records the browser selected when created, and recreating it updates that managed link.
@@ -75,7 +84,7 @@ The app itself installs and stores shared settings under:
 - Custom profile icons, remove-icon support, and automatic favicon fetching.
 - Theme picker with the existing catalog plus Gothic, red/black Crimson, Graphite Copper, Black Cherry, Midnight Moss, Ink Blue, and Violet Ash dark themes.
 - About, app messages and confirmations, overflow menus, and tooltips follow the selected theme. Empty cleanup notices are compact; details are not automatically selected, and scrollbars appear only when needed. Windows-owned file pickers and fatal errors before theme initialization retain Windows styling.
-- Verified in-process backup of all client data to a `.7z` file.
+- In-process `.7z` backup with a searchable client selection, optional client exclusions, progress by stage and integrity verification before final saving.
 - Transactional restore with manifest, path, type, size, CRC, staging, and rollback checks.
 - Backward-compatible restore for older `.zip` backups.
 - Atomic configuration updates with tri-state reads so an unreadable or indeterminate configuration is not treated as empty and pruned.
@@ -95,6 +104,7 @@ The `New` tab is the launcher view. Each open-session tab displays only the clie
 ## Documentation
 
 - [User Guide](docs/USER_GUIDE.md): everyday use and profile tools.
+- [Changes since 6.1.1.0](docs/CHANGES_SINCE_6.1.1.0.md): cumulative coworker-facing changes in 6.3.4.0.
 - [Guided Walkthrough](docs/GUIDED_WALKTHROUGH.md): skippable onboarding, replay and new-feature guidance.
 - [Feature Reference](docs/FEATURE_REFERENCE.md): complete current behavior.
 - [Installation and Updates](docs/INSTALLATION_AND_UPDATES.md): setup, updating, and removal.
@@ -107,7 +117,9 @@ The `New` tab is the launcher view. Each open-session tab displays only the clie
 
 Use `Back Up All Client Data` before large changes, before moving machines, or before testing a new build. Use `Restore Client Data` to bring profiles back from a validated ctSpaces `.7z` backup. Older `.zip` backups remain selectable for compatibility.
 
-ctSpaces requires every supported browser process using a profile below the `Sites` folder to be closed before export or restore, including a browser started manually with a ctSpaces profile path. An active match or a relevant process that cannot be inspected reliably blocks the operation so browser databases are not copied while in use.
+Choose the clients to include in a backup; excluded clients are not changed and may stay open. Selected clients must be closed, including browsers started manually with a ctSpaces profile path. Restore requires every supported browser using a profile below `Sites` to be closed. An active match or uncertain relevant process inspection blocks the affected operation.
+
+Restore replaces the active collection with the backup's clients rather than merging collections. Clients excluded from that backup will be absent from the restored active list; the prior collection remains in a pre-restore safety folder. Browser security can tie sign-ins to a Windows user or computer, so file backup is not a guarantee of portable sign-ins.
 
 ## Project Layout
 

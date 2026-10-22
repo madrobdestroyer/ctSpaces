@@ -66,14 +66,17 @@ static bool NotesInsertCode(HWND dialog,ClientNotesDialogState &state,const Note
     MessageBoxW(dialog,L"Move the cursor outside the existing code box before inserting another. You can edit its code directly inside the box.",L"Code block",MB_OK|MB_ICONINFORMATION);return false;
   }
   const auto rtf=NotesCodeRtf(input);if (!client_notes::ValidRichText(rtf)) return false;
-  IUnknown *ole=nullptr;ITextDocument *document=nullptr;SendMessageW(edit,EM_GETOLEINTERFACE,0,reinterpret_cast<LPARAM>(&ole));
-  if (ole) {ole->QueryInterface(__uuidof(ITextDocument),reinterpret_cast<void **>(&document));ole->Release();}
-  SendMessageW(edit,EM_STOPGROUPTYPING,0,0);if (document) document->BeginEditCollection();
-  NotesStream stream{rtf};EDITSTREAM data{reinterpret_cast<DWORD_PTR>(&stream),0,NotesStreamIn};
-  SendMessageW(edit,EM_STREAMIN,SF_RTF|SFF_SELECTION,reinterpret_cast<LPARAM>(&data));
-  if (!data.dwError) ApplyNotesTextColors(edit);
-  if (document) {document->EndEditCollection();document->Release();}
-  if (data.dwError) {MessageBoxW(dialog,L"Code insertion failed. Use Undo to restore the previous text.",L"Code block",MB_OK|MB_ICONWARNING);return false;}
+  CHARRANGE selected{};NotesSelection(edit,selected);
+  const auto result=NotesApplyNativeTransaction(dialog,state,selected,[&](HWND target) {
+    NotesStream stream{rtf};EDITSTREAM data{reinterpret_cast<DWORD_PTR>(&stream),0,NotesStreamIn};
+    SendMessageW(target,EM_STREAMIN,SF_RTF|SFF_SELECTION,reinterpret_cast<LPARAM>(&data));
+    const bool complete=!data.dwError && stream.offset==stream.bytes.size();
+    if(complete) ApplyNotesTextColors(target);
+    return complete;
+  });
+  if(result!=NotesAppTransactionResult::Committed) {
+    NotesAppTransactionNotice(dialog,result,L"Code could not be inserted completely. Your previous draft is still open.",L"Code block");return false;
+  }
   MarkNotesChanged(dialog,state);SaveClientNotesDraft(dialog,state,true);SetFocus(edit);return true;
 }
 static void NotesCreateCodeBlock(HWND dialog,ClientNotesDialogState &state) {

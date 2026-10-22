@@ -1,6 +1,10 @@
 param(
     [string]$ExePath = (Join-Path $PSScriptRoot '..\dist\x64\Release\ctSpaces.exe'),
     [string]$BrowserPath = '',
+    [ValidateRange(1, 2)][int]$TabCount = 1,
+    [ValidateSet('NormalWindowClose', 'SessionShutdown')]
+    [string]$CloseMode = 'NormalWindowClose',
+    [string]$ArtifactDirectory = (Join-Path $PSScriptRoot '..\build\restore-after-browser-close'),
     [int]$TimeoutSeconds = 15
 )
 
@@ -8,8 +12,13 @@ $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'QaProcess.ps1')
 $projectRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
 $resolvedExe = [IO.Path]::GetFullPath($ExePath)
+$evidenceRoot = [IO.Path]::GetFullPath($ArtifactDirectory)
+if (-not $evidenceRoot.StartsWith((Join-Path $projectRoot 'build\'), [StringComparison]::OrdinalIgnoreCase)) {
+    throw 'Restoration evidence must stay below workspace build.'
+}
 $qaParent = Join-Path $projectRoot 'build\qa-browser-close-restore'
 $runId = [Guid]::NewGuid().ToString('N')
+$qaTitlePrefix = 'ctSpaces Restore ' + $runId.Substring(0, 12)
 $qaRoot = Join-Path $qaParent ('run-' + $runId)
 $qaExeDir = Join-Path $qaRoot 'app'
 $qaExe = Join-Path $qaExeDir 'ctSpaces-browser-close-qa.exe'
@@ -19,6 +28,7 @@ $profilePath = Join-Path $qaDataDir "Sites\$clientName"
 $preferencesPath = Join-Path $profilePath 'Default\Preferences'
 $configPath = Join-Path $qaDataDir 'config.ini'
 $launcherProcess = $null
+$completed = $false
 $launcherWindow = [IntPtr]::Zero
 $ownedProcesses = [Collections.Generic.Dictionary[int, Diagnostics.Process]]::new()
 $liveConfigPath = Join-Path $env:LOCALAPPDATA 'InfinitySys\ctSpaces\config.ini'
@@ -88,8 +98,6 @@ function Register-OwnedProcess {
     return $Process
 }
 
-Add-Type -AssemblyName UIAutomationClient
-Add-Type -AssemblyName UIAutomationTypes
 Add-Type -TypeDefinition @'
 using System;
 using System.Runtime.InteropServices;
@@ -244,6 +252,7 @@ public static class CtRestoreCloseQaNative
     }
 }
 '@
+Add-Type -Path (Join-Path $PSScriptRoot 'ChromiumSessionFixture.cs')
 
 function Start-QaBrowser {
     param([string[]]$AdditionalArguments = @())
@@ -319,6 +328,33 @@ function Get-DisposableProfileProcesses {
     )
 }
 
+function Wait-ForDisposableProfileExit {
+    param([Parameter(Mandatory = $true)][string]$Phase)
+    $watch = [Diagnostics.Stopwatch]::StartNew()
+    $observations = [Collections.Generic.List[object]]::new()
+    do {
+        $pending = @(Get-DisposableProfileProcesses)
+        $observations.Add([pscustomobject]@{
+            ElapsedMilliseconds = $watch.ElapsedMilliseconds
+            ProcessIds = @($pending | ForEach-Object { [int]$_.ProcessId })
+        })
+        if ($pending.Count -eq 0) { break }
+        Start-Sleep -Milliseconds 100
+    } while ($watch.Elapsed.TotalSeconds -lt $TimeoutSeconds)
+    New-Item -ItemType Directory -Path $evidenceRoot -Force | Out-Null
+    [pscustomobject]@{
+        Phase = $Phase
+        TimeoutSeconds = $TimeoutSeconds
+        Observations = @($observations.ToArray())
+        Passed = ($pending.Count -eq 0)
+    } | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (
+        Join-Path $evidenceRoot ($runId + '-' + $Phase + '-process-exit.json')
+    )
+    if ($pending.Count) {
+        throw "$Phase left disposable profile processes after $TimeoutSeconds seconds: $($pending.ProcessId -join ', ')"
+    }
+}
+
 function Stop-DisposableProfileProcess {
     param([Parameter(Mandatory = $true)]$ProfileProcess)
 
@@ -387,16 +423,28 @@ function Wait-ForTitledBrowserWindow {
     $deadline = [DateTime]::UtcNow.AddSeconds($Timeout)
     do {
         $window = [CtRestoreCloseQaNative]::FindVisibleWindowByTitle(
-            'ctSpaces Restore'
+            $qaTitlePrefix
         )
         if ($window -ne [IntPtr]::Zero) {
             $windowProcessId =
                 [int][CtRestoreCloseQaNative]::GetWindowProcessId($window)
+            $observed = Get-DisposableProfileProcesses | Where-Object {
+                [int]$_.ProcessId -eq $windowProcessId -and $_.ExecutablePath -and
+                [IO.Path]::GetFullPath($_.ExecutablePath).Equals($resolvedBrowser, [StringComparison]::OrdinalIgnoreCase)
+            } | Select-Object -First 1
+            if (-not $observed) { throw 'Refusing an unverified browser window outside the exact disposable profile.' }
             if (-not $ownedProcesses.ContainsKey($windowProcessId)) {
-                $windowProcess = [Diagnostics.Process]::GetProcessById(
-                    $windowProcessId
-                )
-                [void](Register-OwnedProcess $windowProcess)
+                $windowProcess = [Diagnostics.Process]::GetProcessById($windowProcessId)
+                try {
+                    $null = $windowProcess.SafeHandle
+                    if ($windowProcess.HasExited -or
+                        [Math]::Abs(($windowProcess.StartTime.ToUniversalTime() - ([DateTime]$observed.CreationDate).ToUniversalTime()).TotalSeconds) -ge 1 -or
+                        -not [IO.Path]::GetFullPath($windowProcess.MainModule.FileName).Equals($resolvedBrowser, [StringComparison]::OrdinalIgnoreCase) -or
+                        [int][CtRestoreCloseQaNative]::GetWindowProcessId($window) -ne $windowProcessId) {
+                        throw 'Refusing a reused or mismatched browser window process.'
+                    }
+                    [void](Register-OwnedProcess $windowProcess)
+                } catch { $windowProcess.Dispose(); throw }
             }
             return $window
         }
@@ -404,6 +452,54 @@ function Wait-ForTitledBrowserWindow {
     } while ([DateTime]::UtcNow -lt $deadline)
 
     throw 'The browser did not restore a ctSpaces QA tab.'
+}
+
+function Get-SessionPaths {
+    @(Get-ChildItem -LiteralPath (Join-Path $profilePath 'Default\Sessions') -Filter 'Session_*' -File -ErrorAction SilentlyContinue | ForEach-Object FullName)
+}
+
+function Wait-NewSessionSnapshot {
+    param([string[]]$PreviousSessionPaths)
+    $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
+    do {
+        $fresh = Get-SessionPaths | Where-Object { $_ -notin $PreviousSessionPaths } | Sort-Object -Descending | Select-Object -First 1
+        if ($fresh -and (Get-Item -LiteralPath $fresh).Length -gt 8) { return $fresh }
+        Start-Sleep -Milliseconds 100
+    } while ([DateTime]::UtcNow -lt $deadline)
+    throw 'Browser session storage did not finish initializing before the close request.'
+}
+
+function Wait-ForRestoredTabs {
+    param([string[]]$PreviousSessionPaths, [string[]]$ExpectedUrls)
+    $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
+    $lastError = 'The browser has not written its new current-session snapshot.'
+    do {
+        $fresh = Get-SessionPaths | Where-Object { $_ -notin $PreviousSessionPaths } | Sort-Object -Descending | Select-Object -First 1
+        if ($fresh) {
+            try {
+                $urls = @([ChromiumSessionFixture]::CurrentUrls($fresh))
+                if (@($ExpectedUrls | Where-Object { $_ -notin $urls }).Count -eq 0) {
+                    return [pscustomobject]@{Session=$fresh; RestoredUrls=$urls; ExpectedUrls=$ExpectedUrls}
+                }
+                $lastError = 'Current-session tabs: ' + ($urls -join ', ')
+            } catch { $lastError = [string]$_ }
+        }
+        Start-Sleep -Milliseconds 100
+    } while ([DateTime]::UtcNow -lt $deadline)
+    throw "The new browser session did not retain every expected fixture tab. $lastError"
+}
+
+function Save-SessionEvidence {
+    param($Receipt, [string]$Phase)
+    New-Item -ItemType Directory -Path $evidenceRoot -Force | Out-Null
+    $destination = Join-Path $evidenceRoot ($runId + '-' + $Phase + '.session')
+    Copy-Item -LiteralPath $Receipt.Session -Destination $destination
+    $sourceHash = (Get-FileHash -LiteralPath $Receipt.Session -Algorithm SHA256).Hash
+    $copyHash = (Get-FileHash -LiteralPath $destination -Algorithm SHA256).Hash
+    if ($sourceHash -ne $copyHash) { throw 'Restoration session changed while retaining its evidence.' }
+    $retainedUrls = @([ChromiumSessionFixture]::CurrentUrls($destination))
+    if (@($Receipt.ExpectedUrls | Where-Object { $_ -notin $retainedUrls }).Count) { throw 'Retained session no longer proves all expected tabs.' }
+    [pscustomobject]@{Session=$destination;Sha256=$copyHash;RestoredUrls=$retainedUrls;ExpectedUrls=$Receipt.ExpectedUrls}
 }
 
 function Wait-ForWindowToClose {
@@ -419,52 +515,28 @@ function Wait-ForWindowToClose {
     $false
 }
 
-function Invoke-CloseAllPrompt {
-    param([IntPtr]$BrowserWindow)
-
-    try {
-        $root = [Windows.Automation.AutomationElement]::FromHandle($BrowserWindow)
-        $condition = [Windows.Automation.PropertyCondition]::new(
-            [Windows.Automation.AutomationElement]::ControlTypeProperty,
-            [Windows.Automation.ControlType]::Button
-        )
-        $buttons = $root.FindAll(
-            [Windows.Automation.TreeScope]::Descendants, $condition
-        )
-        foreach ($button in $buttons) {
-            if ($button.Current.Name -match '^Close all( tabs)?$') {
-                $pattern = $button.GetCurrentPattern(
-                    [Windows.Automation.InvokePattern]::Pattern
-                )
-                $pattern.Invoke()
-                return $true
-            }
-        }
-    } catch {
-    }
-    $false
-}
-
 function Close-BrowserNormally {
     param([IntPtr]$BrowserWindow)
 
-    [void][CtRestoreCloseQaNative]::SetForegroundWindow($BrowserWindow)
+    if ($CloseMode -eq 'SessionShutdown') {
+        if (-not [CtRestoreCloseQaNative]::RequestSessionShutdown($BrowserWindow)) {
+            throw 'Could not send the browser session shutdown request.'
+        }
+        if (-not (Wait-ForWindowToClose $BrowserWindow)) {
+            throw 'The browser window did not close after session shutdown.'
+        }
+        return $false
+    }
     if (-not [CtRestoreCloseQaNative]::PostMessageW(
             $BrowserWindow, 0x0010, [UIntPtr]::Zero, [IntPtr]::Zero
         )) {
         throw 'Could not send the normal browser close request.'
     }
 
-    if (Wait-ForWindowToClose $BrowserWindow 2) {
-        return $false
-    }
-    if (-not (Invoke-CloseAllPrompt $BrowserWindow)) {
-        throw 'The browser close-all prompt appeared but could not be approved.'
-    }
     if (-not (Wait-ForWindowToClose $BrowserWindow)) {
-        throw 'The browser window did not close after approving Close all.'
+        throw 'The normal browser close request did not close the window. Use a one-tab fixture for unattended WM_CLOSE coverage; the separate two-tab SessionShutdown case covers multi-tab restoration without approving browser UI prompts.'
     }
-    $true
+    $false
 }
 
 function Wait-ForLauncherWindow {
@@ -562,26 +634,26 @@ try {
     $alphaPath = Join-Path $qaRoot 'alpha.html'
     $betaPath = Join-Path $qaRoot 'beta.html'
     [IO.File]::WriteAllText(
-        $alphaPath, '<title>ctSpaces Restore Alpha</title><h1>Alpha</h1>'
+        $alphaPath, "<title>$qaTitlePrefix Alpha</title><h1>Alpha</h1>"
     )
     [IO.File]::WriteAllText(
-        $betaPath, '<title>ctSpaces Restore Beta</title><h1>Beta</h1>'
+        $betaPath, "<title>$qaTitlePrefix Beta</title><h1>Beta</h1>"
     )
     $alphaUrl = ([Uri]::new($alphaPath)).AbsoluteUri
     $betaUrl = ([Uri]::new($betaPath)).AbsoluteUri
 
-    $seedProcess = Start-QaBrowser @('--new-window', $alphaUrl, $betaUrl)
+    $seedArguments = @('--new-window', $alphaUrl)
+    if ($TabCount -eq 2) { $seedArguments += $betaUrl }
+    $expectedUrls = @($alphaUrl)
+    if ($TabCount -eq 2) { $expectedUrls += $betaUrl }
+    $seedProcess = Start-QaBrowser $seedArguments
     $seedWindow = Wait-ForTitledBrowserWindow
+    $null = Wait-NewSessionSnapshot @()
     $seedPromptApproved = Close-BrowserNormally $seedWindow
     if (-not $seedProcess.WaitForExit(10000)) {
         throw 'The disposable browser root process stayed open after Close all.'
     }
-    Start-Sleep -Milliseconds 1000
-    $lingeringProfileProcesses = Get-DisposableProfileProcesses
-    if ($lingeringProfileProcesses.Count -gt 0) {
-        $lingeringIds = ($lingeringProfileProcesses.ProcessId -join ', ')
-        throw "Disposable profile processes remained after Close all: $lingeringIds"
-    }
+    Wait-ForDisposableProfileExit 'seed-browser-close'
     New-Item -ItemType File -Path (Join-Path $profilePath 'ctSpaces') `
         -Force | Out-Null
     [IO.File]::WriteAllText(
@@ -616,6 +688,7 @@ try {
     if (-not [CtRestoreCloseQaNative]::IsWindowEnabled($restoreToggle)) {
         throw 'Restore tabs did not enable for the disposable existing client.'
     }
+    $firstSessionBefore = Get-SessionPaths
     $result = [UIntPtr]::Zero
     if (-not [CtRestoreCloseQaNative]::SendMessageTimeoutW(
             $openButton, 0x00F5, [UIntPtr]::Zero, [IntPtr]::Zero,
@@ -625,14 +698,14 @@ try {
     }
 
     $ctSpacesWindow = Wait-ForTitledBrowserWindow
+    $null = Wait-NewSessionSnapshot $firstSessionBefore
     $ctSpacesPromptApproved = Close-BrowserNormally $ctSpacesWindow
-    Start-Sleep -Milliseconds 1250
-    $lingeringProfileProcesses = Get-DisposableProfileProcesses
-    if ($lingeringProfileProcesses.Count -gt 0) {
-        $lingeringIds = ($lingeringProfileProcesses.ProcessId -join ', ')
-        throw "ctSpaces-launched profile processes remained after Close all: $lingeringIds"
-    }
+    Wait-ForDisposableProfileExit 'first-reopen-close'
+    # Chromium keeps its writable current-session file locked while running.
+    # Read the fresh snapshot only after this reopened browser closes normally.
+    $firstTabs = Save-SessionEvidence (Wait-ForRestoredTabs $firstSessionBefore $expectedUrls) 'first-reopen'
 
+    $secondSessionBefore = Get-SessionPaths
     Set-WindowTextValue $clientEdit $clientName
     $result = [UIntPtr]::Zero
     if (-not [CtRestoreCloseQaNative]::SendMessageTimeoutW(
@@ -642,6 +715,7 @@ try {
         throw 'Could not reopen the disposable client through ctSpaces.'
     }
     $restoredWindow = Wait-ForTitledBrowserWindow
+    $null = Wait-NewSessionSnapshot $secondSessionBefore
     $titleDeadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
     do {
         $restoredTitle =
@@ -672,6 +746,7 @@ try {
         [void]$restoredProcess.WaitForExit(10000)
     } catch {
     }
+    $secondTabs = Save-SessionEvidence (Wait-ForRestoredTabs $secondSessionBefore $expectedUrls) 'second-reopen'
 
     $liveConfigHashAfter = if (
         Test-Path -LiteralPath $liveConfigPath -PathType Leaf
@@ -684,10 +759,15 @@ try {
         throw 'Browser-close QA modified the live ctSpaces preference file.'
     }
 
+    $completed = $true
     [pscustomobject]@{
         Browser = [IO.Path]::GetFileName($resolvedBrowser)
         BrowserId = $browserId
         BrowserDisplayName = $browserDisplayName
+        TabCount = $TabCount
+        CloseMode = $CloseMode
+        FirstRestoredTabs = $firstTabs
+        SecondRestoredTabs = $secondTabs
         SeedCloseAllPromptApproved = $seedPromptApproved
         CtSpacesCloseAllPromptApproved = $ctSpacesPromptApproved
         BackgroundProfileReleased = $true
@@ -695,7 +775,7 @@ try {
         RestoredAfterSecondBrowserClose = $true
         RestoredWindowTitle = $restoredTitle
         LiveConfigUnchanged = $true
-    } | ConvertTo-Json
+    } | ConvertTo-Json -Depth 5
 } finally {
     if ($launcherWindow -ne [IntPtr]::Zero -and
         [CtRestoreCloseQaNative]::IsWindow($launcherWindow)) {
@@ -733,7 +813,7 @@ try {
             $allowedPrefix, [StringComparison]::OrdinalIgnoreCase
         ) -and [IO.Path]::GetFileName($resolvedQaRoot).StartsWith(
             'run-', [StringComparison]::Ordinal
-        ) -and (Test-Path -LiteralPath $resolvedQaRoot)) {
+        ) -and (Test-Path -LiteralPath $resolvedQaRoot) -and $completed) {
         $cleanupDeadline = [DateTime]::UtcNow.AddSeconds(10)
         do {
             try {
@@ -747,5 +827,7 @@ try {
                 Start-Sleep -Milliseconds 300
             }
         } while (Test-Path -LiteralPath $resolvedQaRoot)
+    } elseif (Test-Path -LiteralPath $resolvedQaRoot) {
+        Write-Warning "Preserved browser restoration failure fixture: $resolvedQaRoot"
     }
 }

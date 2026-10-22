@@ -187,6 +187,44 @@ try {
         ($LASTEXITCODE -eq 0 -and 'Default/Favicons' -in $inPlaceEntries) `
         'The in-place archive is not readable after replacement.'
 
+    $rootsSource = Join-Path $testRoot 'RootsSource'
+    New-Item -ItemType Directory -Path $rootsSource | Out-Null
+    & $systemTar -xf $validInput -C $rootsSource
+    Assert-ArchiveSanitizerCheck ($LASTEXITCODE -eq 0) `
+        'Could not extract the valid starter for roots-shape tests.'
+    $rootsBookmarks = Join-Path $rootsSource 'Default\Bookmarks'
+    $rootsOriginal = [IO.File]::ReadAllBytes($rootsBookmarks)
+    try {
+        $rootsCase = 0
+        foreach ($invalidRoots in @('4', 'null', '[]', '"not an object"')) {
+            $rootsCase++
+            [IO.File]::WriteAllText($rootsBookmarks,
+                ('{"roots":' + $invalidRoots + ',"version":1}'),
+                (New-Object Text.UTF8Encoding($false)))
+            $rootsInput = Join-Path $testRoot "InvalidRoots$rootsCase.zip"
+            [IO.Compression.ZipFile]::CreateFromDirectory($rootsSource, $rootsInput)
+            $inputBytes = [Convert]::ToBase64String(
+                [IO.File]::ReadAllBytes($rootsInput))
+            $rootsOutput = Join-Path $testRoot "PreservedRoots$rootsCase.7z"
+            [IO.File]::WriteAllBytes($rootsOutput, [byte[]](9, 0, 3, 7, 255))
+            $outputBytes = [Convert]::ToBase64String(
+                [IO.File]::ReadAllBytes($rootsOutput))
+            Assert-WrapperRejects -InputArchive $rootsInput `
+                -OutputArchive $rootsOutput -ErrorPattern 'roots object' `
+                -Message "An archive with malformed Bookmarks roots $invalidRoots was accepted."
+            Assert-ArchiveSanitizerCheck `
+                ([Convert]::ToBase64String([IO.File]::ReadAllBytes($rootsInput)) `
+                    -ceq $inputBytes) 'Roots-shape rejection modified its source archive.'
+            Assert-ArchiveSanitizerCheck `
+                ([Convert]::ToBase64String([IO.File]::ReadAllBytes($rootsOutput)) `
+                    -ceq $outputBytes) 'Roots-shape rejection modified the existing output archive.'
+        }
+        Write-Host 'Archive Bookmarks roots rejection checks passed (4 cases; exact input/output bytes preserved).'
+    }
+    finally {
+        [IO.File]::WriteAllBytes($rootsBookmarks, $rootsOriginal)
+    }
+
     $emptyArchive = Join-Path $testRoot 'Empty.zip'
     New-TestZip -Path $emptyArchive -Entries @()
     Assert-WrapperRejects -InputArchive $emptyArchive `

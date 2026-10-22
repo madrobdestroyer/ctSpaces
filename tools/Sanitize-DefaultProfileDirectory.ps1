@@ -577,7 +577,9 @@ function Get-BookmarkUrlSet {
     param([Parameter(Mandatory = $true)][object]$Bookmarks)
 
     $roots = $Bookmarks.PSObject.Properties['roots']
-    if (-not $roots) {
+    if (-not $roots -or $null -eq $roots.Value -or
+        ($roots.Value -isnot [pscustomobject] -and
+         $roots.Value -isnot [Collections.IDictionary])) {
         throw 'Bookmarks does not contain a roots object.'
     }
     $urls = [Collections.Generic.HashSet[string]]::new(

@@ -11,6 +11,40 @@ inline Gdiplus::Color Color(COLORREF value) {
   return Gdiplus::Color(255, GetRValue(value), GetGValue(value), GetBValue(value));
 }
 
+inline bool HasActionIcon(UINT id) {
+  return id==IDC_NOTES_FIND_TOGGLE || id==IDC_NOTES_SNIPPETS ||
+      id==IDC_NOTES_TEMPLATES || id==IDC_NOTES_WORKLOG || id==IDC_NOTES_FORMAT ||
+      id==IDC_NOTES_LIBRARY || id==IDC_NOTES_TRASH;
+}
+
+// Compact line icons supplement the existing labels; their controls, hit areas
+// and keyboard commands stay unchanged.
+inline void DrawActionIcon(HDC dc,const RECT &bounds,UINT id,COLORREF color) {
+  using namespace Gdiplus;
+  Graphics graphics(dc);graphics.SetSmoothingMode(SmoothingModeAntiAlias);
+  graphics.TranslateTransform((bounds.left+bounds.right)/2.0f,(bounds.top+bounds.bottom)/2.0f);
+  const float scale=(bounds.bottom-bounds.top)/20.0f;graphics.ScaleTransform(scale,scale);
+  Pen pen(Color(color),1.7f);pen.SetStartCap(LineCapRound);pen.SetEndCap(LineCapRound);pen.SetLineJoin(LineJoinRound);
+  const auto line=[&](float x1,float y1,float x2,float y2){graphics.DrawLine(&pen,x1,y1,x2,y2);};
+  switch(id) {
+  case IDC_NOTES_FIND_TOGGLE:
+    graphics.DrawEllipse(&pen,-7.0f,-7.0f,10.0f,10.0f);line(2,2,7,7);break;
+  case IDC_NOTES_SNIPPETS:
+    line(-4,-5,-8,0);line(-8,0,-4,5);line(4,-5,8,0);line(8,0,4,5);line(2,-7,-2,7);break;
+  case IDC_NOTES_TEMPLATES:
+    graphics.DrawRectangle(&pen,-6.0f,-8.0f,12.0f,16.0f);line(-3,-4,3,-4);line(-3,0,3,0);line(-3,4,1,4);break;
+  case IDC_NOTES_LIBRARY:
+    graphics.DrawRectangle(&pen,-4.0f,-6.0f,11.0f,14.0f);line(-7,5,-7,-9);line(-7,-9,4,-9);line(-1,-2,4,-2);line(-1,2,4,2);break;
+  case IDC_NOTES_WORKLOG:
+    graphics.DrawEllipse(&pen,-8.0f,-8.0f,13.0f,13.0f);line(-1.5f,-5,-1.5f,-1.5f);line(-1.5f,-1.5f,1.5f,0);line(5,2,5,8);line(2,5,8,5);break;
+  case IDC_NOTES_FORMAT:
+    line(-7,-7,7,-7);line(0,-7,0,6);line(-4,6,4,6);break;
+  case IDC_NOTES_TRASH:
+    line(-7,-5,7,-5);line(-3,-5,-3,-8);line(-3,-8,3,-8);line(3,-8,3,-5);
+    line(-5,-3,-4,8);line(-4,8,4,8);line(4,8,5,-3);line(-1.5f,-1,-1.5f,5);line(1.5f,-1,1.5f,5);break;
+  }
+}
+
 // Subtle vertical lighting gives the reference's controls depth without
 // introducing bitmap assets or losing sharpness on another display scale.
 inline void DrawSurface(HDC dc, const RECT &bounds, COLORREF top,

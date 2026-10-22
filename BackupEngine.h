@@ -4,8 +4,11 @@
 
 #include <cstddef>
 #include <filesystem>
+#include <memory>
+#include <optional>
 #include <string>
 #include <string_view>
+#include <vector>
 
 namespace CtBackup {
 
@@ -56,20 +59,50 @@ struct Result {
   [[nodiscard]] bool ok() const noexcept { return SUCCEEDED(code); }
 };
 
+struct RestoreValidationSnapshot;
 struct StagedRestore {
   std::filesystem::path stagingRoot;
   std::filesystem::path payloadDir;
   unsigned long long profileCount = 0;
+  std::shared_ptr<const RestoreValidationSnapshot> validation;
 };
+
+// Seal the real staging roots and exact tree after successful archive/legacy
+// validation. A reconstructed three-field StagedRestore is not commit-ready.
+Result CaptureStagedRestoreIdentity(StagedRestore &stagedRestore,
+                                    bool protectedExtraction = false);
+#ifdef CTSPACES_BACKUP_TEST_HOOKS
+// Fail one bound rename in native tests to verify the real rollback branch.
+void FailRestoreRenameForTest(unsigned ordinal);
+// Inject access-denied attempts inside the real bounded rename loop.
+void DenyRestoreRenameAttemptsForTest(unsigned ordinal, unsigned failures,
+                                     void (*beforeRetry)(void *) = nullptr,
+                                     void *user = nullptr);
+unsigned RestoreRenameAttemptsForTest();
+enum class BackupPublicationBoundary { ManifestCreated, ArchiveCreated, Verified };
+using BackupPublicationHook=void(*)(const std::filesystem::path& manifest,
+    const std::filesystem::path& archive,BackupPublicationBoundary boundary,void* user);
+void SetBackupPublicationHookForTest(BackupPublicationHook hook,void* user);
+void FailBackupPublicationForTest();
+#endif
 
 using RestoreCommitGuard =
     bool (*)(void *user, std::wstring &failureDetails);
+
+struct BackupOptions {
+  // nullopt preserves the all-client backup contract. An explicit empty list
+  // is invalid; selected names are copied and validated before enumeration.
+  std::optional<std::vector<std::wstring>> selectedClientNames;
+  _7zDetailedProgressCb detailedProgress = nullptr;
+  void *detailedProgressUser = nullptr;
+};
 
 Result CreateValidated7zBackup(const std::filesystem::path &sitesDir,
                                const std::filesystem::path &destination,
                                const char *appVersion,
                                _7zProgressCb progressCb,
-                               void *progressUser);
+                               void *progressUser,
+                               const BackupOptions &options = {});
 
 Result StageValidated7zRestore(const std::filesystem::path &archivePath,
                                const std::filesystem::path &stagingRoot,

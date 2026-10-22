@@ -7,6 +7,7 @@ struct NotesPanel {
   bool details=false, actions=false, loading=true;
   NotesActionsState actionState;
   std::vector<std::wstring> clients, matches;
+  int scrollOffset=0,scrollMax=0,scrollHeader=0;
 };
 static HWND g_hNotesClientPanel=nullptr;
 static void CloseNotesPanel(ClientNotesDialogState &state) {
@@ -18,12 +19,23 @@ static bool NotesClientAvailable(const std::wstring &client) {
   return IsExistingClientProfile(client) && !IsClientArchived(client) &&
       TryGetSafeClientProfilePath(client,root) && RevalidateSafeClientContainerPath(client,root);
 }
+static std::wstring NotesRememberedClient(const wchar_t *key) {
+  // Keep the full supported identifier, and reject an overlong stored value
+  // rather than interpreting its truncated prefix as another client's name.
+  wchar_t client[kMaxClientNameLength + 2]{};
+  const DWORD length = GetPrivateProfileStringW(L"notes_window",key,L"",client,
+      static_cast<DWORD>(std::size(client)),g_sConfigPath.c_str());
+  if (!length || length >= std::size(client)-1)
+    return {};
+  const std::wstring name(client,length);
+  return SanitizeName(name)==name ? name : std::wstring{};
+}
 static std::vector<std::wstring> NotesRecentClients() {
   std::vector<std::wstring> clients;
   for (int i=0;i<6;++i) {
-    wchar_t client[65]{};const auto key=i ? L"recent"+std::to_wstring(i) : L"last_client";
-    GetPrivateProfileStringW(L"notes_window",key.c_str(),L"",client,65,g_sConfigPath.c_str());
-    if (*client && std::none_of(clients.begin(),clients.end(),[&](const auto &c){return client_notes::SamePageName(c,client);})) clients.emplace_back(client);
+    const auto key=i ? L"recent"+std::to_wstring(i) : L"last_client";
+    const auto client=NotesRememberedClient(key.c_str());
+    if (!client.empty() && std::none_of(clients.begin(),clients.end(),[&](const auto &c){return client_notes::SamePageName(c,client);})) clients.emplace_back(client);
   }
   return clients;
 }
@@ -32,8 +44,8 @@ static void NotesRememberClient(const std::wstring &client) {
   recent.erase(std::remove_if(recent.begin(),recent.end(),[&](const auto &c){return client_notes::SamePageName(c,client);}),recent.end());
   recent.insert(recent.begin(),client);
   std::vector<config_persistence::IniMutation> changes; // Same atomic config path as window dimensions.
-  changes.push_back({L"notes_window",std::wstring(L"last_client"),client});
-  for (size_t i=1;i<=5;++i) changes.push_back({L"notes_window",L"recent"+std::to_wstring(i),i<recent.size() ? recent[i] : L""});
+  changes.push_back({L"notes_window",std::wstring(L"last_client"),client_preference_encoding::ForIni(client)});
+  for (size_t i=1;i<=5;++i) changes.push_back({L"notes_window",L"recent"+std::to_wstring(i),i<recent.size() ? client_preference_encoding::ForIni(recent[i]) : L""});
   SaveConfigMutations(L"recent notes clients",changes,false);
 }
 static std::vector<std::wstring> NotesNavigationClients() {
@@ -47,52 +59,131 @@ static std::vector<std::wstring> NotesNavigationClients() {
   std::stable_sort(clients.begin(),clients.end(),[&](const auto &a,const auto &b){return rank(a)<rank(b);});
   return clients;
 }
-static void NotesPanelLayout(HWND dialog,const NotesPanel &panel) {
+static int NotesPanelHintHeight(HWND dialog,int width,int minimum) {
+  const HWND hint=GetDlgItem(dialog,IDC_NOTES_DETAILS_HINT);const auto text=NotesWindowText(hint);HDC dc=GetDC(hint);
+  if(!dc)return minimum;
+  const auto font=reinterpret_cast<HFONT>(SendMessageW(hint,WM_GETFONT,0,0));const auto previous=SelectObject(dc,font?font:GetStockObject(DEFAULT_GUI_FONT));
+  RECT measured{0,0,(std::max)(1,width),0};DrawTextW(dc,text.c_str(),static_cast<int>(text.size()),&measured,DT_CALCRECT|DT_WORDBREAK|DT_NOPREFIX);
+  SelectObject(dc,previous);ReleaseDC(hint,dc);return (std::max)(minimum,static_cast<int>(measured.bottom-measured.top));
+}
+static void NotesPanelLayout(HWND dialog,NotesPanel &panel) {
   const auto px=[&](int value){return ScaleByDpi(value,GetDpiForWindow(dialog));};
   const int width=panel.details || panel.actions ? 390 : 360;
-  const int height=panel.details ? 382 : panel.actions ? 414 : 122+static_cast<int>((std::max)(size_t{1},panel.matches.size()))*28;
-  SetWindowPos(dialog,nullptr,0,0,px(width),px(height),SWP_NOMOVE|SWP_NOZORDER|SWP_NOACTIVATE);
-  const auto place=[&](int id,int x,int y,int w,int h) {
-    HWND control=GetDlgItem(dialog,id);RECT old{};GetWindowRect(control,&old);MapWindowPoints(nullptr,dialog,reinterpret_cast<POINT *>(&old),2);
-    if (old.left!=px(x) || old.top!=px(y) || old.right-old.left!=px(w) || old.bottom-old.top!=px(h))
-      SetWindowPos(control,nullptr,px(x),px(y),px(w),px(h),SWP_NOZORDER|SWP_NOACTIVATE);
+  const int height=panel.details ? 502 : panel.actions ? 414 : 122+static_cast<int>((std::max)(size_t{1},panel.matches.size()))*28;
+  const auto work=NotesWorkArea(panel.owner ? panel.owner : dialog);
+  const int outerWidth=(std::min)(px(width),(std::max)(1,static_cast<int>(work.right-work.left)));
+  const int outerHeight=(std::min)(px(height),(std::max)(1,static_cast<int>(work.bottom-work.top)));
+  RECT bounds{};GetWindowRect(dialog,&bounds);
+  const int left=(std::clamp)(static_cast<int>(bounds.left),static_cast<int>(work.left),static_cast<int>(work.right)-outerWidth);
+  const int top=(std::clamp)(static_cast<int>(bounds.top),static_cast<int>(work.top),static_cast<int>(work.bottom)-outerHeight);
+  if(bounds.left!=left||bounds.top!=top||bounds.right-bounds.left!=outerWidth||bounds.bottom-bounds.top!=outerHeight)
+    SetWindowPos(dialog,nullptr,left,top,outerWidth,outerHeight,SWP_NOZORDER|SWP_NOACTIVATE);
+  int contentHeight=panel.details ? px(height) : (std::max)(outerHeight,px(panel.actions ? 226 : 150));
+  const auto setScrollbar=[&](bool visible){if(((GetWindowLongPtrW(dialog,GWL_STYLE)&WS_VSCROLL)!=0)!=visible)ShowScrollBar(dialog,SB_VERT,visible);};
+  RECT area{};GetClientRect(dialog,&area);int hintHeight=px(114);
+  if(panel.details){
+    const int available=static_cast<int>(area.right)+((GetWindowLongPtrW(dialog,GWL_STYLE)&WS_VSCROLL)?GetSystemMetricsForDpi(SM_CXVSCROLL,GetDpiForWindow(dialog)):0);
+    hintHeight=NotesPanelHintHeight(dialog,available-px(32),px(114));contentHeight=(std::max)(px(height),px(378)+hintHeight+px(10));
+  }
+  // Decide from the full width first, avoiding hide/show churn when repeated
+  // metadata updates still need the existing scrollbar.
+  setScrollbar(contentHeight>outerHeight);GetClientRect(dialog,&area);
+  if(panel.details){
+    const auto measureHint=[&]{hintHeight=NotesPanelHintHeight(dialog,static_cast<int>(area.right)-px(32),px(114));contentHeight=(std::max)(px(height),px(378)+hintHeight+px(10));};
+    measureHint();
+    // A scrollbar reduces the real field width. Measure again after it is
+    // present so its extra wrapping also contributes to the scroll extent.
+    if(contentHeight>area.bottom&&!(GetWindowLongPtrW(dialog,GWL_STYLE)&WS_VSCROLL)){setScrollbar(true);GetClientRect(dialog,&area);measureHint();}
+  }
+  panel.scrollHeader=px(44);panel.scrollMax=(std::max)(0,contentHeight-static_cast<int>(area.bottom));
+  panel.scrollOffset=(std::clamp)(panel.scrollOffset,0,panel.scrollMax);
+  SCROLLINFO scroll{sizeof(scroll),SIF_RANGE|SIF_PAGE|SIF_POS};scroll.nMax=(std::max)(0,contentHeight-panel.scrollHeader-1);
+  scroll.nPage=static_cast<UINT>((std::max)(1,static_cast<int>(area.bottom)-panel.scrollHeader));scroll.nPos=panel.scrollOffset;
+  SetScrollInfo(dialog,SB_VERT,&scroll,TRUE);
+  const int fieldWidth=(std::max)(1,static_cast<int>(area.right)-px(32));
+  const auto placeControl=[&](HWND control,int x,int y,int w,int h,bool body) {
+    if(!control) return;
+    if(body) y-=panel.scrollOffset;
+    RECT old{};GetWindowRect(control,&old);MapWindowPoints(nullptr,dialog,reinterpret_cast<POINT *>(&old),2);
+    if(old.left!=x || old.top!=y || old.right-old.left!=w || old.bottom-old.top!=h)
+      SetWindowPos(control,nullptr,x,y,w,h,SWP_NOZORDER|SWP_NOACTIVATE);
+    if(body) {
+      RECT actual{};GetWindowRect(control,&actual);MapWindowPoints(nullptr,dialog,reinterpret_cast<POINT *>(&actual),2);
+      HRGN clip=nullptr;
+      if(panel.scrollMax) {
+        const int clipHeight=static_cast<int>(actual.bottom-actual.top);
+        const int first=(std::clamp)(panel.scrollHeader-static_cast<int>(actual.top),0,clipHeight);
+        const int last=(std::clamp)(static_cast<int>(area.bottom-actual.top),0,clipHeight);
+        clip=last>first ? CreateRectRgn(0,first,(std::max)(0,static_cast<int>(actual.right-actual.left)),last) : CreateRectRgn(0,0,0,0);
+      }
+      SetWindowRgn(control,clip,TRUE);
+    }
   };
-  place(IDC_NOTES_LABEL1,16,14,width-68,22);place(IDCANCEL,width-44,8,28,28);
+  const auto place=[&](int id,int y,int h) {placeControl(GetDlgItem(dialog,id),px(16),y,fieldWidth,h,true);};
+  placeControl(GetDlgItem(dialog,IDC_NOTES_LABEL1),px(16),px(14),(std::max)(1,static_cast<int>(area.right)-px(68)),px(22),false);
+  placeControl(GetDlgItem(dialog,IDCANCEL),(std::max)(0,static_cast<int>(area.right)-px(44)),px(8),px(28),px(28),false);
   if (panel.details) {
     // Static captions are anonymous resource controls. Place them in source
     // order so every edit has its label and no excess dialog-unit padding.
     int caption=0;
     for (HWND child=GetWindow(dialog,GW_CHILD);child;child=GetWindow(child,GW_HWNDNEXT)) if (GetDlgCtrlID(child)==IDC_STATIC || GetDlgCtrlID(child)==65535) {
-      SetWindowPos(child,nullptr,px(16),px(46+caption*66),px(width-32),px(20),SWP_NOZORDER|SWP_NOACTIVATE);++caption;
+      placeControl(child,px(16),px(46+caption*66),fieldWidth,px(20),true);++caption;
     }
-    place(IDC_NOTES_STATUS_PICK,16,68,width-32,180);
-    place(IDC_NOTES_TAGS_EDIT,16,134,width-32,30);
-    place(IDC_NOTES_INPUT1,16,200,width-32,30);place(IDC_NOTES_INPUT2,16,266,width-32,30);
-    place(IDC_NOTES_DETAILS_HINT,16,312,width-32,60);
+    place(IDC_NOTES_STATUS_PICK,px(68),px(180));
+    place(IDC_NOTES_TAGS_EDIT,px(134),px(30));
+    place(IDC_NOTES_INPUT1,px(200),px(30));place(IDC_NOTES_INPUT2,px(266),px(30));
+    place(IDC_NOTES_LINK_BROWSER_PICK,px(332),px(180));
+    place(IDC_NOTES_DETAILS_HINT,px(378),hintHeight);
   } else if (panel.actions) {
-    place(IDC_NOTES_QUERY,16,46,width-32,30);place(IDC_NOTES_RESULTS,16,88,width-32,252);
-    place(IDC_NOTES_INFO,16,350,width-32,52);
+    const int listHeight=(std::min)(px(252),(std::max)(px(66),contentHeight-px(162)));
+    place(IDC_NOTES_QUERY,px(46),px(30));place(IDC_NOTES_RESULTS,px(88),listHeight);
+    place(IDC_NOTES_INFO,px(98)+listHeight,px(52));
   } else {
-    place(IDC_NOTES_CLIENT_SEARCH,16,46,width-32,30);place(IDC_NOTES_LABEL2,16,86,width-32,28);
-    place(IDC_NOTES_CLIENT_MATCHES,16,114,width-32,height-122);
+    place(IDC_NOTES_CLIENT_SEARCH,px(46),px(30));place(IDC_NOTES_LABEL2,px(86),px(28));
+    place(IDC_NOTES_CLIENT_MATCHES,px(114),(std::max)(px(28),contentHeight-px(122)));
     SendDlgItemMessageW(dialog,IDC_NOTES_CLIENT_MATCHES,LB_SETITEMHEIGHT,0,px(28));
+    HWND list=GetDlgItem(dialog,IDC_NOTES_CLIENT_MATCHES);RECT visible{};GetClientRect(list,&visible);
+    const auto rows=SendMessageW(list,LB_GETCOUNT,0,0),rowHeight=SendMessageW(list,LB_GETITEMHEIGHT,0,0);
+    ShowScrollBar(list,SB_VERT,rows>0 && rowHeight>0 && rows*rowHeight>visible.bottom);
   }
   InvalidateRect(dialog,nullptr,FALSE);
 }
+static void NotesPanelScroll(HWND dialog,NotesPanel &panel,int position) {
+  position=(std::clamp)(position,0,panel.scrollMax);
+  if(position!=panel.scrollOffset){panel.scrollOffset=position;NotesPanelLayout(dialog,panel);}
+}
+static void NotesPanelRevealControl(HWND dialog,NotesPanel &panel,HWND child) {
+  if(!panel.scrollMax || !child || GetParent(child)!=dialog) return;
+  RECT bounds{},area{};GetWindowRect(child,&bounds);MapWindowPoints(nullptr,dialog,reinterpret_cast<POINT *>(&bounds),2);GetClientRect(dialog,&area);
+  int position=panel.scrollOffset;
+  if(bounds.top<panel.scrollHeader || bounds.bottom-bounds.top>area.bottom-panel.scrollHeader) position+=static_cast<int>(bounds.top)-panel.scrollHeader;
+  else if(bounds.bottom>area.bottom) position+=static_cast<int>(bounds.bottom-area.bottom);
+  NotesPanelScroll(dialog,panel,position);
+}
 static void NotesPaintPanel(HWND dialog,HDC dc) {
   RECT area{};GetClientRect(dialog,&area);FillRect(dc,&area,g_hbrThemeWindow);FrameRect(dc,&area,g_hbrThemeBorder);
+  const int saved=SaveDC(dc);auto *panel=reinterpret_cast<NotesPanel *>(GetWindowLongPtrW(dialog,DWLP_USER));
+  if(panel && panel->scrollMax) IntersectClipRect(dc,0,panel->scrollHeader,area.right,area.bottom);
   for (int id:{IDC_NOTES_CLIENT_SEARCH,IDC_NOTES_CLIENT_MATCHES,IDC_NOTES_QUERY,IDC_NOTES_RESULTS,
       IDC_NOTES_TAGS_EDIT,IDC_NOTES_INPUT1,IDC_NOTES_INPUT2}) {
     HWND control=GetDlgItem(dialog,id);if (!control || !IsWindowVisible(control)) continue;
     RECT rect{};GetWindowRect(control,&rect);MapWindowPoints(nullptr,dialog,reinterpret_cast<POINT *>(&rect),2);InflateRect(&rect,1,1);
     FrameRect(dc,&rect,g_hbrThemeBorder);
   }
+  RestoreDC(dc,saved);
 }
 static void NotesPanelMatches(HWND dialog,NotesPanel &panel) {
   const auto query=NotesWindowText(GetDlgItem(dialog,IDC_NOTES_CLIENT_SEARCH));
   auto list=GetDlgItem(dialog,IDC_NOTES_CLIENT_MATCHES);
   SendMessageW(list,LB_RESETCONTENT,0,0); panel.matches.clear();
-  for (const auto &client:panel.clients) {
+  // An exact name must remain reachable even when eight pinned/recent clients
+  // contain that name. Preserve the normal order for all other suggestions.
+  auto clients=panel.clients;
+  if (!query.empty()) {
+    const auto exact=std::find_if(clients.begin(),clients.end(),[&](const auto &client){return client_name_comparison::EqualIgnoringCase(client,query);});
+    if (exact!=clients.end()) std::rotate(clients.begin(),exact,exact+1);
+  }
+  for (const auto &client:clients) {
     if (!query.empty() && !StrStrIW(client.c_str(),query.c_str())) continue;
     panel.matches.push_back(client);
     std::wstring label=client;
@@ -121,6 +212,7 @@ static bool NotesApplyDetails(HWND dialog,NotesPanel &panel) {
     state.detailsDrafts[panel.note]={std::to_wstring(status),NotesWindowText(GetDlgItem(dialog,IDC_NOTES_TAGS_EDIT)),ticket,url};
     SetNotesStatus(panel.owner,state);
     SetDlgItemTextW(dialog,IDC_NOTES_DETAILS_HINT,L"Not saved: use an http/https URL and up to 16 tags of 32 characters each.");
+    NotesPanelLayout(dialog,panel);
     return false;
   }
   state.detailsDrafts.erase(panel.note);
@@ -129,8 +221,10 @@ static bool NotesApplyDetails(HWND dialog,NotesPanel &panel) {
     page->pristine=false;page->modified=client_notes::Now();state.metadataChanged=true;
     SaveClientNotesDraft(panel.owner,state);UpdateNotesToolbar(panel.owner,state);
   }
-  SetDlgItemTextW(dialog,IDC_NOTES_DETAILS_HINT,state.saveFailed ? L"Could not save. Your changes stay in the notebook draft; use More > Retry saving." :
-      L"Changes save automatically. Click outside to close. Status is local; it does not update your ticket system.");
+  const auto information=state.saveFailed ? std::wstring(L"Could not save. Your changes stay in the notebook draft; use More > Retry saving.") :
+      L"Links use your regular PC browser, outside client profiles. Changes save automatically. Status does not update your ticket system.\r\n\r\n"+NotesStatisticsText(GetDlgItem(panel.owner,IDC_CLIENT_NOTES_TEXT));
+  SetDlgItemTextW(dialog,IDC_NOTES_DETAILS_HINT,information.c_str());
+  NotesPanelLayout(dialog,panel);
   SetNotesStatus(panel.owner,state);
   return true;
 }
@@ -180,10 +274,15 @@ static INT_PTR CALLBACK NotesPanelProc(HWND dialog,UINT message,WPARAM w,LPARAM 
       }
       for (auto [id,limit]:{std::pair{IDC_NOTES_TAGS_EDIT,1024},{IDC_NOTES_INPUT1,128},{IDC_NOTES_INPUT2,2048}})
         SendDlgItemMessageW(dialog,id,EM_SETLIMITTEXT,limit,0);
+      auto browser=GetDlgItem(dialog,IDC_NOTES_LINK_BROWSER_PICK);SetWindowSubclass(browser,NotesComboSubclass,1,0);
+      SendMessageW(browser,CB_SETITEMHEIGHT,-1,height);SendMessageW(browser,CB_SETITEMHEIGHT,0,height);
+      NotesFillLinkBrowser(browser);
+      const auto information=L"Links use your regular PC browser, outside client profiles. Changes save automatically. Status does not update your ticket system.\r\n\r\n"+NotesStatisticsText(GetDlgItem(panel->owner,IDC_CLIENT_NOTES_TEXT));
+      SetDlgItemTextW(dialog,IDC_NOTES_DETAILS_HINT,information.c_str());
     } else {
       panel->clients=NotesNavigationClients();NotesPanelMatches(dialog,*panel);
       SendDlgItemMessageW(dialog,IDC_NOTES_CLIENT_SEARCH,EM_SETCUEBANNER,FALSE,reinterpret_cast<LPARAM>(L"Search clients..."));
-      SendDlgItemMessageW(dialog,IDC_NOTES_CLIENT_SEARCH,EM_SETLIMITTEXT,64,0);
+      SendDlgItemMessageW(dialog,IDC_NOTES_CLIENT_SEARCH,EM_SETLIMITTEXT,kMaxClientNameLength,0);
       SetWindowSubclass(GetDlgItem(dialog,IDC_NOTES_CLIENT_SEARCH),NotesClientSearchKey,1,0);
       SetWindowSubclass(GetDlgItem(dialog,IDC_NOTES_CLIENT_MATCHES),NotesClientListKey,1,0);
       ShowWindow(GetDlgItem(dialog,IDOK),SW_HIDE);
@@ -191,6 +290,14 @@ static INT_PTR CALLBACK NotesPanelProc(HWND dialog,UINT message,WPARAM w,LPARAM 
     NotesPanelLayout(dialog,*panel);panel->loading=false;return TRUE;
   }
   if (!panel) return FALSE;
+  if(message==WM_ERASEBKGND) return TRUE; // Our paint owns the header and clipped body together.
+  if(message==WM_VSCROLL && !l && panel->scrollMax) {
+    SCROLLINFO scroll{sizeof(scroll),SIF_TRACKPOS};GetScrollInfo(dialog,SB_VERT,&scroll);
+    int position=panel->scrollOffset;RECT area{};GetClientRect(dialog,&area);const int line=ScaleByDpi(28,GetDpiForWindow(dialog));
+    switch(LOWORD(w)){case SB_LINEUP:position-=line;break;case SB_LINEDOWN:position+=line;break;case SB_PAGEUP:position-=static_cast<int>(area.bottom)-panel->scrollHeader;break;case SB_PAGEDOWN:position+=static_cast<int>(area.bottom)-panel->scrollHeader;break;case SB_TOP:position=0;break;case SB_BOTTOM:position=panel->scrollMax;break;case SB_THUMBTRACK:case SB_THUMBPOSITION:position=scroll.nTrackPos;break;default:return TRUE;}
+    NotesPanelScroll(dialog,*panel,position);return TRUE;
+  }
+  if(message==WM_MOUSEWHEEL && panel->scrollMax) {NotesPanelScroll(dialog,*panel,panel->scrollOffset-MulDiv(GET_WHEEL_DELTA_WPARAM(w),ScaleByDpi(48,GetDpiForWindow(dialog)),WHEEL_DELTA));return TRUE;}
   if (message==WM_PAINT) {PAINTSTRUCT paint{};auto dc=BeginPaint(dialog,&paint);NotesPaintPanel(dialog,dc);EndPaint(dialog,&paint);return TRUE;}
   if (message==WM_PRINTCLIENT) {NotesPaintPanel(dialog,reinterpret_cast<HDC>(w));return TRUE;}
   if (message==WM_DRAWITEM && l && DrawNotesComboItem(*reinterpret_cast<DRAWITEMSTRUCT *>(l))) return TRUE;
@@ -205,6 +312,11 @@ static INT_PTR CALLBACK NotesPanelProc(HWND dialog,UINT message,WPARAM w,LPARAM 
   if (message==WM_TIMER && w==1) {KillTimer(dialog,1);NotesApplyDetails(dialog,*panel);return TRUE;}
   if (message==WM_COMMAND) {
     const int id=LOWORD(w);
+    wchar_t kind[32]{};HWND sender=reinterpret_cast<HWND>(l);
+    if(sender && id!=IDCANCEL && GetClassNameW(sender,kind,static_cast<int>(std::size(kind))) &&
+        ((!_wcsicmp(kind,L"Edit") && HIWORD(w)==EN_SETFOCUS) ||
+         (!_wcsicmp(kind,L"ComboBox") && HIWORD(w)==CBN_SETFOCUS) ||
+         (!_wcsicmp(kind,L"ListBox") && HIWORD(w)==LBN_SETFOCUS))) NotesPanelRevealControl(dialog,*panel,sender);
     if (id==IDCANCEL) {DestroyWindow(dialog);return TRUE;}
     if (panel->actions) {
       if (id==IDC_NOTES_QUERY && HIWORD(w)==EN_CHANGE) {NotesActionsFill(dialog,panel->actionState);return TRUE;}
@@ -218,6 +330,20 @@ static INT_PTR CALLBACK NotesPanelProc(HWND dialog,UINT message,WPARAM w,LPARAM 
       return TRUE;
     }
     if (panel->details) {
+      if (id==IDC_NOTES_LINK_BROWSER_PICK) {
+        HWND combo=GetDlgItem(dialog,id);
+        if (HIWORD(w)==CBN_SELENDCANCEL) {NotesFillLinkBrowser(combo);return TRUE;}
+        if (HIWORD(w)!=CBN_SELENDOK &&
+            (HIWORD(w)!=CBN_SELCHANGE || SendMessageW(combo,CB_GETDROPPEDSTATE,0,0))) return TRUE;
+        const auto row=SendMessageW(combo,CB_GETCURSEL,0,0);
+        bool saved=false;
+        if (row>=0) {
+          const auto choice=SendMessageW(combo,CB_GETITEMDATA,row,0);
+          if (choice!=CB_ERR) saved=NotesSaveLinkBrowser(static_cast<UINT>(choice));
+        }
+        if (!saved) NotesFillLinkBrowser(combo);
+        return TRUE;
+      }
       if (HIWORD(w)==EN_CHANGE || (id==IDC_NOTES_STATUS_PICK && HIWORD(w)==CBN_SELCHANGE)) SetTimer(dialog,1,400,nullptr);
       return TRUE;
     }
@@ -268,10 +394,10 @@ static void NotesShowPanel(HWND owner,ClientNotesDialogState *state,bool details
   if (!details && !actions) g_hNotesClientPanel=window;
   RECT anchor{};GetWindowRect(state ? GetDlgItem(owner,details ? IDC_NOTES_DETAILS : actions ? IDC_NOTES_MORE : IDC_NOTES_SWITCH_CLIENT) : g_hBtnNotes,&anchor);
   RECT bounds{};GetWindowRect(window,&bounds);
-  MONITORINFO monitor{sizeof(monitor)};GetMonitorInfoW(MonitorFromWindow(owner,MONITOR_DEFAULTTONEAREST),&monitor);
+  const auto work=NotesWorkArea(owner);
   const int width=bounds.right-bounds.left,height=bounds.bottom-bounds.top;
-  const int left=std::clamp(static_cast<int>(details || actions ? anchor.right-width : anchor.left),static_cast<int>(monitor.rcWork.left),static_cast<int>(monitor.rcWork.right)-width);
-  const int top=std::clamp(static_cast<int>(anchor.bottom+6),static_cast<int>(monitor.rcWork.top),static_cast<int>(monitor.rcWork.bottom)-height);
+  const int left=std::clamp(static_cast<int>(details || actions ? anchor.right-width : anchor.left),static_cast<int>(work.left),(std::max)(static_cast<int>(work.left),static_cast<int>(work.right)-width));
+  const int top=std::clamp(static_cast<int>(anchor.bottom+6),static_cast<int>(work.top),(std::max)(static_cast<int>(work.top),static_cast<int>(work.bottom)-height));
   SetWindowPos(window,HWND_TOP,left,top,0,0,SWP_NOSIZE|SWP_SHOWWINDOW);
   SetFocus(GetDlgItem(window,details ? IDC_NOTES_STATUS_PICK : actions ? IDC_NOTES_QUERY : IDC_NOTES_CLIENT_SEARCH));
 }
@@ -287,9 +413,10 @@ static void OpenRequestedNotesClient(LPARAM data) {
   }
 }
 static void ShowNotesFromMain() {
+  if (!g_bUiEnabled || g_bClientNotesBusy.load()) return;
   auto client=GetSelectedClientNameSanitized(false);
   if (!NotesClientAvailable(client)) {
-    wchar_t last[65]{};GetPrivateProfileStringW(L"notes_window",L"last_client",L"",last,65,g_sConfigPath.c_str());client=last;
+    client=NotesRememberedClient(L"last_client");
   }
   if (NotesClientAvailable(client)) ShowClientNotes(client);
   else NotesShowPanel(g_hGui,nullptr,false);

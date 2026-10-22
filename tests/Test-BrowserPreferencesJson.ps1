@@ -17,7 +17,7 @@ foreach ($requiredGuard in @(
     'kMaximumPreferencesJsonBytes',
     'FILE_FLAG_OPEN_REPARSE_POINT',
     'FILE_ATTRIBUTE_REPARSE_POINT',
-    'ReplaceFileW'
+    'config_persistence::MutateRawFileAtomically('
 )) {
     if (-not $source.Contains($requiredGuard)) {
         throw "Browser preferences source is missing safety guard: $requiredGuard"

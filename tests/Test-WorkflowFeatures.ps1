@@ -1,11 +1,16 @@
 param(
     [string]$ExePath = (Join-Path $PSScriptRoot '..\dist\x64\Release\ctSpaces.exe'),
-    [int]$TimeoutSeconds = 12
+    [int]$TimeoutSeconds = 12,
+    [ValidateRange(0, 2000)][int]$LifecycleStressCycles = 0,
+    [ValidateRange(0, 20000)][int]$UnrelatedBrowserExitChurn = 0,
+    [string]$EvidenceDirectory = '',
+    [switch]$KeepFixture
 )
 
 $ErrorActionPreference = 'Stop'
 $projectRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
 $resolvedExe = [IO.Path]::GetFullPath($ExePath)
+$testedExecutableHash = $null
 $qaParent = Join-Path $projectRoot 'build\qwf'
 $runId = [Guid]::NewGuid().ToString('N')
 $qaRoot = Join-Path $qaParent ('run-' + $runId.Substring(0, 10))
@@ -48,6 +53,9 @@ $liveClientPaths = @(
     ForEach-Object { Join-Path $liveDataDir ('Sites\' + $_) }
 $launcher = $null
 $launcherWindow = [IntPtr]::Zero
+$completed = $false
+$phase = 'fixture setup'
+$churnJob = $null
 
 function Get-FileFingerprint {
     param([string]$Path)
@@ -312,6 +320,23 @@ function Set-WindowTextValue {
     }
 }
 
+function Get-WindowTextValue {
+    param([IntPtr]$Window)
+
+    # WM_GETTEXT is marshalled across processes; GetWindowText does not reliably
+    # retrieve another process's edit-control contents.
+    $capacity = 1024
+    $pointer = [Runtime.InteropServices.Marshal]::AllocHGlobal($capacity * 2)
+    try {
+        [Runtime.InteropServices.Marshal]::WriteInt16($pointer, 0)
+        [void](Send-WindowMessage -Window $Window -Message 0x000D `
+            -WParam ([UIntPtr]::new($capacity)) -LParam $pointer)
+        [Runtime.InteropServices.Marshal]::PtrToStringUni($pointer)
+    } finally {
+        [Runtime.InteropServices.Marshal]::FreeHGlobal($pointer)
+    }
+}
+
 function Invoke-AppCommand {
     param([int]$Command)
 
@@ -445,6 +470,7 @@ try {
     New-Item -ItemType Directory -Path $qaDataDir -Force | Out-Null
     New-Item -ItemType Directory -Path $qaShortcutDir -Force | Out-Null
     Copy-Item -LiteralPath $resolvedExe -Destination $qaExe -Force
+    $testedExecutableHash = (Get-FileHash -LiteralPath $qaExe -Algorithm SHA256).Hash
     New-Item -ItemType File -Path (Join-Path $qaExeDir 'ctSpaces.portable') `
         -Force | Out-Null
 
@@ -538,7 +564,7 @@ try {
         ' --qa-data-dir="' + $qaDataDir + '"' +
         ' --qa-shortcut-dir="' + $qaShortcutDir + '"'
     $launcher = Start-Process -FilePath $qaExe -ArgumentList $arguments `
-        -PassThru
+        -WindowStyle Hidden -PassThru
     [void]$launcher.WaitForInputIdle(10000)
     $launcherWindow = Wait-Until {
         $window = [CtWorkflowQaNative]::FindWindow(
@@ -849,6 +875,113 @@ try {
         throw 'Rename or archive changed the unrelated same-named shortcut fixture.'
     }
 
+    $stressPeakHandles = 0
+    $stressStart = Get-Date
+    $stressUpperName = $renamedName.ToUpperInvariant()
+    $stressInputProtected = $false
+    if ($LifecycleStressCycles -gt 0) {
+        # These cycles exercise command-driven profile transactions, with a
+        # known source client. Keep incidental desktop typing from changing the
+        # fixture request between WM_SETTEXT and the synchronous QA command.
+        # Programmatic text setters still work; ordinary selector workflows
+        # before and after this loop remain editable.
+        [void](Send-WindowMessage -Window $clientEdit -Message 0x00CF `
+            -WParam ([UIntPtr]::new(1))) # EM_SETREADONLY
+        Set-WindowTextValue $clientEdit $renamedName
+        [void](Send-WindowMessage -Window $clientEdit -Message 0x00B1 `
+            -WParam ([UIntPtr]::Zero) -LParam ([IntPtr]::Zero)) # caret at start
+        [void](Send-WindowMessage -Window $clientEdit -Message 0x0102 `
+            -WParam ([UIntPtr]::new(119))) # deliberate incidental WM_CHAR 'w'
+        if ((Get-WindowTextValue $clientEdit) -cne $renamedName) {
+            throw 'The lifecycle fixture did not reject incidental character input.'
+        }
+        $stressInputProtected = $true
+    }
+    if ($UnrelatedBrowserExitChurn -gt 0) {
+        # A signed Windows no-op helper under a supported browser filename
+        # reproduces process-snapshot/exit races without launching a browser or
+        # providing any client profile arguments. Its processes are fixture-only.
+        $churnDirectory = Join-Path $qaRoot 'unrelated-process-churn'
+        New-Item -ItemType Directory -Path $churnDirectory -Force | Out-Null
+        $churnExe = Join-Path $churnDirectory 'msedge.exe'
+        Copy-Item -LiteralPath (Join-Path $env:WINDIR 'System32\rundll32.exe') -Destination $churnExe
+        $churnJob = Start-Job -ArgumentList $churnExe, $UnrelatedBrowserExitChurn -ScriptBlock {
+            param($Path, $Count)
+            for ($iteration = 0; $iteration -lt $Count; $iteration++) {
+                $child = Start-Process -FilePath $Path -WindowStyle Hidden -PassThru
+                try {
+                    if (-not $child.WaitForExit(5000)) {
+                        $child.Kill(); [void]$child.WaitForExit(5000)
+                        throw 'Fixture no-op process failed to exit.'
+                    }
+                } finally { $child.Dispose() }
+            }
+            "UNRELATED-BROWSER-EXIT-CHURN completed=$Count"
+        }
+    }
+    for ($stressCycle = 1; $stressCycle -le $LifecycleStressCycles; $stressCycle++) {
+        foreach ($rename in @(
+            [pscustomobject]@{ From = $renamedName; To = $stressUpperName; Label = 'rename out' },
+            [pscustomobject]@{ From = $stressUpperName; To = $renamedName; Label = 'rename back' }
+        )) {
+            $phase = "Stress $stressCycle $($rename.Label)"
+            Set-WindowTextValue $clientEdit $rename.From
+            Set-QaRenameTarget $rename.To
+            if ([CtWorkflowQaNative]::GetDlgItem($launcherWindow, 206) -ne $clientEdit -or
+                (Get-WindowTextValue $clientEdit) -cne $rename.From) {
+                throw "$phase input changed before command dispatch. Fixture: $qaRoot"
+            }
+            if ((Send-WindowMessage -Window $launcherWindow -Message (0x8000 + 13)) -eq [UIntPtr]::Zero) {
+                $receiptPath = Join-Path $qaDataDir 'qa-client-lifecycle.log'
+                $receipt = if (Test-Path -LiteralPath $receiptPath) {
+                    (Get-Content -LiteralPath $receiptPath -Tail 8) -join "`n"
+                } else { '<executable has no QA error receipt>' }
+                throw "$phase failed.`nUnderlying application receipts:`n$receipt`nFixture: $qaRoot"
+            }
+            $exactNames = @(Get-ExactChildDirectoryNames (Join-Path $qaDataDir 'Sites'))
+            if ($exactNames -cnotcontains $rename.To -or $exactNames -ccontains $rename.From) {
+                throw "$phase returned success without committing exact casing. Fixture: $qaRoot"
+            }
+        }
+        $phase = "Stress $stressCycle archive"
+        Set-WindowTextValue $clientEdit $renamedName
+        if ((Get-WindowTextValue $clientEdit) -cne $renamedName) {
+            throw "$phase input changed before command dispatch. Fixture: $qaRoot"
+        }
+        if ((Send-WindowMessage -Window $launcherWindow -Message (0x8000 + 14)) -eq [UIntPtr]::Zero) {
+            throw "$phase failed. Fixture: $qaRoot"
+        }
+        $phase = "Stress $stressCycle restore"
+        if ((Send-WindowMessage -Window $launcherWindow -Message (0x8000 + 11) -WParam ([UIntPtr]::new(1))) -eq [UIntPtr]::Zero) {
+            throw "$phase failed. Fixture: $qaRoot"
+        }
+        Assert-V2SlotSentinels $renamedProfilePath
+        Assert-ClientNotes $renamedProfilePath
+        if (-not (Test-Path -LiteralPath $renamedShortcutPath -PathType Leaf) -or
+            -not (Test-Path -LiteralPath (Join-Path $renamedProfilePath $deepTailRelativePath) -PathType Leaf)) {
+            throw "Stress $stressCycle lost the owned shortcut or deep-tail fixture. Fixture: $qaRoot"
+        }
+        if ((Get-FileHash -LiteralPath $betaShortcutPath -Algorithm SHA256).Hash -cne $unrelatedShortcutHash) {
+            throw "Stress $stressCycle modified the unrelated shortcut. Fixture: $qaRoot"
+        }
+        Wait-ForConfigPattern "(?ms)^\[restore_tabs\].*?^disabled_client\d+=${renamedRegex}\|edge\r?$"
+        Wait-ForConfigPattern "(?ms)^\[restore_tabs\].*?^disabled_client\d+=${renamedRegex}\|chrome\r?$"
+        $launcher.Refresh()
+        $stressPeakHandles = [Math]::Max($stressPeakHandles, $launcher.HandleCount)
+        if ($stressCycle % 10 -eq 0) {
+            Write-Output "LIFECYCLE-STRESS cycles=$stressCycle actions=$($stressCycle * 4) handles=$($launcher.HandleCount)"
+        }
+    }
+    if ($stressInputProtected) {
+        [void](Send-WindowMessage -Window $clientEdit -Message 0x00CF `
+            -WParam ([UIntPtr]::Zero))
+    }
+    $phase = 'remaining workflow validations'
+    if ($churnJob) {
+        [void](Wait-Job $churnJob -Timeout 60)
+        if ($churnJob.State -ne 'Completed') { throw 'Fixture exit-churn job failed or did not finish.' }
+        Receive-Job $churnJob -ErrorAction Stop
+    }
     Invoke-AppCommand 41016
     Wait-ForConfigPattern '(?m)^client_title_first=1\r?$'
     Assert-LiveDataUnchanged
@@ -882,7 +1015,17 @@ try {
     }
     Assert-LiveDataUnchanged
 
+    $completed = $true
     [pscustomobject]@{
+        Executable = $resolvedExe
+        TestedExecutable = $qaExe
+        ExecutableSha256 = $testedExecutableHash
+        LifecycleStressCycles = $LifecycleStressCycles
+        LifecycleStressActions = $LifecycleStressCycles * 4
+        LifecycleStressPeakHandles = $stressPeakHandles
+        LifecycleStressSeconds = [Math]::Round(((Get-Date) - $stressStart).TotalSeconds, 2)
+        LifecycleStressInputProtected = $stressInputProtected
+        UnrelatedBrowserExitChurn = $UnrelatedBrowserExitChurn
         PinnedOrderPersisted = $true
         ArchivedClientHidden = $true
         ExactClientOnlyShortcutCreated = $true
@@ -913,7 +1056,25 @@ try {
         LiveConfigUnchanged = $true
         LiveSitesUnchanged = $true
     } | ConvertTo-Json
+} catch {
+    $failure = $_
+    try { [pscustomobject]@{
+        Phase = $phase
+        Error = $failure.Exception.Message
+        Fixture = $qaRoot
+        Executable = $resolvedExe
+        TestedExecutable = $qaExe
+        ExecutableSha256 = $testedExecutableHash
+    } | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $qaRoot 'failure.json')
+    } catch {
+        Write-Warning "Could not write fixture failure receipt: $($_.Exception.Message)"
+    }
+    throw $failure
 } finally {
+    if ($churnJob) {
+        Stop-Job $churnJob -ErrorAction SilentlyContinue
+        Remove-Job $churnJob -Force -ErrorAction SilentlyContinue
+    }
     if ($launcherWindow -ne [IntPtr]::Zero -and
         [CtWorkflowQaNative]::IsWindow($launcherWindow)) {
         [void][CtWorkflowQaNative]::PostMessageW(
@@ -935,11 +1096,25 @@ try {
 
     $resolvedQaRoot = [IO.Path]::GetFullPath($qaRoot)
     $allowedPrefix = [IO.Path]::GetFullPath($qaParent).TrimEnd('\') + '\'
-    if ($resolvedQaRoot.StartsWith(
+    if ($EvidenceDirectory -and (Test-Path -LiteralPath $qaRoot)) {
+        New-Item -ItemType Directory -Path $EvidenceDirectory -Force | Out-Null
+        foreach ($receiptName in @('qa-client-lifecycle.log', 'qa-startup-error.txt')) {
+            $receiptPath = Join-Path $qaDataDir $receiptName
+            if (Test-Path -LiteralPath $receiptPath -PathType Leaf) {
+                Copy-Item -LiteralPath $receiptPath -Destination (Join-Path $EvidenceDirectory $receiptName) -Force
+            }
+        }
+        if (Test-Path -LiteralPath (Join-Path $qaRoot 'failure.json')) {
+            Copy-Item -LiteralPath (Join-Path $qaRoot 'failure.json') -Destination (Join-Path $EvidenceDirectory 'failure.json') -Force
+        }
+    }
+    if ($completed -and -not $KeepFixture -and $resolvedQaRoot.StartsWith(
             $allowedPrefix, [StringComparison]::OrdinalIgnoreCase
         ) -and [IO.Path]::GetFileName($resolvedQaRoot).StartsWith('run-') -and
         (Test-Path -LiteralPath $resolvedQaRoot)) {
         Remove-Item -LiteralPath $resolvedQaRoot -Recurse -Force
+    } elseif (Test-Path -LiteralPath $resolvedQaRoot) {
+        Write-Output "Workflow fixture retained: $resolvedQaRoot"
     }
     Assert-LiveDataUnchanged
 }

@@ -1,8 +1,12 @@
-﻿// Native notes workspace commands. Included after the editor helpers so all
+// Native notes workspace commands. Included after the editor helpers so all
 // persistence and formatting actions use the same validated paths.
+#include "NotesAppTransaction.inl"
 static INT_PTR CALLBACK NotesTemplatesProc(HWND,UINT,WPARAM,LPARAM);
 static INT_PTR CALLBACK NotesTemplateEditorProc(HWND,UINT,WPARAM,LPARAM);
 static void RefreshNotesTemplatesForTheme(HWND);
+#ifdef CTSPACES_NOTES_TEST_HOOKS
+extern void CtSpacesNotesTestAfterCommit(const wchar_t *root);
+#endif
 struct NotesInput {
   std::wstring title, label1, label2, first, second;
   std::wstring hint;
@@ -104,7 +108,7 @@ static INT_PTR CALLBACK NotesClientPickerProc(HWND dialog,UINT message,WPARAM wP
     SetWindowTheme(combo,L"",L""); SetWindowSubclass(combo,NotesComboSubclass,1,0);
     SendMessageW(combo,CB_SETITEMHEIGHT,-1,ScaleByDpi(30,GetDpiForWindow(dialog)));
     SendMessageW(combo,CB_SETITEMHEIGHT,0,ScaleByDpi(30,GetDpiForWindow(dialog)));
-    SendDlgItemMessageW(dialog,IDC_NOTES_CLIENT_PICKER,CB_LIMITTEXT,64,0);
+    SendDlgItemMessageW(dialog,IDC_NOTES_CLIENT_PICKER,CB_LIMITTEXT,kMaxClientNameLength,0);
     if (picker->clients.empty()) SetDlgItemTextW(dialog,IDC_NOTES_LABEL2,L"No other active clients are available.");
     EnableWindow(GetDlgItem(dialog,IDOK),!picker->clients.empty()); return TRUE;
   }
@@ -135,23 +139,36 @@ static std::wstring NotesDate(uint64_t value) {
   wchar_t text[80]{}; swprintf_s(text,L"%04u-%02u-%02u %02u:%02u",date.wYear,date.wMonth,date.wDay,date.wHour,date.wMinute);
   return text;
 }
+static std::wstring NotesNamePrefix(std::wstring base,size_t limit) {
+  if(base.size()>limit) {
+    base.resize(limit);
+    // A supplementary character occupies two UTF-16 units. Shortening a valid
+    // title must not leave half of it, or erase the whole meaningful name.
+    if(!base.empty() && base.back()>=0xd800 && base.back()<=0xdbff) base.pop_back();
+  }
+  while(!base.empty() && client_notes::NameSpace(base.back())) base.pop_back();
+  return base;
+}
 static std::wstring NotesUniqueName(const ClientNotesDialogState &state,std::wstring base) {
   if (base.empty()) base=L"Untitled";
-  base.resize((std::min)(base.size(),size_t{48}));
+  base=NotesNamePrefix(std::move(base),48);
   if (!client_notes::ValidPageName(base)) base=L"Note";
   std::wstring name=base;
   for (size_t i=2;std::any_of(state.pages.begin(),state.pages.end(),[&](const auto &p){return client_notes::SamePageName(p.name,name);});++i)
     name=base+L" "+std::to_wstring(i);
   return name;
 }
-static std::wstring NotesPlain(const client_notes::NotePage &page) {
+static std::wstring NotesPlain(const client_notes::NotePage &page,HWND extractor=nullptr) {
   if (!page.rich) return page.text;
-  HWND edit=CreateWindowExW(0,L"RICHEDIT50W",L"",ES_MULTILINE,0,0,0,0,nullptr,nullptr,g_hInst,nullptr);
+  const bool ownsEditor=!extractor;
+  HWND edit=extractor ? extractor : CreateWindowExW(0,L"RICHEDIT50W",L"",ES_MULTILINE,0,0,0,0,nullptr,nullptr,g_hInst,nullptr);
   if (!edit) return {};
   SendMessageW(edit,EM_EXLIMITTEXT,0,client_notes::kMaxRichBytes);
   NotesStream stream{page.rtf}; EDITSTREAM data{reinterpret_cast<DWORD_PTR>(&stream),0,NotesStreamIn};
   SendMessageW(edit,EM_STREAMIN,SF_RTF,reinterpret_cast<LPARAM>(&data));
-  std::wstring text=NotesWindowText(edit); DestroyWindow(edit);
+  std::wstring text=NotesWindowText(edit);
+  if (ownsEditor) DestroyWindow(edit);
+  else SendMessageW(edit,EM_EMPTYUNDOBUFFER,0,0);
   // RichEdit soft line/cell separators need ordinary whitespace in readable
   // exports; HTML preformatted text does not render a vertical tab as a line.
   std::replace(text.begin(),text.end(),L'\v',L'\n');
@@ -170,7 +187,7 @@ static void NotesCopyText(HWND owner,const std::wstring &text) {
   if (block) GlobalFree(block);
 }
 static void NotesRememberView(HWND dialog,ClientNotesDialogState &state) {
-  if (!HasActiveNote(state)) return;
+  if (!NotesEditorMatchesActive(state)) return;
   // Opening legacy content alone must not create a notebook.
   if (state.original.notebook_snapshot.status==client_notes::ReadStatus::Missing &&
       !state.metadataChanged && !state.formattingChanged && !SendDlgItemMessageW(dialog,IDC_CLIENT_NOTES_TEXT,EM_GETMODIFY,0,0)) return;
@@ -187,12 +204,42 @@ static void NotesRememberView(HWND dialog,ClientNotesDialogState &state) {
     state.pages[i].active=active;
   }
 }
+static uint64_t NotesProcessCreation(HANDLE process) {
+  FILETIME created{},exited{},kernel{},user{};
+  if(!GetProcessTimes(process,&created,&exited,&kernel,&user)) return 0;
+  return (static_cast<uint64_t>(created.dwHighDateTime)<<32)|created.dwLowDateTime;
+}
+static std::wstring NotesNewDraftName() {
+  GUID session{};wchar_t text[40]{};
+  const uint64_t created=NotesProcessCreation(GetCurrentProcess());
+  if(!created || FAILED(CoCreateGuid(&session)) || !StringFromGUID2(session,text,_countof(text))) return {};
+  return L"ctSpaces-notes-draft-"+std::to_wstring(GetCurrentProcessId())+L"-"+
+      std::to_wstring(created)+L"-"+text+L".ctn";
+}
+static bool NotesDraftOwner(const std::wstring &name,DWORD &pid,uint64_t &created) {
+  constexpr size_t prefix=21,suffix=4;
+  if(name.size()<=prefix+suffix || !name.starts_with(L"ctSpaces-notes-draft-") || !name.ends_with(L".ctn")) return false;
+  const auto owner=name.substr(prefix,name.size()-prefix-suffix);
+  const auto dash=owner.find(L'-');const auto pidText=owner.substr(0,dash);
+  if(pidText.empty() || !std::all_of(pidText.begin(),pidText.end(),[](wchar_t c){return c>=L'0' && c<=L'9';})) return false;
+  wchar_t *tail=nullptr;const auto value=wcstoull(pidText.c_str(),&tail,10);
+  if(!value || value>MAXDWORD || !tail || *tail) return false;
+  pid=static_cast<DWORD>(value);created=0;
+  if(dash==std::wstring::npos) return true; // Earlier versions used only a PID.
+  const auto next=owner.find(L'-',dash+1);if(next==std::wstring::npos) return false;
+  const auto time=owner.substr(dash+1,next-dash-1);
+  if(time.empty() || time.size()>20 || !std::all_of(time.begin(),time.end(),[](wchar_t c){return c>=L'0' && c<=L'9';})) return false;
+  errno=0;created=wcstoull(time.c_str(),&tail,10);if(!created || errno==ERANGE || !tail || *tail) return false;
+  GUID session{};return SUCCEEDED(CLSIDFromString(owner.substr(next+1).c_str(),&session));
+}
 static void NotesWriteRecovery(HWND dialog,ClientNotesDialogState &state) {
   if (state.loading || (!state.formattingChanged && !state.metadataChanged)) return;
+  client_notes::NotebookWriteRoot lease;
+  if(!lease.Acquire(state.clientRoot) || lease.lease.identity!=state.original.directory_identity) return;
   if (!RevalidateSafeClientContainerPath(state.clientName,state.clientRoot) || !CaptureNotesPage(dialog,state,false)) return;
   std::string bytes;
   if (client_notes::SerializeNotebook(state.pages,bytes))
-    client_notes::WriteAuxiliary(state.clientRoot,state.draftName,bytes);
+    client_notes::WriteAuxiliary(state.clientRoot,state.draftName,bytes,&state.draftIdentity);
 }
 static void NotesPreferAdjacentTab(ClientNotesDialogState &state) {
   state.preferredNextPage=0;
@@ -201,7 +248,7 @@ static void NotesPreferAdjacentTab(ClientNotesDialogState &state) {
   const auto neighbor=current!=state.visiblePages.begin() ? current-1 : current+1;
   if (neighbor!=state.visiblePages.end() && *neighbor<state.pages.size()) state.preferredNextPage=state.pages[*neighbor].id;
 }
-static void NotesSelectAvailable(HWND dialog,ClientNotesDialogState &state) {
+static bool NotesSelectAvailable(HWND dialog,ClientNotesDialogState &state) {
   if (!HasActiveNote(state)) {
     state.activePage=state.pages.size();
     for (size_t i=0;i<state.pages.size();++i) {
@@ -211,35 +258,60 @@ static void NotesSelectAvailable(HWND dialog,ClientNotesDialogState &state) {
     }
   }
   state.preferredNextPage=0;
-  RefreshNotesTabs(dialog,state); LoadNotesPage(dialog,state);
+  const bool loaded=LoadNotesPage(dialog,state);
+  RefreshNotesTabs(dialog,state);
+  if (!loaded) MessageBoxW(dialog,L"This note's editor could not be opened. Its saved content has been kept. Select the note again to retry.",L"Client Notes",MB_OK|MB_ICONWARNING);
+  return loaded;
 }
 static bool NotesOpenSavedPage(HWND dialog,ClientNotesDialogState &state,size_t index) {
   if (index>=state.pages.size() || state.pages[index].deleted || state.pages[index].archived ||
       state.baselines.size()!=state.pages.size() || !SaveClientNotesDraft(dialog,state,true)) return false;
   // Reopening is a new tab insertion. Keep an already-open tab in its current
   // position; closed notes append within the existing pinned/unpinned grouping.
-  if (!state.pages[index].open) {
+  const size_t previousIndex=index;
+  const bool wasOpen=state.pages[index].open,wasChanged=state.metadataChanged;
+  const uint64_t previousActive=state.attachedPageId,target=state.pages[index].id;
+  if (!wasOpen) {
     state.pages[index].open=true;
     if (!NotesRelocatePage(state,index,state.pages.size()-1)) return false;
     index=state.pages.size()-1;
   }
   state.activePage=index;state.metadataChanged=true;
-  NotesSelectAvailable(dialog,state);
+  if (!NotesSelectAvailable(dialog,state)) {
+    if (!wasOpen) {
+      const auto moved=std::find_if(state.pages.begin(),state.pages.end(),[&](const auto &p){return p.id==target;});
+      const size_t current=static_cast<size_t>(moved-state.pages.begin());
+      state.pages[current].open=false;NotesRelocatePage(state,current,previousIndex);
+    }
+    state.activePage=state.pages.size();
+    for (size_t i=0;i<state.pages.size();++i) if(state.pages[i].id==previousActive) {state.activePage=i;break;}
+    state.metadataChanged=wasChanged;RefreshNotesTabs(dialog,state);return false;
+  }
   return SaveClientNotesDraft(dialog,state,true);
 }
-static bool NotesAddPage(HWND dialog,ClientNotesDialogState &state,client_notes::NotePage page) {
+static bool NotesAddPage(HWND dialog,ClientNotesDialogState &state,client_notes::NotePage page,bool preserveMembership=false) {
   if (state.pages.size()>=client_notes::kMaxPages) {
     MessageBoxW(dialog,L"This notebook has 10,000 notes, including archived and deleted notes. Export or permanently remove unneeded deleted notes first.",L"Notes limit",MB_OK|MB_ICONINFORMATION); return false;
   }
   page.id=client_notes::NextId(state.pages); page.name=NotesUniqueName(state,page.name);
-  page.open=true; page.deleted=page.archived=page.pinned=false;
+  if(!preserveMembership) page.deleted=page.archived=false;
+  page.open=!page.deleted && !page.archived;page.pinned=false;
   page.created=page.modified=client_notes::Now(); page.cursor=page.scroll=0;
+  const uint64_t previousActive=state.attachedPageId;
+  const bool wasChanged=state.metadataChanged;
   state.pages.push_back(std::move(page)); state.baselines.emplace_back();
-  state.activePage=state.pages.size()-1; state.metadataChanged=true;
-  NotesSelectAvailable(dialog,state); return SaveClientNotesDraft(dialog,state,true);
+  if(state.pages.back().open) state.activePage=state.pages.size()-1;
+  state.metadataChanged=true;
+  if (!NotesSelectAvailable(dialog,state)) {
+    state.pages.pop_back();state.baselines.pop_back();state.activePage=state.pages.size();
+    for (size_t i=0;i<state.pages.size();++i) if(state.pages[i].id==previousActive) {state.activePage=i;break;}
+    state.metadataChanged=wasChanged;RefreshNotesTabs(dialog,state);return false;
+  }
+  return SaveClientNotesDraft(dialog,state,true);
 }
 static void NotesErasePage(HWND dialog,ClientNotesDialogState &state,size_t index) {
   const uint64_t id=state.pages[index].id;
+  state.detailsDrafts.erase(id);state.editorViews.erase(id);state.editorUse.erase(id);state.editorLinks.erase(id);
   auto edit=state.editors.find(id);
   if (edit!=state.editors.end()) {
     // The active editor remains visible until LoadNotesPage swaps in the next
@@ -272,20 +344,43 @@ static void NotesClosePage(HWND dialog,ClientNotesDialogState &state,size_t inde
     NotesErasePage(dialog,state,index); return;
   }
   page.open=false; page.active=false; state.closedPages.push_back(page.id); state.metadataChanged=true;
+  auto cached=state.editors.find(page.id);
+  if (cached!=state.editors.end()) {
+    if (cached->second!=state.attachedEditor) DestroyWindow(cached->second);
+    state.editors.erase(cached);
+  }
+  state.editorUse.erase(page.id);state.editorViews.erase(page.id);state.editorLinks.erase(page.id);
 }
-static void NotesRestoreText(HWND dialog,ClientNotesDialogState &state,const std::string &rtf) {
-  HWND edit=GetDlgItem(dialog,IDC_CLIENT_NOTES_TEXT);
-  CHARRANGE all{0,-1}; SendMessageW(edit,EM_EXSETSEL,0,reinterpret_cast<LPARAM>(&all));
-  NotesStream stream{rtf}; EDITSTREAM data{reinterpret_cast<DWORD_PTR>(&stream),0,NotesStreamIn};
-  SendMessageW(edit,EM_STOPGROUPTYPING,0,0);
-  SendMessageW(edit,EM_STREAMIN,SF_RTF|SFF_SELECTION,reinterpret_cast<LPARAM>(&data));
-  ApplyNotesTextColors(edit); MarkNotesChanged(dialog,state);
+static bool NotesRestoreText(HWND dialog,ClientNotesDialogState &state,const client_notes::Revision &revision) {
+  // A revision can alias the active page's history. Keep its source independent
+  // of any later page capture or revision bookkeeping.
+  const client_notes::Revision source=revision;
+  const auto result=NotesApplyNativeTransaction(dialog,state,CHARRANGE{0,-1},[&](HWND edit) {
+    CHARRANGE all{0,-1};SendMessageW(edit,EM_EXSETSEL,0,reinterpret_cast<LPARAM>(&all));
+    NotesStream stream{source.rtf};EDITSTREAM data{reinterpret_cast<DWORD_PTR>(&stream),0,NotesStreamIn};
+    SendMessageW(edit,EM_STREAMIN,SF_RTF|SFF_SELECTION,reinterpret_cast<LPARAM>(&data));
+    GETTEXTLENGTHEX measure{GTL_PRECISE|GTL_NUMCHARS,1200};
+    const CHARRANGE content{0,static_cast<LONG>(SendMessageW(edit,EM_GETTEXTLENGTHEX,reinterpret_cast<WPARAM>(&measure),0))};
+    LONG cookie=0;bool reset=false;NotesRangeLinkEffects(edit,content,nullptr,&cookie,true,&reset);
+    client_notes::NotePage bindings;bindings.id=state.attachedPageId;bindings.links=source.links;
+    bindings.linkRanges=source.linkRanges;bindings.linkRangesKnown=source.linkRangesKnown;
+    const bool ok=!data.dwError && stream.offset==stream.bytes.size() && reset && NotesRestoreMappedLinks(edit,state,bindings);
+    if(ok) ApplyNotesTextColors(edit);
+    return ok;
+  });
+  if(result!=NotesAppTransactionResult::Committed) {
+    NotesAppTransactionNotice(dialog,result,L"This version could not be restored completely. Your previous draft is still open.",L"Client Notes");return false;
+  }
+  MarkNotesChanged(dialog,state);
+  return true;
 }
 static std::wstring NotesLower(std::wstring text) {
   if (!text.empty()) CharLowerBuffW(text.data(),static_cast<DWORD>(text.size())); return text;
 }
 #include "NotesProductivityUi.inl"
 #include "NotesCodeUi.inl"
+#include "NotesEditingExtras.inl"
+#include "NotesSpellingUi.inl"
 struct NotesLibrary {
   HWND owner=nullptr;
   ClientNotesDialogState *state=nullptr;
@@ -294,10 +389,12 @@ struct NotesLibrary {
   size_t page=0;
   std::vector<size_t> results;
   std::map<uint64_t,std::wstring> plain;
+  HWND plainEditor=nullptr;
   bool selecting=false;
   bool navigating=false;
   std::vector<uint64_t> selected;
   int initialFilter=0;
+  uint64_t initialNote=0;
   bool allClients=false;
   ClientNotesDialogState *localState=nullptr;
   std::unique_ptr<ClientNotesDialogState> snapshot;
@@ -405,8 +502,10 @@ static void NotesLibraryPreview(HWND dialog,NotesLibrary &library) {
       SetDlgItemTextW(dialog,IDC_NOTES_ACTION_HINT,(std::to_wstring(selected.size())+L" selected. Click notes to tick them; Select notes offers Select all or Clear. Actions affect ticked notes only.").c_str());
     }
   }
-  EnableWindow(GetDlgItem(dialog,IDC_NOTES_ARCHIVE),!library.readOnly && !library.history && !page.archived && !page.deleted);
-  EnableWindow(GetDlgItem(dialog,IDC_NOTES_RESTORE),!library.readOnly && !library.history && (page.archived || page.deleted));
+  if (!library.selecting) {
+    EnableWindow(GetDlgItem(dialog,IDC_NOTES_ARCHIVE),!library.readOnly && !library.history && !page.archived && !page.deleted);
+    EnableWindow(GetDlgItem(dialog,IDC_NOTES_RESTORE),!library.readOnly && !library.history && (page.archived || page.deleted));
+  }
   if (library.allClients) {
     const auto &origin=library.origins[library.results[row]];
     SetDlgItemTextW(dialog,IDC_NOTES_INFO,(L"Client: "+origin.first+L"\r\n"+info).c_str());
@@ -472,7 +571,14 @@ static void NotesLibraryFill(HWND dialog,NotesLibrary &library) {
     if (!tag.empty() && std::none_of(page.tags.begin(),page.tags.end(),[&](const auto &t){return NotesLower(t).find(tag)!=std::wstring::npos;})) continue;
     if (!query.empty()) {
       auto [it,inserted]=library.plain.try_emplace(page.id);
-      if (inserted) it->second=NotesPlain(page);
+      if (inserted) {
+        // Keep the native RTF decoder for the lifetime of this library. A cold
+        // 10,000-note search must not create and destroy 10,000 native windows.
+        // This hidden child is destroyed automatically with its dialog.
+        if (!library.plainEditor) library.plainEditor=CreateWindowExW(0,L"RICHEDIT50W",L"",
+            WS_CHILD|ES_MULTILINE,0,0,0,0,dialog,nullptr,g_hInst,nullptr);
+        it->second=NotesPlain(page,library.plainEditor);
+      }
       const auto client=library.allClients ? library.origins[i].first+L" " : L"";
       if (NotesLower(client+page.name+L" "+page.ticket+L" "+NotesTagsText(page)+L" "+kNotesStatuses[page.status]+L" "+it->second).find(query)==std::wstring::npos) continue;
     }
@@ -493,7 +599,8 @@ static void NotesLibraryFill(HWND dialog,NotesLibrary &library) {
     SendDlgItemMessageW(dialog,IDC_NOTES_RESULTS,LB_ADDSTRING,0,reinterpret_cast<LPARAM>(title.c_str()));
   }}
   if (!library.results.empty()) {
-    const auto active=std::find(library.results.begin(),library.results.end(),library.state->activePage);
+    const auto active=library.initialNote ? std::find_if(library.results.begin(),library.results.end(),[&](size_t i){return library.state->pages[i].id==library.initialNote;}) :
+        std::find(library.results.begin(),library.results.end(),library.state->activePage);
     const auto row=!library.history && active!=library.results.end() ? active-library.results.begin() : 0;
     SendDlgItemMessageW(dialog,IDC_NOTES_RESULTS,LB_SETCURSEL,row,0);
   }
@@ -544,6 +651,11 @@ static void LayoutNotesLibrary(HWND dialog) {
   SelectObject(dc,old); ReleaseDC(dialog,dc); SendDlgItemMessageW(dialog,IDC_NOTES_RESULTS,LB_SETHORIZONTALEXTENT,extent,0);
   RECT text{}; GetClientRect(GetDlgItem(dialog,IDC_NOTES_PREVIEW),&text); InflateRect(&text,-px(10),-px(10));
   SendDlgItemMessageW(dialog,IDC_NOTES_PREVIEW,EM_SETRECT,0,reinterpret_cast<LPARAM>(&text));
+  // The parent owns the one-pixel outlines outside these native controls.
+  // Resizing a child does not invalidate its new outer outline within the
+  // previously visible parent area. Queue one complete parent erase after
+  // positioning; WS_CLIPCHILDREN keeps it off the editor and list surfaces.
+  InvalidateRect(dialog,nullptr,TRUE);
 }
 static INT_PTR CALLBACK NotesLibraryProc(HWND dialog,UINT message,WPARAM wParam,LPARAM lParam) {
   auto *lib=reinterpret_cast<NotesLibrary *>(GetWindowLongPtrW(dialog,DWLP_USER));
@@ -596,7 +708,10 @@ static INT_PTR CALLBACK NotesLibraryProc(HWND dialog,UINT message,WPARAM wParam,
     return TRUE;
   }
   if (message==WM_SIZE) { LayoutNotesLibrary(dialog); return TRUE; }
-  if ((message==WM_EXITSIZEMOVE || message==WM_DESTROY) && lib) {NotesRememberLibrary(dialog,*lib);return FALSE;}
+  if ((message==WM_EXITSIZEMOVE || message==WM_DESTROY) && lib) {
+    if (message==WM_DESTROY) lib->plainEditor=nullptr;
+    NotesRememberLibrary(dialog,*lib);return FALSE;
+  }
   if (message==WM_GETMINMAXINFO && lParam) {
     auto *limits=reinterpret_cast<MINMAXINFO *>(lParam);
     limits->ptMinTrackSize={ScaleByDpi(900,GetDpiForWindow(dialog)),ScaleByDpi(lib && !lib->history ? 600 : 480,GetDpiForWindow(dialog))}; return TRUE;
@@ -660,7 +775,7 @@ static INT_PTR CALLBACK NotesLibraryProc(HWND dialog,UINT message,WPARAM wParam,
     std::sort(indices.rbegin(),indices.rend());
     for (const auto i:indices) {auto &p=state.pages[i];
       if (id==IDC_NOTES_ARCHIVE && !p.deleted) {p.archived=true;p.open=false;}
-      else if (id==IDC_NOTES_RESTORE) {p.archived=p.deleted=false;p.open=false;}
+      else if (id==IDC_NOTES_RESTORE && (p.archived || p.deleted)) {p.archived=p.deleted=false;p.open=false;}
       else if (id==IDC_NOTES_DELETE) {if (p.deleted) NotesErasePage(lib->owner,state,i);else {p.deleted=true;p.open=false;}}
     }
     lib->selected.clear();state.metadataChanged=true;NotesSelectAvailable(lib->owner,state);SaveClientNotesDraft(lib->owner,state,true);NotesLibraryFill(dialog,*lib);return TRUE;
@@ -682,12 +797,14 @@ static INT_PTR CALLBACK NotesLibraryProc(HWND dialog,UINT message,WPARAM wParam,
   auto &state=*lib->state;
   if (lib->history) {
     if (id==IDOK || (id==IDC_NOTES_RESULTS && HIWORD(wParam)==LBN_DBLCLK)) {
-      const auto rtf=state.pages[lib->page].history[lib->results[row]].rtf;
-      const auto current=state.pages[lib->page].rtf;
-      state.pages[lib->page].rtf=rtf;
-      client_notes::RememberRevision(state.pages[lib->page],current,true);
-      state.pages[lib->page].rtf=current;
-      NotesRestoreText(lib->owner,state,rtf); SaveClientNotesDraft(lib->owner,state,true); EndDialog(dialog,IDOK);
+      const auto revision=state.pages[lib->page].history[lib->results[row]];
+      if(!SaveClientNotesDraft(lib->owner,state,true)) return TRUE;
+      const auto current=state.pages[lib->page];
+      if(!NotesRestoreText(lib->owner,state,revision)) return TRUE;
+      auto restored=current;restored.rtf=revision.rtf;restored.links=revision.links;restored.linkRanges=revision.linkRanges;restored.linkRangesKnown=revision.linkRangesKnown;
+      client_notes::RememberRevision(restored,current.rtf,true,&current.links,&current.linkRanges,current.linkRangesKnown);
+      state.pages[lib->page].history=std::move(restored.history);
+      if(SaveClientNotesDraft(lib->owner,state,true)) EndDialog(dialog,IDOK);
     }
     return TRUE;
   }
@@ -711,28 +828,13 @@ static INT_PTR CALLBACK NotesLibraryProc(HWND dialog,UINT message,WPARAM wParam,
   } else return FALSE;
   state.metadataChanged=true; NotesSelectAvailable(lib->owner,state); SaveClientNotesDraft(lib->owner,state,true); NotesLibraryFill(dialog,*lib); return TRUE;
 }
-static void NotesShowLibrary(HWND dialog,ClientNotesDialogState &state,bool history=false,int initialFilter=0) {
+static void NotesShowLibrary(HWND dialog,ClientNotesDialogState &state,bool history=false,int initialFilter=0,uint64_t initialNote=0) {
   if (!SaveClientNotesDraft(dialog,state,true) || (history && !HasActiveNote(state))) return;
-  NotesLibrary lib; lib.owner=dialog; lib.state=&state; lib.history=history; lib.page=state.activePage; lib.initialFilter=initialFilter;
+  NotesLibrary lib; lib.owner=dialog; lib.state=&state; lib.history=history; lib.page=state.activePage; lib.initialFilter=initialFilter;lib.initialNote=initialNote;
   DialogBoxParamW(g_hInst,MAKEINTRESOURCEW(IDD_NOTES_LIBRARY),dialog,NotesLibraryProc,reinterpret_cast<LPARAM>(&lib));
   if (!lib.openClient.empty()) NotesRequestClient(dialog,lib.openClient,lib.openNote);
 }
-static void NotesFind(HWND dialog,ClientNotesDialogState &state,bool previous) {
-  if (!HasActiveNote(state)) return;
-  state.findText=NotesWindowText(GetDlgItem(dialog,IDC_NOTES_FIND));
-  if (state.findText.empty()) { SetFocus(GetDlgItem(dialog,IDC_NOTES_FIND)); return; }
-  HWND edit=GetDlgItem(dialog,IDC_CLIENT_NOTES_TEXT); CHARRANGE range{}; NotesSelection(edit,range);
-  FINDTEXTEXW search{}; search.lpstrText=state.findText.data();
-  search.chrg={previous ? range.cpMin : range.cpMax,previous ? 0L : -1L};
-  LRESULT result=SendMessageW(edit,EM_FINDTEXTEXW,previous ? 0 : FR_DOWN,reinterpret_cast<LPARAM>(&search));
-  if (result<0) {
-    search.chrg={previous ? GetWindowTextLengthW(edit) : 0,previous ? 0L : -1L};
-    result=SendMessageW(edit,EM_FINDTEXTEXW,previous ? 0 : FR_DOWN,reinterpret_cast<LPARAM>(&search));
-  }
-  if (result>=0) {
-    SendMessageW(edit,EM_EXSETSEL,0,reinterpret_cast<LPARAM>(&search.chrgText)); SendMessageW(edit,EM_SCROLLCARET,0,0); SetFocus(edit);
-  } else MessageBoxW(dialog,L"No matching text in this note.",L"Find",MB_OK|MB_ICONINFORMATION);
-}
+#include "NotesFindUi.inl"
 static bool NotesPickFile(HWND dialog,bool save,std::wstring &path,bool notebook=false) {
   wchar_t buffer[32768]{}; if (save) wcscpy_s(buffer,notebook ? L"Client notes.ctn" : L"Note.rtf");
   OPENFILENAMEW file{sizeof(file)}; file.hwndOwner=dialog; file.lpstrFile=buffer; file.nMaxFile=static_cast<DWORD>(std::size(buffer));
@@ -746,31 +848,41 @@ static bool NotesWriteExport(const fs::path &path,const std::string &bytes) {
 }
 static bool NotesSameContent(const client_notes::NotePage &a,const client_notes::NotePage &b) {
   return a.name==b.name && a.rtf==b.rtf && a.text==b.text && a.ticket==b.ticket &&
-      a.ticketUrl==b.ticketUrl && a.links==b.links && a.status==b.status && a.tags==b.tags;
+      a.ticketUrl==b.ticketUrl && a.links==b.links && a.linkRanges==b.linkRanges && a.linkRangesKnown==b.linkRangesKnown && a.status==b.status && a.tags==b.tags;
 }
 static void NotesRecoverDrafts(HWND dialog,ClientNotesDialogState &state) {
+  client_notes::NotebookWriteRoot root;
+  if(!root.Acquire(state.clientRoot) || root.lease.identity!=state.original.directory_identity) return;
   std::error_code error;
   for (fs::directory_iterator it(state.clientRoot,error),end; !error && it!=end; it.increment(error)) {
     const auto name=it->path().filename().wstring();
     if (name.rfind(L"ctSpaces-notes-draft-",0)!=0 || it->path().extension()!=L".ctn" || name==state.draftName) continue;
-    const auto pidText=name.substr(21,name.size()-25);
-    wchar_t *tail=nullptr; const DWORD pid=wcstoul(pidText.c_str(),&tail,10);
-    if (pidText.empty() || !pid || !tail || *tail) continue;
-    HANDLE process=OpenProcess(SYNCHRONIZE,FALSE,pid);
-    if (process) { const bool running=WaitForSingleObject(process,0)==WAIT_TIMEOUT; CloseHandle(process); if (running) continue; }
+    DWORD pid=0;uint64_t created=0;if(!NotesDraftOwner(name,pid,created)) continue;
+    HANDLE process=OpenProcess(SYNCHRONIZE|PROCESS_QUERY_LIMITED_INFORMATION,FALSE,pid);
+    if (process) {
+      const DWORD waited=WaitForSingleObject(process,0);
+      const uint64_t current=waited==WAIT_TIMEOUT ? NotesProcessCreation(process) : 0;
+      CloseHandle(process);
+      if(waited==WAIT_FAILED || (waited==WAIT_TIMEOUT && !current)) continue;
+      // A PID may have been reused. The new format identifies the actual
+      // process lifetime; a legacy file bearing our PID cannot be our new,
+      // unique session file and is safe to offer without overwriting it.
+      if(waited==WAIT_TIMEOUT && (created ? created==current : pid!=GetCurrentProcessId())) continue;
+    }
     else if (GetLastError()!=ERROR_INVALID_PARAMETER) continue;
+    client_notes::AuxiliaryFileLease draft;if(!draft.Acquire(it->path())) continue;
     const auto snapshot=client_notes::ReadFileSnapshot(state.clientRoot,name.c_str(),client_notes::kMaxNotebookBytes);
     std::vector<client_notes::NotePage> drafts;
     if (snapshot.status!=client_notes::ReadStatus::Ok || !client_notes::ParseNotebook(snapshot.bytes,drafts)) continue;
-    if (MessageBoxW(dialog,L"A recoverable draft from an earlier session was found. Recover changed notes as separate copies? Existing saved notes will be kept.",L"Recover notes",MB_YESNO|MB_ICONQUESTION)!=IDYES) continue;
+    if (MessageBoxW(dialog,L"A recoverable draft from an earlier session was found. Recover changed notes as separate copies? Archived and deleted copies stay in Archive or Trash. Existing saved notes will be kept.",L"Recover notes",MB_YESNO|MB_ICONQUESTION)!=IDYES) continue;
     bool recovered=true;
     for (auto page : drafts) {
-      const bool changed=std::none_of(state.pages.begin(),state.pages.end(),[&](const auto &saved){return page.id==saved.id && NotesSameContent(page,saved);});
-      if (!changed || page.deleted) continue;
+      const bool changed=std::none_of(state.pages.begin(),state.pages.end(),[&](const auto &saved){return page.id==saved.id && NotesSameContent(page,saved) && page.deleted==saved.deleted && page.archived==saved.archived;});
+      if (!changed) continue;
       page.name+=L" recovered"; page.history.clear(); page.pristine=false;
-      if (!NotesAddPage(dialog,state,std::move(page))) { recovered=false; break; }
+      if (!NotesAddPage(dialog,state,std::move(page),true)) { recovered=false; break; }
     }
-    if (recovered) DeleteFileW(it->path().c_str());
+    if (recovered) draft.Remove();
   }
 }
 static std::vector<client_notes::NotePage> NotesBuiltinTemplates() {
@@ -802,6 +914,7 @@ struct NotesTemplates {
   bool loading=false,dirty=false;
   bool startFromNote=false;
   bool editorValid=true;
+  ClientNotesDialogState::LinkRegistry linkRegistry;
 };
 static bool NotesLoadTemplates(NotesTemplates &templates) {
   templates.root=g_sDataDir/(templates.snippets ? L"NotesSnippets" : L"NotesTemplates");
@@ -821,9 +934,14 @@ static bool NotesLoadTemplates(NotesTemplates &templates) {
 }
 static bool NotesSaveTemplates(HWND dialog,NotesTemplates &templates,const std::vector<client_notes::NotePage> &pages) {
   if (!client_notes::WriteNotebook(templates.root,pages,templates.original,[&]{return client_notes::SafeDirectory(g_sDataDir) && client_notes::SafeDirectory(templates.root);})) {
-    MessageBoxW(dialog,L"The reusable library could not be saved, or another window changed it. Close and reopen it before trying again. Existing entries were kept.",templates.snippets ? L"Snippets" : L"Templates",MB_OK|MB_ICONWARNING); return false;
+    MessageBoxW(dialog,client_notes::PersistenceFailure(L"The reusable library could not be saved, or another window changed it. Close and reopen it before trying again. Existing entries were kept.").c_str(),templates.snippets ? L"Snippets" : L"Templates",MB_OK|MB_ICONWARNING); return false;
   }
-  templates.original=client_notes::ReadNotebook(templates.root); templates.pages=pages; return true;
+#ifdef CTSPACES_NOTES_TEST_HOOKS
+  CtSpacesNotesTestAfterCommit(templates.root.c_str());
+#endif
+  templates.pages=pages;templates.original.status=client_notes::ReadStatus::Ok;
+  templates.original.pages=pages;templates.original.notebook_snapshot.status=client_notes::ReadStatus::Ok;
+  client_notes::SerializeNotebook(pages,templates.original.notebook_snapshot.bytes);return true;
 }
 static bool NotesTemplateDetails(HWND dialog,const std::vector<client_notes::NotePage> &pages,size_t exclude,client_notes::NotePage &page,bool snippet=false) {
   NotesInput input{snippet ? L"Snippet details" : L"Template details",snippet ? L"Snippet name (up to 64 characters)" : L"Template name (up to 64 characters)",L"Hint (up to 128 characters)",page.name,page.ticket};
@@ -849,27 +967,95 @@ static client_notes::NotePage NotesSnippetFromSelection(HWND owner,const client_
     NotesStream stream;EDITSTREAM data{reinterpret_cast<DWORD_PTR>(&stream),0,NotesStreamOut};
     SendMessageW(edit,EM_STREAMOUT,SF_RTF|SFF_SELECTION,reinterpret_cast<LPARAM>(&data));
     if (!data.dwError && !stream.overflow && client_notes::NormalizeEditorExport(stream.bytes)) {
-      page.rtf=stream.bytes;page.rich=true;page.text.clear();page.links.clear();const auto text=NotesPlain(page);
-      for (const auto &link:source.links) if (!link.first.empty() && text.find(link.first)!=std::wstring::npos) page.links.push_back(link);
+      page.rtf=stream.bytes;page.rich=true;page.text.clear();
+      const uint64_t id=page.id;page.id=source.id;
+      auto *workspace=reinterpret_cast<ClientNotesDialogState *>(GetWindowLongPtrW(owner,DWLP_USER));
+      if(!workspace || !NotesCaptureLinkMappings(edit,*workspace,page,&range)) page.rtf.clear();
+      page.id=id;
     } else page.rtf.clear();
   }
   return page;
 }
+struct NotesLinkPiece {LONG first,last;std::wstring label,url;};
+static bool NotesReplacementLinksFit(HWND edit,const client_notes::NotePage &page,const CHARRANGE &selected,LONG insertedLength,
+    const std::vector<NotesLinkPiece> &inserted) {
+  if(!page.links.empty() && !page.linkRangesKnown) return false;
+  if(!client_notes::ValidLinkRanges(page.linkRanges,page.linkRangesKnown,page.links.size())) return false;
+  const LONG first=selected.cpMin,last=selected.cpMax,delta=insertedLength-(last-first);
+  std::vector<NotesLinkPiece> pieces;pieces.reserve(page.linkRanges.size()+inserted.size()+2);
+  for(const auto &range:page.linkRanges) {
+    const LONG begin=static_cast<LONG>(range.first),end=static_cast<LONG>(range.last);const auto &url=page.links[range.target].second;
+    const auto keep=[&](LONG from,LONG to,LONG offset) {if(from<to) pieces.push_back({from+offset,to+offset,NotesRangeText(edit,from,to),url});};
+    if(end<=first) keep(begin,end,0);
+    else if(begin>=last) keep(begin,end,delta);
+    else {keep(begin,(std::min)(end,first),0);keep((std::max)(begin,last),end,delta);}
+  }
+  for(const auto &piece:inserted) if(piece.first<piece.last) pieces.push_back({first+piece.first,first+piece.last,piece.label,piece.url});
+  std::sort(pieces.begin(),pieces.end(),[](const auto &a,const auto &b){return a.first<b.first;});
+  std::vector<NotesLinkPiece> joined;
+  for(auto &piece:pieces) {
+    if(!joined.empty() && joined.back().last==piece.first && joined.back().url==piece.url) {joined.back().last=piece.last;joined.back().label+=piece.label;}
+    else joined.push_back(std::move(piece));
+  }
+  std::set<std::pair<std::wstring,std::wstring>> targets;
+  for(const auto &piece:joined) {
+    std::string valid;
+    if(piece.label.size()>2048 || !client_notes::EncodeUtf8(piece.label,valid)) return false;
+    targets.emplace(piece.label,piece.url);
+  }
+  return targets.size()<=256 && joined.size()<=client_notes::kMaxLinkRanges;
+}
+static LONG NotesReplacementStoryLength(HWND owner,const client_notes::NotePage &page,std::vector<NotesLinkPiece> &pieces) {
+  HWND decoder=CreateWindowExW(0,L"RICHEDIT50W",L"",WS_CHILD|ES_MULTILINE,0,0,1,1,owner,nullptr,g_hInst,nullptr);
+  if(!decoder) return -1;
+  SendMessageW(decoder,EM_EXLIMITTEXT,0,client_notes::kMaxRichBytes);
+  NotesStream stream{page.rtf};EDITSTREAM source{reinterpret_cast<DWORD_PTR>(&stream),0,NotesStreamIn};
+  SendMessageW(decoder,EM_STREAMIN,SF_RTF,reinterpret_cast<LPARAM>(&source));
+  IUnknown *ole=nullptr;ITextDocument *document=nullptr;ITextRange *range=nullptr;LONG length=-1;
+  if(!source.dwError && stream.offset==stream.bytes.size()) {
+    SendMessageW(decoder,EM_GETOLEINTERFACE,0,reinterpret_cast<LPARAM>(&ole));
+    if(ole){ole->QueryInterface(__uuidof(ITextDocument),reinterpret_cast<void **>(&document));ole->Release();}
+    LONG story=0;
+    if(document && SUCCEEDED(document->Range(0,0,&range)) && SUCCEEDED(range->GetStoryLength(&story))) {
+      // Derive prospective occurrences with the same native reader as insertion,
+      // including safely resolvable legacy snippets, without touching its Undo.
+      ClientNotesDialogState bindings;bindings.attachedEditor=decoder;bindings.attachedPageId=1;
+      auto decoded=page;decoded.id=1;
+      if(NotesRestoreMappedLinks(decoder,bindings,decoded) && NotesCaptureLinkMappings(decoder,bindings,decoded)) {
+        length=(std::max)(0L,story-1);
+        for(const auto &occurrence:decoded.linkRanges) pieces.push_back({static_cast<LONG>(occurrence.first),static_cast<LONG>(occurrence.last),decoded.links[occurrence.target].first,decoded.links[occurrence.target].second});
+      }
+    }
+  }
+  if(range) range->Release();if(document) document->Release();DestroyWindow(decoder);return length;
+}
 static bool NotesInsertSnippet(HWND dialog,NotesTemplates &library,const client_notes::NotePage &page) {
   auto &workspace=*library.workspace;if (!HasActiveNote(workspace)) return false;
+  if(!CaptureNotesPage(library.owner,workspace,true)) return false;
   auto &current=workspace.pages[workspace.activePage];
-  for (const auto &link:page.links) if (std::any_of(current.links.begin(),current.links.end(),[&](const auto &prior){return prior.first==link.first && prior.second!=link.second;})) {
-    MessageBoxW(dialog,L"This note already uses the same link label with a different address. Rename that link label before inserting the snippet so its destination stays clear.",L"Snippet link conflict",MB_OK|MB_ICONINFORMATION);return false;
-  }
   NotesStream stream{page.rtf};EDITSTREAM data{reinterpret_cast<DWORD_PTR>(&stream),0,NotesStreamIn};
-  HWND edit=GetDlgItem(library.owner,IDC_CLIENT_NOTES_TEXT);SendMessageW(edit,EM_STOPGROUPTYPING,0,0);
-  SendMessageW(edit,EM_STREAMIN,SF_RTF|SFF_SELECTION,reinterpret_cast<LPARAM>(&data));
-  if (data.dwError) {MessageBoxW(dialog,L"The snippet could not be inserted completely. Use Undo to restore the selection before trying again.",L"Insert snippet",MB_OK|MB_ICONWARNING);return false;}
-  for (const auto &link:page.links) if (std::none_of(current.links.begin(),current.links.end(),[&](const auto &prior){return prior.first==link.first;})) current.links.push_back(link);
-  workspace.metadataChanged=true;ApplyNotesTextColors(edit);MarkNotesChanged(library.owner,workspace);
+  HWND edit=GetDlgItem(library.owner,IDC_CLIENT_NOTES_TEXT);CHARRANGE selected{};NotesSelection(edit,selected);
+  std::vector<NotesLinkPiece> pieces;const LONG length=NotesReplacementStoryLength(library.owner,page,pieces);
+  if(length<0 || !NotesReplacementLinksFit(edit,current,selected,length,pieces)) {MessageBoxW(dialog,L"The snippet's links cannot be inserted safely, or this replacement would exceed 256 link targets, 16,384 linked ranges or 2,048 characters per label. Your existing text and links are kept.",L"Snippet links",MB_OK|MB_ICONWARNING);return false;}
+  GETTEXTLENGTHEX measure{GTL_PRECISE|GTL_NUMCHARS,1200};const LONG before=static_cast<LONG>(SendMessageW(edit,EM_GETTEXTLENGTHEX,reinterpret_cast<WPARAM>(&measure),0));
+  const auto result=NotesApplyNativeTransaction(library.owner,workspace,selected,[&](HWND target) {
+    SendMessageW(target,EM_STREAMIN,SF_RTF|SFF_SELECTION,reinterpret_cast<LPARAM>(&data));
+    const LONG after=static_cast<LONG>(SendMessageW(target,EM_GETTEXTLENGTHEX,reinterpret_cast<WPARAM>(&measure),0));
+    const CHARRANGE inserted{selected.cpMin,selected.cpMin+after-before+(selected.cpMax-selected.cpMin)};
+    client_notes::NotePage bindings;bindings.id=current.id;bindings.links=page.links;
+    bindings.linkRanges=page.linkRanges;bindings.linkRangesKnown=page.linkRangesKnown;
+    const bool ok=!data.dwError && stream.offset==stream.bytes.size() && NotesRestoreMappedLinks(target,workspace,bindings,&inserted);
+    if(ok) ApplyNotesTextColors(target);
+    return ok;
+  });
+  if(result!=NotesAppTransactionResult::Committed) {
+    NotesAppTransactionNotice(dialog,result,L"The snippet could not be inserted safely. Your previous text is kept.",L"Insert snippet");return false;
+  }
+  workspace.metadataChanged=true;MarkNotesChanged(library.owner,workspace);
   return SaveClientNotesDraft(library.owner,workspace,true);
 }
 #include "NotesTemplatesUi.inl"
+#include "NotesMarkdownUi.inl"
 
 static void NotesTemplatePreview(HWND dialog,NotesTemplates &templates) {
   const LRESULT row=SendDlgItemMessageW(dialog,IDC_NOTES_RESULTS,LB_GETCURSEL,0,0);
@@ -950,17 +1136,7 @@ static INT_PTR CALLBACK NotesTemplatesProc(HWND dialog,UINT message,WPARAM wPara
   if (id==IDOK || (id==IDC_NOTES_RESULTS && HIWORD(wParam)==LBN_DBLCLK)) {
     auto page=NotesTemplateFromPage(templates->pages[row]);
     if (templates->snippets) {
-      auto &workspace=*templates->workspace;if (!HasActiveNote(workspace)) return TRUE;
-      auto &current=workspace.pages[workspace.activePage];
-      for (const auto &link:page.links) if (std::any_of(current.links.begin(),current.links.end(),[&](const auto &prior){return prior.first==link.first && prior.second!=link.second;})) {
-        MessageBoxW(dialog,L"This note already uses the same link label with a different address. Rename that link label before inserting the snippet so its destination stays clear.",L"Snippet link conflict",MB_OK|MB_ICONINFORMATION);return TRUE;
-      }
-      NotesStream stream{page.rtf};EDITSTREAM data{reinterpret_cast<DWORD_PTR>(&stream),0,NotesStreamIn};
-      HWND edit=GetDlgItem(templates->owner,IDC_CLIENT_NOTES_TEXT);SendMessageW(edit,EM_STOPGROUPTYPING,0,0);
-      SendMessageW(edit,EM_STREAMIN,SF_RTF|SFF_SELECTION,reinterpret_cast<LPARAM>(&data));
-      if (data.dwError) {MessageBoxW(dialog,L"The snippet could not be inserted completely. Use Undo to restore the selection before trying again.",L"Insert snippet",MB_OK|MB_ICONWARNING);return TRUE;}
-      for (const auto &link:page.links) if (std::none_of(current.links.begin(),current.links.end(),[&](const auto &prior){return prior.first==link.first;})) current.links.push_back(link);
-      workspace.metadataChanged=true;ApplyNotesTextColors(edit);MarkNotesChanged(templates->owner,workspace);SaveClientNotesDraft(templates->owner,workspace,true);EndDialog(dialog,IDOK);return TRUE;
+      if(NotesInsertSnippet(dialog,*templates,page)) EndDialog(dialog,IDOK);return TRUE;
     }
     if (NotesAddPage(templates->owner,*templates->workspace,std::move(page))) EndDialog(dialog,IDOK); return TRUE;
   }
@@ -990,12 +1166,12 @@ static constexpr std::array<NotesTourStep,14> kNotesTourSteps{{
    L"2. Click + (or Ctrl+T). An Untitled note opens immediately; you do not need to name it first. Type your notes.\r\n\r\n"
    L"3. Pause briefly to let autosave run. Switching tabs or closing the notes window also saves pending edits. There is no Save button.\r\n\r\n"
    L"Notes belong to this client and are stored locally. The window follows your app theme and remembers its size. This walkthrough only shows examples; it does not edit your notes.",
-   L"The notes workspace: tabs above the formatting toolbar, with the document below.",IDR_NOTES_TOUR_WORKSPACE},
+   L"The notes workspace: client-owned tabs, everyday actions and a full-width document.",IDR_NOTES_TOUR_WORKSPACE},
   {L"Format text, highlights and checklists",
-   L"1. Select text, then choose a heading, font size, Bold, Italic or Underline in the toolbar.\r\n\r\n"
+   L"1. Select text to show formatting beside it, or click Format at your typing position. Choose a heading, font size, Bold, Italic or Underline. Escape, clicking outside or scrolling closes the palette. Ctrl+B, Ctrl+I and Ctrl+U also work while it is hidden.\r\n\r\n"
    L"2. Use the highlighter's arrow to choose a color. The marker button applies or removes that color.\r\n\r\n"
    L"3. Choose the checklist button to create tasks. Click a box to mark an item done; its text is struck through. Enter adds the next item; Enter on an empty item ends the list.\r\n\r\n"
-   L"4. Select words and choose Link to give them a label and web address. All note links open in your PC's default browser, outside client profiles. Right-click for Cut, Copy, Paste and Undo/Redo; pasting inserts plain text.\r\n\r\n"
+   L"4. Select words and choose Link to give them a label and web address. More > Link browser chooses the regular PC browser for every note and ticket link, outside client profiles. Right-click for Cut, Copy, Paste and Undo/Redo; pasting inserts plain text.\r\n\r\n"
    L"5. Choose Code in the style dropdown to open a language picker. Paste or type source, then Insert code block. The bordered box keeps its language label and monospace code. Code is stored as text and never run.",
    L"Example formatting: headings, completed checklist items and a yellow highlight.",IDR_NOTES_TOUR_WORKSPACE},
   {L"Name, organize and close tabs",
@@ -1013,8 +1189,8 @@ static constexpr std::array<NotesTourStep,14> kNotesTourSteps{{
   {L"Link a note to a ticket (optional)",
    L"1. Open a note, then Details. Add the optional ticket number and URL. Changes save automatically; click outside the panel to close it.\r\n\r\n"
    L"2. Enter a ticket number if useful, for example 44553. Click OK. All notes shows [Ticket 44553] beside its title and Ticket: 44553 above the preview. You can search for the number.\r\n\r\n"
-   L"3. Add an HTTP/HTTPS ticket URL to enable Open ticket link in All notes and More. It opens in your default browser and regular sign-in, separate from client profiles.\r\n\r\n"
-   L"4. Use Status on the top action row to set this note's work status and tags. The button shows Investigating, Waiting, Follow-up or Resolved. This is local organization and does not update the ticketing system.\r\n\r\n"
+   L"3. Add an HTTP/HTTPS ticket URL to enable Open ticket link in All notes and More. More > Link browser chooses System default or a specific installed browser. Links use its regular sign-in, separate from client profiles. The choice applies to all client notebooks.\r\n\r\n"
+   L"4. Use Details to set this note's work status and tags. A small icon and label beside Details show Investigating, Waiting, Follow-up or Resolved. No status hides the indicator. This is local organization and does not update the ticketing system.\r\n\r\n"
    L"These fields are labels and links you provide. They do not fetch the ticket, import its messages or synchronize with a ticketing system. Leave them blank if you do not need them.",
    L"Ticket details explains the optional number and URL. The example uses ticket 44553.",IDR_NOTES_TOUR_TICKET},
   {L"Use or customize a reusable template",
@@ -1052,7 +1228,7 @@ static constexpr std::array<NotesTourStep,14> kNotesTourSteps{{
    L"1. Select a client in the launcher and choose Settings > Quick note, or right-click a pinned client > Quick note.\r\n\r\n"
    L"2. Write immediately. The title is optional; this saves a closed note in the client's notebook. Pause for autosave or close to flush it. An untouched capture creates no empty note.\r\n\r\n"
    L"3. In the full editor, click More or press Ctrl+K. Type a feature name, such as snippet, status, work log or export. Read its hint, then click the action or press Enter. Click outside to close the panel.\r\n\r\n"
-   L"All formatting and window commands opens the complete menu. Quick capture is plain text; open the saved note in All notes when you need formatting.",
+   L"Search More for Word wrap, Go to line (Ctrl+G), Document information, Check spelling (F7), Print or save as PDF (Ctrl+P), Markdown import/export and Insert table. These tools appear only when needed. All formatting and window commands opens the complete menu. Quick capture is plain text; open the saved note in All notes when you need formatting.",
    L"More lets you find commands by name and read what they do.",IDR_NOTES_TOUR_ACTIONS},
   {L"Set status, tags and sort your notes",
    L"1. In a note, choose More > Status and tags. Pick No status, Investigating, Waiting on client, Follow-up needed or Resolved.\r\n\r\n"
@@ -1196,12 +1372,41 @@ static INT_PTR CALLBACK NotesHelpProc(HWND dialog,UINT message,WPARAM wParam,LPA
   return FALSE;
 }
 #include "NotesInspectorUi.inl"
+static std::wstring NotesInvalidDetailsSummary(const ClientNotesDialogState &state) {
+  std::wstring text;size_t count=0;
+  for (const auto &[id,draft]:state.detailsDrafts) {
+    const auto page=std::find_if(state.pages.begin(),state.pages.end(),[&](const auto &p){return p.id==id;});
+    if (page==state.pages.end()) continue;
+    if (++count>8) continue;
+    text+=L"\n\""+page->name+L"\" ("+state.clientName+L"; "+
+        (page->deleted ? L"Trash" : page->archived ? L"Archived" : page->open ? L"open tab" : L"saved, tab closed")+L")";
+  }
+  if(count>8) text+=L"\nAnd "+std::to_wstring(count-8)+L" other notes.";
+  return text+L"\n";
+}
+static void NotesReviewInvalidDetails(HWND dialog,ClientNotesDialogState &state) {
+  for (const auto &[id,draft]:state.detailsDrafts) {
+    const auto page=std::find_if(state.pages.begin(),state.pages.end(),[&](const auto &p){return p.id==id;});
+    if (page==state.pages.end()) continue;
+    if (page->archived || page->deleted) {
+      NotesShowLibrary(dialog,state,false,page->deleted ? 3 : 2,id);
+    } else {
+      const size_t index=static_cast<size_t>(page-state.pages.begin());
+      if (NotesOpenSavedPage(dialog,state,index)) NotesShowPanel(dialog,&state,true);
+    }
+    return;
+  }
+}
 static bool NotesWorkspaceCommand(HWND dialog,ClientNotesDialogState &state,UINT command) {
+  if (command==IDC_NOTES_LINK_BROWSER) {NotesChooseLinkBrowser(dialog);return true;}
   if (command==IDC_NOTES_SWITCH_CLIENT) { NotesShowPanel(dialog,&state,false);return true; }
-  if ((command==IDC_NOTES_DETAILS || command==IDC_NOTES_OPEN_TICKET) && HasActiveNote(state)) {
-    if (command==IDC_NOTES_OPEN_TICKET && ValidNotesUrl(state.pages[state.activePage].ticketUrl))
+  if (command==IDC_NOTES_OPEN_TICKET) {
+    if (HasActiveNote(state) && ValidNotesUrl(state.pages[state.activePage].ticketUrl))
       OpenNotesUrl(dialog,state,state.pages[state.activePage].ticketUrl,true);
-    else if (SaveClientNotesDraft(dialog,state,true)) NotesShowPanel(dialog,&state,true);
+    return true;
+  }
+  if (command==IDC_NOTES_DETAILS && HasActiveNote(state)) {
+    if (SaveClientNotesDraft(dialog,state,true)) NotesShowPanel(dialog,&state,true);
     return true;
   }
   if (command==IDC_NOTES_HELP) {
@@ -1213,6 +1418,24 @@ static bool NotesWorkspaceCommand(HWND dialog,ClientNotesDialogState &state,UINT
   if (command==IDC_NOTES_WALKTHROUGH) { NotesTourState tour; DialogBoxParamW(g_hInst,MAKEINTRESOURCEW(IDD_NOTES_WALKTHROUGH),dialog,NotesTourProc,reinterpret_cast<LPARAM>(&tour)); return true; }
   HWND edit=GetDlgItem(dialog,IDC_CLIENT_NOTES_TEXT);
   const bool active=HasActiveNote(state);
+  if (NotesFindCommand(dialog,state,command)) return true;
+  if (command==IDC_NOTES_MARKDOWN_IMPORT) { NotesImportMarkdown(dialog,state); return true; }
+  if (command==IDC_NOTES_WORD_WRAP && active) {
+    const bool wrap=!state.wordWrap;
+    if (SaveConfigMutations(L"notes word wrapping",{{L"notes_editor",std::wstring(L"word_wrap"),wrap?L"1":L"0"}},true)) {
+      state.wordWrap=wrap;
+      for(const auto &[id,editor]:state.editors) { (void)id; NotesApplyWordWrap(editor,wrap); }
+    }
+    return true;
+  }
+  if (command==IDC_NOTES_GO_TO_LINE && active) { NotesGoToLine(dialog,state); return true; }
+  if (command==IDC_NOTES_STATISTICS && active) {
+    MessageBoxW(dialog,(NotesStatisticsText(edit)+L"\r\n\r\nWords are separated by whitespace. Characters count Unicode symbols; CRLF counts as one line break.").c_str(),L"Document information",MB_OK|MB_ICONINFORMATION);return true;
+  }
+  if (command==IDC_NOTES_PRINT && active) { NotesPrint(dialog,state); return true; }
+  if (command==IDC_NOTES_SPELLING && active) { NotesCheckSpelling(dialog,state); return true; }
+  if (command==IDC_NOTES_MARKDOWN_EXPORT && active) { NotesExportMarkdown(dialog,state); return true; }
+  if (command==IDC_NOTES_TABLE && active) { NotesCreateSimpleTable(dialog,state); return true; }
   if (command==IDC_NOTES_LIBRARY) { NotesShowLibrary(dialog,state); return true; }
   if (command==IDC_NOTES_TRASH) { NotesShowLibrary(dialog,state,false,3); return true; }
   if (command==IDC_NOTES_MORE || command==IDC_NOTES_ACTIONS) {
@@ -1228,7 +1451,7 @@ static bool NotesWorkspaceCommand(HWND dialog,ClientNotesDialogState &state,UINT
     if (ole) {ole->QueryInterface(__uuidof(ITextDocument),reinterpret_cast<void **>(&document));ole->Release();}
     SendMessageW(edit,EM_STOPGROUPTYPING,0,0);if (document) document->BeginEditCollection();
     CHARRANGE end{-1,-1};SendMessageW(edit,EM_EXSETSEL,0,reinterpret_cast<LPARAM>(&end));SendMessageW(edit,EM_REPLACESEL,TRUE,reinterpret_cast<LPARAM>(L"\r\n\r\n"));
-    CHARFORMAT2W normal{sizeof(normal)};normal.dwMask=CFM_BOLD|CFM_ITALIC|CFM_UNDERLINE|CFM_STRIKEOUT|CFM_LINK|CFM_COLOR|CFM_BACKCOLOR|CFM_SIZE|CFM_FACE;
+    CHARFORMAT2W normal{sizeof(normal)};normal.dwMask=CFM_BOLD|CFM_ITALIC|CFM_UNDERLINE|CFM_STRIKEOUT|CFM_LINK|CFM_LINKPROTECTED|CFM_COLOR|CFM_BACKCOLOR|CFM_SIZE|CFM_FACE;
     normal.dwEffects=CFE_AUTOBACKCOLOR;normal.crTextColor=g_themeColors.crControlText;normal.yHeight=240;wcscpy_s(normal.szFaceName,L"Segoe UI");
     SendMessageW(edit,EM_SETCHARFORMAT,SCF_SELECTION,reinterpret_cast<LPARAM>(&normal));
     PARAFORMAT2 paragraph{sizeof(paragraph)};paragraph.dwMask=PFM_NUMBERING|PFM_STARTINDENT|PFM_OFFSET|PFM_SPACEBEFORE|PFM_SPACEAFTER|PFM_LINESPACING;
@@ -1244,8 +1467,22 @@ static bool NotesWorkspaceCommand(HWND dialog,ClientNotesDialogState &state,UINT
     };
     add(IDC_NOTES_FIND_TOGGLE,L"Find in note\tCtrl+F");
     add(IDC_NOTES_REPLACE,L"Find and replace\tCtrl+H");
+    HMENU editing=CreatePopupMenu();
+    const UINT availability=active?0:MF_GRAYED;
+    AppendMenuW(editing,MF_STRING|availability|(state.wordWrap?MF_CHECKED:0),IDC_NOTES_WORD_WRAP,L"Word wrap");
+    AppendMenuW(editing,MF_STRING|availability,IDC_NOTES_GO_TO_LINE,L"Go to line...\tCtrl+G");
+    AppendMenuW(editing,MF_STRING|availability,IDC_NOTES_STATISTICS,L"Document information...");
+    AppendMenuW(editing,MF_STRING|availability,IDC_NOTES_SPELLING,L"Check spelling...\tF7");
+    AppendMenuW(editing,MF_STRING|availability,IDC_NOTES_PRINT,L"Print / PDF...\tCtrl+P");
+    AppendMenuW(editing,MF_SEPARATOR,0,nullptr);
+    AppendMenuW(editing,MF_STRING,IDC_NOTES_MARKDOWN_IMPORT,L"Import Markdown...");
+    AppendMenuW(editing,MF_STRING|availability,IDC_NOTES_MARKDOWN_EXPORT,L"Export Markdown...");
+    AppendMenuW(editing,MF_STRING|availability,IDC_NOTES_TABLE,L"Insert table...");
+    AppendMenuW(menu,MF_POPUP,reinterpret_cast<UINT_PTR>(editing),L"Editing tools");
     add(IDC_NOTES_DUPLICATE,L"Duplicate note"); add(IDC_NOTES_HISTORY,L"Version history");
     add(IDC_NOTES_TICKET,L"Ticket details (optional)..."); add(IDC_NOTES_OPEN_TICKET,L"Open ticket link");
+    const std::wstring linkBrowserLabel=L"Link browser: "+NotesLinkBrowserLabel()+L"...";
+    add(IDC_NOTES_LINK_BROWSER,linkBrowserLabel.c_str(),false);
     AppendMenuW(menu,MF_SEPARATOR,0,nullptr);
     add(IDC_NOTES_STRIKE,L"Strikethrough"); add(IDC_NOTES_CODE,L"Insert labeled code block..."); add(IDC_NOTES_DATE,L"Insert date and time");
     add(IDC_NOTES_LINK_REMOVE,L"Remove selected link"); add(IDC_NOTES_LINK_COPY,L"Copy selected link address");
@@ -1267,13 +1504,6 @@ static bool NotesWorkspaceCommand(HWND dialog,ClientNotesDialogState &state,UINT
     RECT anchor{}; GetWindowRect(GetDlgItem(dialog,IDC_NOTES_MORE),&anchor);
     const UINT selected=TrackThemedNotesMenu(menu,TPM_RETURNCMD|TPM_NONOTIFY|TPM_RIGHTALIGN,anchor.right,anchor.bottom,dialog);
     DestroyMenu(menu); if (selected) SendMessageW(dialog,WM_COMMAND,selected,0); return true;
-  }
-  if (command==IDC_NOTES_FIND_TOGGLE || command==IDC_NOTES_FIND_CLOSE) {
-    state.findVisible=command==IDC_NOTES_FIND_TOGGLE; LayoutClientNotes(dialog,GetDpiForWindow(dialog));
-    SetFocus(state.findVisible ? GetDlgItem(dialog,IDC_NOTES_FIND) : edit); return true;
-  }
-  if (command==IDC_NOTES_FIND_NEXT || command==IDC_NOTES_FIND_PREV) {
-    NotesFind(dialog,state,command==IDC_NOTES_FIND_PREV); return true;
   }
   if (command==IDC_NOTES_RETRY) { SaveClientNotesDraft(dialog,state,true); return true; }
   if (command==IDC_NOTES_TOPMOST || command==IDC_NOTES_PROGRESS) {
@@ -1299,7 +1529,7 @@ static bool NotesWorkspaceCommand(HWND dialog,ClientNotesDialogState &state,UINT
     if (!SaveClientNotesDraft(dialog,state,true)) return true;
     NotesTemplates templates{dialog,&state};
     templates.snippets=command==IDC_NOTES_SNIPPETS || command==IDC_NOTES_SAVE_SNIPPET;
-    if (!NotesLoadTemplates(templates)) { MessageBoxW(dialog,L"The template library could not be opened safely. Existing templates were kept.",L"Templates",MB_OK|MB_ICONWARNING); return true; }
+    if (!NotesLoadTemplates(templates)) { MessageBoxW(dialog,client_notes::PersistenceFailure(L"The template library could not be opened safely. Existing templates were kept.").c_str(),L"Templates",MB_OK|MB_ICONWARNING); return true; }
     templates.startFromNote=command==IDC_NOTES_SAVE_TEMPLATE || command==IDC_NOTES_SAVE_SNIPPET;
     DialogBoxParamW(g_hInst,MAKEINTRESOURCEW(IDD_NOTES_TEMPLATE_EDITOR),dialog,NotesTemplateEditorProc,reinterpret_cast<LPARAM>(&templates));
     return true;
@@ -1343,14 +1573,20 @@ static bool NotesWorkspaceCommand(HWND dialog,ClientNotesDialogState &state,UINT
     return true;
   }
   if (command==IDC_NOTES_EXPORT_ALL) {
+    if(state.editorLoadFailed && !state.attachedPageId && state.original.notebook_snapshot.status==client_notes::ReadStatus::Ok) {
+      std::wstring path;if(!NotesPickFile(dialog,true,path,true)) return true;
+      if(!NotesWriteExport(path,state.original.notebook_snapshot.bytes)) MessageBoxW(dialog,client_notes::PersistenceFailure(L"The saved notebook could not be exported. Its original file remains unchanged.").c_str(),L"Export notebook",MB_OK|MB_ICONWARNING);
+      return true;
+    }
     if (!CaptureNotesPage(dialog,state,true)) return true;
     std::wstring path; if (!NotesPickFile(dialog,true,path,true)) return true;
     std::string bytes;
-    if (!client_notes::SerializeNotebook(state.pages,bytes) || !NotesWriteExport(path,bytes)) MessageBoxW(dialog,L"The notebook could not be exported.",L"Export notebook",MB_OK|MB_ICONWARNING);
+    if (!client_notes::SerializeNotebook(state.pages,bytes) || !NotesWriteExport(path,bytes)) MessageBoxW(dialog,client_notes::PersistenceFailure(L"The notebook could not be exported.").c_str(),L"Export notebook",MB_OK|MB_ICONWARNING);
     return true;
   }
   if (command==IDC_NOTES_CONFLICT) {
-    CaptureNotesPage(dialog,state,false); NotesWriteRecovery(dialog,state);
+    if(!CaptureNotesPage(dialog,state,true)) {SetNotesSaveFailure(dialog,state,true);return true;}
+    NotesWriteRecovery(dialog,state);
     const auto latest=client_notes::ReadNotebook(state.clientRoot);
     if (latest.status==client_notes::ReadStatus::Error) {
       MessageBoxW(dialog,L"The saved notebook is unavailable. Your draft remains open. Use Copy entire note or Export this note to keep an additional copy, then retry saving.",L"Save recovery",MB_OK|MB_ICONWARNING); return true;
@@ -1365,22 +1601,30 @@ static bool NotesWorkspaceCommand(HWND dialog,ClientNotesDialogState &state,UINT
       DialogBoxParamW(g_hInst,MAKEINTRESOURCEW(IDD_NOTES_LIBRARY),dialog,NotesLibraryProc,reinterpret_cast<LPARAM>(&preview));
       return true;
     }
-    auto drafts=state.pages;
+    auto drafts=state.pages;const auto pendingDetails=state.detailsDrafts;
     size_t required=latest.pages.size();
-    for (const auto &p : drafts) if (!p.deleted && std::none_of(latest.pages.begin(),latest.pages.end(),[&](const auto &saved){return saved.id==p.id && NotesSameContent(saved,p);})) ++required;
+    for (const auto &p : drafts) if ((!p.deleted || pendingDetails.contains(p.id)) && std::none_of(latest.pages.begin(),latest.pages.end(),[&](const auto &saved){return saved.id==p.id && NotesSameContent(saved,p);})) ++required;
     if (required>client_notes::kMaxPages) {
       MessageBoxW(dialog,L"There is not enough room to recover all changed notes. Export your drafts before reloading. Your current editor has been kept.",L"Notebook full",MB_OK|MB_ICONWARNING); return true;
     }
     for (const auto &[id,window] : state.editors) DestroyWindow(window);
-    state.editors.clear(); state.attachedEditor=nullptr;
+    state.editors.clear();state.editorUse.clear();state.editorViews.clear();state.editorLinks.clear();state.attachedEditor=nullptr;state.attachedPageId=0;
     state.pages=latest.pages; state.original=latest; state.baselines.assign(state.pages.size(),{}); state.activePage=state.pages.size();
+    state.detailsDrafts.clear();
+    for(const auto &[id,draft]:pendingDetails) {
+      const auto source=std::find_if(drafts.begin(),drafts.end(),[&](const auto &p){return p.id==id;});
+      const auto saved=std::find_if(latest.pages.begin(),latest.pages.end(),[&](const auto &p){return p.id==id;});
+      if(source!=drafts.end() && saved!=latest.pages.end() && NotesSameContent(*source,*saved)) state.detailsDrafts[id]=draft;
+    }
     for (auto page : drafts) {
-      if (page.deleted || std::any_of(state.pages.begin(),state.pages.end(),[&](const auto &p){return p.id==page.id && NotesSameContent(p,page);})) continue;
+      if ((page.deleted && !pendingDetails.contains(page.id)) || std::any_of(state.pages.begin(),state.pages.end(),[&](const auto &p){return p.id==page.id && NotesSameContent(p,page);})) continue;
       if (state.pages.size()>=client_notes::kMaxPages) {
         MessageBoxW(dialog,L"The notebook is full. Remaining draft notes are retained in the recovery file for the next session.",L"Recovered copies",MB_OK|MB_ICONWARNING); break;
       }
-      page.name=NotesUniqueName(state,page.name+L" recovered"); page.id=client_notes::NextId(state.pages); page.open=true; page.archived=false;
-      state.pages.push_back(std::move(page)); state.baselines.emplace_back(); state.activePage=state.pages.size()-1;
+      const auto sourceId=page.id;
+      page.name=NotesUniqueName(state,page.name+L" recovered"); page.id=client_notes::NextId(state.pages); page.open=!page.deleted; page.archived=false;
+      if(const auto pending=pendingDetails.find(sourceId);pending!=pendingDetails.end()) state.detailsDrafts[page.id]=pending->second;
+      const bool open=page.open;state.pages.push_back(std::move(page)); state.baselines.emplace_back();if(open) state.activePage=state.pages.size()-1;
     }
     state.metadataChanged=true; NotesSelectAvailable(dialog,state); SaveClientNotesDraft(dialog,state,true); return true;
   }
@@ -1400,34 +1644,60 @@ static bool NotesWorkspaceCommand(HWND dialog,ClientNotesDialogState &state,UINT
     return true;
   }
   case IDC_NOTES_LINK: case IDC_NOTES_LINK_COPY: case IDC_NOTES_LINK_REMOVE: {
+    if(!CaptureNotesPage(dialog,state,false)) return true;
     CHARRANGE selected{}; NotesSelection(edit,selected);
     std::wstring label=NotesRangeText(edit,selected.cpMin,selected.cpMax), address;
-    for (const auto &[text,url] : page.links) if (text==label) { address=url; break; }
+    address=NotesNativeLinkAddress(edit,state,selected);
     if (address.empty() && ValidNotesUrl(label)) address=label;
-    if (command==IDC_NOTES_LINK_COPY) { if (!address.empty()) NotesCopyText(dialog,address); return true; }
-    if (command==IDC_NOTES_LINK_REMOVE) {
-      NotesCharacterFormat(dialog,state,CFM_LINK|CFM_UNDERLINE|CFM_COLOR,0,g_themeColors.crControlText);
+    if (command==IDC_NOTES_LINK_COPY) {
+      if (NotesRangeLinkEffects(edit,selected) && CaptureNotesPage(dialog,state,false)) {
+        address=NotesNativeLinkAddress(edit,state,selected);
+        if (address.empty() && ValidNotesUrl(label) && NotesLinkLabelExists(edit,label)) address=label;
+        if (!address.empty()) NotesCopyText(dialog,address);
+      }
       return true;
     }
+    if (command==IDC_NOTES_LINK_REMOVE) {
+      NotesCharacterFormat(dialog,state,CFM_LINK|CFM_LINKPROTECTED|CFM_UNDERLINE|CFM_COLOR,0,g_themeColors.crControlText);
+      CaptureNotesPage(dialog,state,false);
+      return true;
+    }
+    const auto linkClient=state.clientName;const auto linkRoot=state.clientRoot;
+    const auto linkPageId=state.attachedPageId;const auto linkIndex=state.activePage;
     NotesInput input{L"Insert or edit link",L"Link text",L"HTTP / HTTPS address",label,address};
     if (!NotesAsk(dialog,input)) return true;
+    if(!NotesEditorMatchesActive(state) || state.attachedEditor!=edit || state.attachedPageId!=linkPageId ||
+        state.activePage!=linkIndex || state.clientName!=linkClient || state.clientRoot!=linkRoot) return true;
     if (!ValidNotesUrl(input.second) || input.first.size()>2048 || input.first.find_first_of(L"\r\n")!=std::wstring::npos) {
       MessageBoxW(dialog,L"Use a valid HTTP/HTTPS address and a single-line label.",L"Link",MB_OK|MB_ICONWARNING); return true;
     }
     if (input.first.empty()) input.first=input.second;
-    auto found=std::find_if(page.links.begin(),page.links.end(),[&](const auto &link){return link.first==input.first;});
-    if (found!=page.links.end() && found->second!=input.second && input.first!=label) {
-      MessageBoxW(dialog,L"That link text already points to another address in this note. Choose a distinct label.",L"Link text",MB_OK|MB_ICONINFORMATION); return true;
+    auto &linkPage=state.pages[state.activePage];
+    if(!NotesReplacementLinksFit(edit,linkPage,selected,static_cast<LONG>(input.first.size()),{{0,static_cast<LONG>(input.first.size()),input.first,input.second}})) {
+      MessageBoxW(dialog,L"This replacement would exceed 256 link targets, 16,384 linked ranges or 2,048 characters per label. Your existing text and links are kept.",L"Link limit",MB_OK|MB_ICONWARNING);return true;
     }
-    if (found==page.links.end() && page.links.size()>=256) return true;
-    SendMessageW(edit,EM_EXSETSEL,0,reinterpret_cast<LPARAM>(&selected));
-    SendMessageW(edit,EM_REPLACESEL,TRUE,reinterpret_cast<LPARAM>(input.first.c_str()));
-    selected.cpMax=selected.cpMin+static_cast<LONG>(input.first.size());
-    SendMessageW(edit,EM_EXSETSEL,0,reinterpret_cast<LPARAM>(&selected));
-    NotesCharacterFormat(dialog,state,CFM_LINK|CFM_UNDERLINE|CFM_COLOR,CFE_LINK|CFE_UNDERLINE,g_bThemeIsDark ? RGB(138,205,235) : RGB(0,91,158));
-    if (found==page.links.end()) page.links.emplace_back(input.first,input.second);
-    else found->second=input.second;
-    state.metadataChanged=true; return true;
+    const auto result=NotesApplyNativeTransaction(dialog,state,selected,[&](HWND target) {
+      SendMessageW(target,EM_EXSETSEL,0,reinterpret_cast<LPARAM>(&selected));
+      if(input.first!=label) {
+        SendMessageW(target,EM_REPLACESEL,TRUE,reinterpret_cast<LPARAM>(input.first.c_str()));
+        // loading suppresses the normal post-replace editor-subclass repair.
+        // Keep surviving original-cookie prefix/suffix runs linked before bind.
+        NotesRestoreCookieLinks(target,state);
+      }
+      selected.cpMax=selected.cpMin+static_cast<LONG>(input.first.size());
+      SendMessageW(target,EM_EXSETSEL,0,reinterpret_cast<LPARAM>(&selected));
+      CHARFORMAT2W format{sizeof(format)};format.dwMask=CFM_LINK|CFM_LINKPROTECTED|CFM_UNDERLINE|CFM_COLOR;
+      format.dwEffects=CFE_LINK|CFE_LINKPROTECTED|CFE_UNDERLINE;format.crTextColor=g_bThemeIsDark ? RGB(138,205,235) : RGB(0,91,158);
+      const bool formatted=SendMessageW(target,EM_SETCHARFORMAT,SCF_SELECTION,reinterpret_cast<LPARAM>(&format))!=0;
+      LONG effects=CFE_LINK|CFE_LINKPROTECTED;bool linksOk=false;NotesRangeLinkEffects(target,selected,&effects,nullptr,false,&linksOk);
+      const LONG cookie=NotesRegisterLinkCookie(state,linkPage.id,input.second);
+      return NotesBindLinkCookie(target,state,linkPage.id,selected,cookie) && linksOk && formatted &&
+          NotesRangeText(target,selected.cpMin,selected.cpMax)==input.first;
+    });
+    if(result!=NotesAppTransactionResult::Committed) {
+      NotesAppTransactionNotice(dialog,result,L"This link could not be edited safely. Your previous text and address are kept.",L"Link");return true;
+    }
+    CaptureNotesPage(dialog,state,false);MarkNotesChanged(dialog,state);UpdateNotesToolbar(dialog,state);SetFocus(edit);return true;
   }
   case IDC_NOTES_CLOSE_TAB: case IDC_NOTES_CLOSE_ALL: case IDC_NOTES_CLOSE_OTHERS: {
     if (!SaveClientNotesDraft(dialog,state,true)) return true;
@@ -1462,12 +1732,12 @@ static bool NotesWorkspaceCommand(HWND dialog,ClientNotesDialogState &state,UINT
     std::wstring path; if (!NotesPickFile(dialog,true,path)) return true;
     std::string bytes=page.rtf;
     if (_wcsicmp(fs::path(path).extension().c_str(),L".txt")==0 && !client_notes::EncodeUtf8(NotesWindowText(edit),bytes)) return true;
-    if (!NotesWriteExport(path,bytes)) MessageBoxW(dialog,L"The note could not be exported.",L"Export note",MB_OK|MB_ICONWARNING);
+    if (!NotesWriteExport(path,bytes)) MessageBoxW(dialog,client_notes::PersistenceFailure(L"The note could not be exported.").c_str(),L"Export note",MB_OK|MB_ICONWARNING);
     return true;
   }
   case IDC_NOTES_TICKET: {
     NotesInput input{L"Note information - created "+NotesDate(page.created)+L", edited "+NotesDate(page.modified),L"Ticket number (optional)",L"Ticket URL (optional, http/https)",page.ticket,page.ticketUrl};
-    input.hint=L"Link this note to a support ticket. The number appears in All notes and is searchable. Open ticket link uses your default browser and regular sign-in, separate from client profiles. No ticket lookup or sync is performed.";
+    input.hint=L"Link this note to a support ticket. The number appears in All notes and is searchable. More > Link browser chooses the regular PC browser for all note links, separate from client profiles. No ticket lookup or sync is performed.";
     if (NotesAsk(dialog,input)) {
       if (input.first.size()>128 || (!input.second.empty() && !ValidNotesUrl(input.second))) { MessageBoxW(dialog,L"Use a ticket number of at most 128 characters and a valid HTTP/HTTPS URL.",L"Ticket details",MB_OK|MB_ICONWARNING); return true; }
       page.ticket=input.first; page.ticketUrl=input.second; state.metadataChanged=true; SaveClientNotesDraft(dialog,state,true);
@@ -1502,7 +1772,7 @@ static bool NotesWorkspaceCommand(HWND dialog,ClientNotesDialogState &state,UINT
     copy.active=false; copy.open=false; copy.pinned=false; copy.pristine=false;
     target.pages.push_back(std::move(copy));
     if (!client_notes::WriteNotebook(destination,target.pages,expectedTarget,[&]{return RevalidateSafeClientContainerPath(input.first,destination);})) {
-      MessageBoxW(dialog,L"The destination could not be saved. The source note has been kept.",L"Transfer note",MB_OK|MB_ICONWARNING); return true;
+      MessageBoxW(dialog,client_notes::PersistenceFailure(L"The destination could not be saved. The source note has been kept.").c_str(),L"Transfer note",MB_OK|MB_ICONWARNING); return true;
     }
     if (command==IDC_NOTES_MOVE) {
       page.deleted=true; page.open=false; state.metadataChanged=true; NotesSelectAvailable(dialog,state); SaveClientNotesDraft(dialog,state,true);
@@ -1522,30 +1792,6 @@ static bool NotesWorkspaceCommand(HWND dialog,ClientNotesDialogState &state,UINT
   case IDC_NOTES_ZOOM_IN: case IDC_NOTES_ZOOM_OUT: case IDC_NOTES_ZOOM_RESET:
     page.zoom=command==IDC_NOTES_ZOOM_RESET ? 100 : static_cast<uint32_t>(std::clamp(static_cast<int>(page.zoom)+(command==IDC_NOTES_ZOOM_IN ? 10 : -10),25,400));
     SendMessageW(edit,EM_SETZOOM,page.zoom,100); state.metadataChanged=true; SetFocus(edit); return true;
-  case IDC_NOTES_REPLACE: case IDC_NOTES_REPLACE_ALL: {
-    NotesInput input{L"Find and replace",L"Find text",L"Replace with",NotesWindowText(GetDlgItem(dialog,IDC_NOTES_FIND)),L""};
-    if (!NotesAsk(dialog,input) || input.first.empty()) return true;
-    const int choice=MessageBoxW(dialog,L"Replace all matches? Choose No to replace the next match only.",L"Replace",MB_YESNOCANCEL|MB_ICONQUESTION);
-    if (choice==IDCANCEL) return true;
-    CHARRANGE selected{}; NotesSelection(edit,selected); LONG start=choice==IDYES ? 0 : selected.cpMin;
-    SendMessageW(edit,EM_STOPGROUPTYPING,0,0);
-    IUnknown *ole=nullptr; ITextDocument *document=nullptr;
-    SendMessageW(edit,EM_GETOLEINTERFACE,0,reinterpret_cast<LPARAM>(&ole));
-    if (ole) { ole->QueryInterface(__uuidof(ITextDocument),reinterpret_cast<void **>(&document)); ole->Release(); }
-    if (document) document->BeginEditCollection();
-    size_t count=0;
-    for (;;) {
-      FINDTEXTEXW search{{start,-1},input.first.data(),{}};
-      if (SendMessageW(edit,EM_FINDTEXTEXW,FR_DOWN,reinterpret_cast<LPARAM>(&search))<0) break;
-      SendMessageW(edit,EM_EXSETSEL,0,reinterpret_cast<LPARAM>(&search.chrgText));
-      SendMessageW(edit,EM_REPLACESEL,TRUE,reinterpret_cast<LPARAM>(input.second.c_str())); ++count;
-      start=search.chrgText.cpMin+static_cast<LONG>(input.second.size());
-      if (choice!=IDYES) break;
-    }
-    if (document) { document->EndEditCollection(); document->Release(); } SetFocus(edit);
-    if (!count) MessageBoxW(dialog,L"No matches found.",L"Replace",MB_OK|MB_ICONINFORMATION);
-    return true;
-  }
   default: return false;
   }
 }
@@ -1555,6 +1801,7 @@ static bool NotesTranslateKey(MSG &message) {
   if (!state) return false;
   const bool ctrl=(GetKeyState(VK_CONTROL)&0x8000)!=0, shift=(GetKeyState(VK_SHIFT)&0x8000)!=0;
   UINT command=0;
+  if (!ctrl && message.wParam==VK_TAB && GetFocus()==GetDlgItem(g_hNotesWindow,IDC_CLIENT_NOTES_TEXT) && NotesNavigateTableCell(GetFocus(),shift)) return true;
   if (!ctrl && message.wParam==VK_TAB && GetFocus()==GetDlgItem(g_hNotesWindow,IDC_CLIENT_NOTES_TEXT) && NotesListKey(GetFocus(),WM_KEYDOWN,VK_TAB)) { MarkNotesChanged(g_hNotesWindow,*state); return true; }
   if (ctrl) {
     switch (message.wParam) {
@@ -1562,6 +1809,8 @@ static bool NotesTranslateKey(MSG &message) {
     case 'T': command=shift ? IDC_NOTES_REOPEN : IDC_NOTES_ADD_TAB; break;
     case 'F': command=IDC_NOTES_FIND_TOGGLE; break;
     case 'H': command=IDC_NOTES_REPLACE; break;
+    case 'G': command=IDC_NOTES_GO_TO_LINE; break;
+    case 'P': command=IDC_NOTES_PRINT; break;
     case 'S': command=IDC_NOTES_RETRY; break;
     case 'K': command=IDC_NOTES_ACTIONS; break;
     case VK_PRIOR: if (shift) command=IDC_NOTES_TAB_LEFT; break;
@@ -1573,16 +1822,20 @@ static bool NotesTranslateKey(MSG &message) {
       if (!state->visiblePages.empty() && SaveClientNotesDraft(g_hNotesWindow,*state,true)) {
         int selected=TabCtrl_GetCurSel(GetDlgItem(g_hNotesWindow,IDC_NOTES_TABS));
         selected=(selected+(shift ? static_cast<int>(state->visiblePages.size())-1 : 1))%static_cast<int>(state->visiblePages.size());
-        state->activePage=state->visiblePages[selected]; RefreshNotesTabs(g_hNotesWindow,*state); LoadNotesPage(g_hNotesWindow,*state);
+        state->activePage=state->visiblePages[selected];
+        if (!LoadNotesPage(g_hNotesWindow,*state)) MessageBoxW(g_hNotesWindow,L"This note's editor could not be opened. Its saved content has been kept.",L"Client Notes",MB_OK|MB_ICONWARNING);
+        RefreshNotesTabs(g_hNotesWindow,*state);
       }
       return true;
     }
-  } else if (message.wParam==VK_F3) command=shift ? IDC_NOTES_FIND_PREV : IDC_NOTES_FIND_NEXT;
+  } else if (message.wParam==VK_F7) command=IDC_NOTES_SPELLING;
+  else if (message.wParam==VK_F3) command=shift ? IDC_NOTES_FIND_PREV : IDC_NOTES_FIND_NEXT;
   else if (message.wParam==VK_ESCAPE && state->dragTab>=0) {
     SendDlgItemMessageW(g_hNotesWindow,IDC_NOTES_TABS,WM_CANCELMODE,0,0);return true;
   }
   else if (message.wParam==VK_ESCAPE && state->findVisible) command=IDC_NOTES_FIND_CLOSE;
   else if (message.wParam==VK_RETURN && GetFocus()==GetDlgItem(g_hNotesWindow,IDC_NOTES_FIND)) command=IDC_NOTES_FIND_NEXT;
+  else if (message.wParam==VK_RETURN && GetFocus()==GetDlgItem(g_hNotesWindow,IDC_NOTES_REPLACE_TEXT)) command=IDC_NOTES_REPLACE_NEXT;
   if (!command) return false;
   SendMessageW(g_hNotesWindow,WM_COMMAND,command,0); return true;
 }

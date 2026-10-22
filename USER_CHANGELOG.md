@@ -1,5 +1,41 @@
 # ctSpaces 6.3 What's New
 
+## 6.3.4.0 — cumulative update since 6.1.1.0
+
+This is the change list for coworkers moving from their last shared version,
+6.1.1.0. It includes the 6.2 and 6.3 improvements, not just one patch.
+
+- Client Notes is a formatted notebook with reorderable tabs, searchable
+  All notes, archive, recoverable Trash, version history and import/export.
+  Each notebook stays with its client; shared templates and snippets produce
+  independent client notes.
+- Use quick capture, editable templates/snippets, ticket details, local status
+  and tags, dated work updates, code boxes, tables and HTML handovers.
+- Find/Replace, word wrap, Go to line, text counts, Windows spelling review,
+  printing/PDF and previewed Markdown interchange are available on demand.
+- Notes follows the selected theme, saves quietly and stays available when the
+  launcher is minimized or closed to the tray. Client switches reuse its window.
+  Save problems retain the draft; snapshots and conflict tools aid recovery.
+- Ticket and note links open in a chosen regular PC browser outside client
+  profiles. Right-click a link to copy its complete address.
+- Choose global Vertical, Horizontal or Keep browser's choice, with a per-client
+  Follow global/Vertical/Horizontal override for new windows. Horizontal sets
+  the vertical-tab preference to off. **Edge Restore tabs can retain a saved
+  window's old layout.** Set that layout in Edge before closing the window if
+  using session restore; ctSpaces does not force restored windows to change.
+- Exclude clients from an all-client backup and follow scanning, compression
+  and verification progress. Restore replaces the active collection rather
+  than merging it and retains the previous collection in a safety folder.
+- Reliability fixes cover client identity, lifecycle/menu ownership, browser
+  profile use, rejected edits, save/link preservation and resize/tab behavior.
+
+Back up before updating or downgrading. Saving upgrades notebook storage;
+6.1.1.0 cannot read the new notebook format. Browser support/policy and
+actual test coverage are described in the
+[release notes](RELEASE_NOTES_6.3.4.0.md) and
+[validation](docs/RELEASE_VALIDATION_6.3.4.0.md).
+The [shareable change list](docs/CHANGES_SINCE_6.1.1.0.md) is written for the team.
+
 ## 6.3.3.0 Compact Notes actions
 
 - Find, Snippets, Templates, Details, Status, Link/Open ticket and Add update

@@ -1,6 +1,8 @@
 # Developer Guide
 
-Applies to ctSpaces 6.0.
+Applies to ctSpaces 6.3.4.0. The cumulative coworker baseline is 6.1.1.0; see
+[the change list](CHANGES_SINCE_6.1.1.0.md) and
+[release validation](RELEASE_VALIDATION_6.3.4.0.md) for completed checks and limits.
 
 ## Technology
 
@@ -29,8 +31,13 @@ notes are retained.
 |---|---|
 | `ctSpaces.cpp` | Startup, installer/update flow, launcher UI, themes, profile lifecycle, browser launch/tracking, icons, backup/restore, and dialogs |
 | `ctSpaces.rc` | Icons, dialog resources, embedded `Default.7z`, embedded runtime sanitizer, and Windows version metadata |
-| `ClientNotes.h` / `NotesWorkspaceUi.inl` | Validated atomic notebook v1/v2 storage and native notes workflows |
+| `ClientNotes.h` / `NotesWorkspaceUi.inl` | Validated atomic notebook v1/v2/v3 storage and native notes workflows |
+| `NotesFindModel.h` / `NotesFindUi.inl` | Native-position search, bounded match counts, atomic replacement and temporary search rows |
+| `NotesTextTools.h` / `NotesEditingExtras.inl` | Logical-line statistics/navigation, remembered wrapping and independent RichEdit print copies |
+| `NotesSpelling.h` / `NotesSpellingUi.inl` | On-demand Windows spelling dictionaries, technical-text exclusions and explicit corrections |
+| `NotesMarkdown.h` / `NotesMarkdownUi.inl` | Bounded Markdown interchange, previews, client/selection lifetime checks and simple native tables |
 | `tests/NotesWorkspaceTests.cpp` | Isolated native-control tests compiled against production notes implementation |
+| `tests/Test-NotesFind.ps1`, `tests/Test-NotesSpelling.ps1`, `tests/Test-NotesMarkdown.ps1`, `tests/Test-NotesEditingExtras.ps1` | Guarded background editing regressions using private notebooks; print jobs/dialogs are intercepted, with real RichEdit pagination directed to memory |
 | `Resource.h` | Resource identifiers |
 | `version.h` | Single version source for app, About, file, and product versions |
 | `theme.h` | Built-in named theme catalog |
@@ -63,6 +70,25 @@ notes are retained.
 | `tests\Test-RestoreAfterBrowserClose.ps1` | Disposable local-tab restore, profile-release, and client-first title integration test |
 | `docs\DEVELOPER_GUIDE.md` | Public architecture, testing, and release procedures |
 | `docs\RELEASE_VALIDATION_*.md` | Versioned validation evidence and explicitly retained boundaries |
+
+RichEdit changes its Tab behavior after the dialog manager queries
+`WM_GETDLGCODE`. Client Notes handles table navigation explicitly through TOM's
+`tomCell` unit before native dialog routing. Movement updates only the caret,
+uses `EM_EXSETSEL` rather than activating the editor, and does not mark the note
+changed. The control subclass suppresses the translated Tab after handling its
+key-down message; the normal application message path consumes the key before
+translation. Ctrl+Tab retains notebook-tab navigation, and ordinary list
+indentation retains its existing path. Native regressions issue the real dialog
+query before the complete key sequence and verify unchanged RTF and Undo.
+
+Logical-line tools count CR/LF pairs and native U+000B soft breaks while keeping
+UTF-16 editor positions intact. Code boxes use those soft breaks for source
+lines. Details measures its explanation with the actual native font and usable
+width, including scrollbar space, and extends the scrollable body when needed.
+Its normal panel stays 390 by 502 DIPs with a minimum 114-DIP explanation. Hint
+updates reflow without moving unchanged popup bounds or changing input focus;
+native regressions verify complete clipped-scroll coverage and stable repeated
+layout on narrow work areas.
 
 ## Runtime Architecture
 
@@ -115,6 +141,22 @@ Sites\<ClientName>\Browsers\firefox\Profile
 A legacy client root remains the original Chromium `--user-data-dir`; private data is never moved into the v2 tree as an automatic migration. The durable `ctSpaces-legacy-browser-v2` marker binds that root to the first selected Chromium browser. Selecting Firefox first creates only its nested slot and leaves the legacy root unbound until a Chromium selection. Later browsers get clean nested slots.
 
 When restore is off, ctSpaces changes only the browser startup preference to a normal new tab through a staged, atomic Preferences replacement. It does not remove Session files or any cookies, logins, bookmarks, history, extensions, or site data.
+
+Tab layout is a launch-time native preference for new windows, not an automation
+command to reorient restored windows. Global Keep/Vertical/Horizontal and client
+Follow global/Vertical/Horizontal resolve before an idle managed launch. Temp
+uses global; Default is excluded. Horizontal writes the native vertical-tab
+preference false; Keep releases enforcement, including removal of only the
+ctSpaces-owned Firefox `user.js` block.
+
+**Edge session-restore limitation:** live checks in both directions showed the
+stored new-window preference and restored window layout disagreeing. Edge can
+retain the saved window's layout with Restore tabs on. Changing layout in Edge
+before closing that session retains the desired native state. No supported
+forced override is claimed, and ctSpaces preserves session files and restore
+behavior. An [Edge engineer's explanation of session-restored layout](https://techcommunity.microsoft.com/discussions/edgeinsiderdiscussions/vertical-tabs-prevents-edge-canary-103-0-1250-0-from-launching/3344208/replies/3348593)
+also describes that distinction; it is historical context, while the current
+limitation is supported by the separately recorded live checks.
 
 The active-profile map and tab list use case-insensitive `(client, browser)` identity. One slot cannot be launched twice from one launcher, but different browser slots for the same client may run simultaneously. Each tab deliberately displays only `session.clientName`, so simultaneous slots for one client have matching visible labels without collapsing their internal identities. The session reaper detects browser-process exit and removes the corresponding tab.
 
@@ -183,6 +225,10 @@ Theme preference writes both the legacy numeric `theme` value and the stable `th
 The executable is intentionally not manifested longPathAware. The 240-unit client syntax limit remains for historical and backup compatibility, but every new client, missing slot, rename target, and restored client must satisfy BackupEngine.h's separate 259-character file and 247-character directory budgets. New targets reserve 150 file characters and 123 directory characters below the client root for the Chromium profile prefix plus the deepest current Default.7z entries; release validation measures the archive so template growth cannot silently exceed those reserves. Rename and restore additionally map and preflight every current or staged tree item before moving anything. Temporary profile-creation roots receive the same conservative headroom check. Existing paths that Win32 cannot inspect fail closed.
 
 Shortcut naming uses the exact absolute Desktop directory to verify that the canonical `Client.lnk` path fits the legacy file-path budget. If the exact client label cannot fit, creation fails without choosing a different visible name. Compatibility lookup still checks former browser-qualified, fixed-240, prior 32-bit, hashed, and historical full filename forms so ownership-verified old links remain manageable during rename and deletion.
+
+An explicitly supplied `--browser` option must have one valid value. Incomplete
+or repeated browser options are rejected rather than falling back to the current
+selection. Browser-less client requests retain the current-selection behavior.
 
 ## Client Icon Pipeline
 
@@ -402,7 +448,7 @@ User-visible behavior, data handling, installation prompts, profile cleanup, and
 
 Run `tests/Test-NotesWorkspace.ps1` after a Release x64 app build. This compiles production notes code into an isolated native test process, redirects only confirmation/input/file-picker boundaries, and exercises actual RichEdit and tab controls. It never runs the application startup or reads live client data. Fixtures are retained below `build/notes-workspace-test-*` for inspection. `tests/Test-ClientNotes.ps1` covers notebook storage/migration and unsafe path boundaries. Finish with a live disposable `--qa-instance` / `--qa-data-dir` visual review; native assertions do not establish visual quality or flicker behavior.
 
-The notes workspace is modeless, with one client notebook open at a time. Cached native editors preserve undo per note until the window closes. Client lifecycle operations flush/close the relevant notebook before proceeding. V2 notebooks keep bounded revisions and optional crash snapshots; all writes retain stale-snapshot and safe-path checks. Deferred work is tracked in `docs/notes-roadmap.json`.
+The notes workspace is modeless, with one client notebook open at a time. Cached native editors preserve Undo for the active note and the 15 most recently visited open notes; eviction, closing a tab or closing the window releases that editor's Undo queue. Client lifecycle operations flush/close the relevant notebook before proceeding. V2 notebooks keep bounded revisions and optional crash snapshots; all writes retain stale-snapshot and safe-path checks. Deferred work is tracked in `docs/notes-roadmap.json`.
 
 Notes productivity helpers live in `NotesProductivityUi.inl`, included by the
 workspace after its text/date helpers. Status and tags opt notebooks into V3;

@@ -19,8 +19,15 @@
 #include "BackupEngine.h"
 #include "BrowserTitle.h"
 #include "BrowserPreferencesJson.h"
+#include "FirefoxPreferences.h"
+#include "ClientTabLayout.h"
+#include "BrowserProcessExit.h"
 #include "ClientShortcutName.h"
+#include "ClientNameComparison.h"
+#include "ClientPreferenceEncoding.h"
 #include "ClientActivity.h"
+#include "ClientDeletionSafety.h"
+#include "TransientProfileIdentity.h"
 #include "ClientNotes.h"
 #include "CleanupResultPages.h"
 #include "ConfigPersistence.h"
@@ -28,11 +35,14 @@
 #include "InProc7z.h"
 #include "OwnerDrawUi.h"
 #include "NotesEditorUi.h"
+#include "NotesTextTools.h"
 #include "ProgressUI.h"
+#include "BackupProgressUi.h"
 #include "SiblingStageName.h"
 #include "theme.h"
 #include "version.h"
 #include <commctrl.h>
+#include <commdlg.h>
 #include <dwmapi.h>
 #include <gdiplus.h>
 #include <propkey.h>
@@ -157,7 +167,7 @@ enum class ProfileUseState { NotInUse, InUse, Indeterminate };
 struct CaseInsensitiveLess {
   bool operator()(const std::wstring &left,
                   const std::wstring &right) const noexcept {
-    return _wcsicmp(left.c_str(), right.c_str()) < 0;
+    return client_name_comparison::CompareIgnoringCase(left, right) < 0;
   }
 };
 
@@ -265,8 +275,8 @@ struct ClientBrowserKey {
 struct ClientBrowserKeyLess {
   bool operator()(const ClientBrowserKey &left,
                   const ClientBrowserKey &right) const noexcept {
-    const int nameOrder =
-        _wcsicmp(left.clientName.c_str(), right.clientName.c_str());
+    const int nameOrder = client_name_comparison::CompareIgnoringCase(
+        left.clientName, right.clientName);
     if (nameOrder != 0)
       return nameOrder < 0;
     return static_cast<int>(left.browser) < static_cast<int>(right.browser);
@@ -278,6 +288,9 @@ struct ActiveProfileInfo {
   fs::path executablePath;
   fs::path profilePath;
   ProfileType type = ProfileType::Standard;
+  // Retained from the successful launch, never adopted by reopening a PID.
+  std::shared_ptr<void> process;
+  std::shared_ptr<transient_profile::Identity> directory;
 };
 
 struct ProfileExitPayload {
@@ -359,6 +372,8 @@ static std::atomic_bool g_bClientNotesBusy = false;
 static HWND g_hNotesWindow = nullptr;
 static bool NotesTranslateKey(MSG &message);
 static bool PrepareNotesForClientChange(const std::wstring &client = {});
+static bool FlushClientNotesForBackup(
+    const std::vector<std::wstring> &selectedClients, std::wstring &error);
 static std::vector<std::unique_ptr<ProfileExitPayload>> g_notesDeferredExits;
 static bool g_bSyncingClientInput = false;
 static bool g_bFilteringClientList = false;
@@ -374,6 +389,7 @@ static std::vector<PendingClientClose> g_closeAllAwaitingWindows;
 static ULONGLONG g_closeAllDeadline = 0;
 static bool g_bExitWhenProfilesClose = false;
 static bool g_bClosePendingDuringLaunch = false;
+static bool g_bExplicitExitPendingDuringLaunch = false;
 static bool g_bArchiveTaskInProgress = false;
 static std::atomic_bool g_bCleanupBusy = false;
 static HWND g_hCleanupScanDialog = nullptr;
@@ -410,11 +426,14 @@ static HWND g_hQuickTourFrame = nullptr;
 enum class MainDragKind { None, PinnedClient, SessionTab };
 static MainDragKind g_mainDragKind = MainDragKind::None;
 static int g_iMainDragIndex = -1;
+static uint64_t g_mainDragSessionIdentity = 0;
 static POINT g_ptMainDragStart{};
 static bool g_bMainDragActive = false;
 static bool g_bPinnedOrderChanged = false;
 static bool g_bPinnedDragSnapshotValid = false;
 static std::vector<std::wstring> g_pinnedClientsBeforeDrag;
+static std::vector<std::wstring> g_pinnedClientsExpectedDuringDrag;
+static bool g_bPinnedDragCancelled = false;
 #define WM_APP_SESSION_STARTED (WM_APP + 5)
 #define WM_APP_PROFILE_EXITED (WM_APP + 6)
 #define WM_APP_FINALIZE_LAYOUT (WM_APP + 8)
@@ -434,6 +453,8 @@ static std::vector<std::wstring> g_pinnedClientsBeforeDrag;
 #define WM_APP_LAUNCHER_TRAY (WM_APP + 22)
 #define WM_APP_SHOW_LAUNCHER (WM_APP + 23)
 #define WM_APP_SWITCH_NOTES_CLIENT (WM_APP + 24)
+#define WM_APP_REFRESH_NOTES_ICON (WM_APP + 25)
+#define WM_APP_EXIT_CTSPACES (WM_APP + 26)
 struct NotesClientRequest { std::wstring client; uint64_t note=0; };
 
 static int GetMainGuiHeightDip() {
@@ -441,16 +462,26 @@ static int GetMainGuiHeightDip() {
                                  : MAIN_GUI_HEIGHT_DIP;
 }
 
+static uint64_t NextSessionIdentity() {
+  static std::atomic<uint64_t> next{1};
+  return next.fetch_add(1, std::memory_order_relaxed);
+}
+
 struct Session {
   std::wstring clientName;
   BrowserKind browser = BrowserKind::Edge;
   DWORD pid;
+  // A menu can pump browser-exit/start messages. Position and PID can both be
+  // reused while it is open; copies/reordering retain this session identity.
+  uint64_t identity = NextSessionIdentity();
 };
 std::vector<Session> g_sessions;
 
 HMENU g_hConfigMenu = nullptr;
 
 HMENU g_hBrowserSubMenu = nullptr;
+static HMENU g_hGlobalTabLayoutMenu = nullptr;
+static HMENU g_hClientTabLayoutMenu = nullptr;
 std::vector<HBITMAP> g_menuBitmaps; // owned; freed on WM_DESTROY
 HWND g_hThemeCombo = nullptr;
 const int g_iThemeSeparatorIndex = 3;
@@ -533,6 +564,14 @@ static bool RequestSessionCloseNormally(DWORD pid);
 #define IDM_CTX_CREATE_SHORTCUT 41015
 #define IDM_CTX_CLIENT_TITLE_FIRST 41016
 #define IDM_CTX_MINIMIZE_TRAY 41022
+#define IDM_TAB_LAYOUT_GLOBAL 41300
+#define IDM_TAB_LAYOUT_GLOBAL_BROWSER 41301
+#define IDM_TAB_LAYOUT_GLOBAL_VERTICAL 41302
+#define IDM_TAB_LAYOUT_GLOBAL_HORIZONTAL 41303
+#define IDM_TAB_LAYOUT_CLIENT 41310
+#define IDM_TAB_LAYOUT_CLIENT_FOLLOW 41311
+#define IDM_TAB_LAYOUT_CLIENT_VERTICAL 41312
+#define IDM_TAB_LAYOUT_CLIENT_HORIZONTAL 41313
 #define IDM_CTX_CLIENT_NOTES 41020
 #define IDM_CTX_QUICK_NOTE 41021
 #define IDM_GUIDED_WALKTHROUGH 41017
@@ -577,6 +616,8 @@ static constexpr wchar_t DEFAULT_THEME_NAME[] = L"Dark - Gothic";
 static int g_iThemeMode =
     1; // 0=System Auto, 1=System Light, 2=System Dark, >=3 custom themes
 static BrowserKind g_selectedBrowser = BrowserKind::Edge;
+static std::atomic<client_tab_layout::Layout> g_globalTabLayout{
+    client_tab_layout::Layout::Browser};
 static bool g_bThemeIsDark = false;
 static HBRUSH g_hbrThemeWindow = nullptr;
 static HBRUSH g_hbrThemeControl = nullptr;
@@ -607,22 +648,44 @@ static void FilterClientList(const std::wstring &query, bool showResults);
 static void UpdateCloseAllButtonState();
 static void RequestCloseAllClientsNormally();
 static bool IsStandardClientSession(const Session &session);
+using ClientPreferenceSnapshot = std::optional<std::vector<std::wstring>>;
+static bool SaveClientListSnapshot(
+    const wchar_t *section, const wchar_t *countKey, const wchar_t *rowPrefix,
+    size_t maximum, bool browserPreferences,
+    const std::vector<std::wstring> &expectedOriginal,
+    const std::vector<std::wstring> &replacement,
+    ClientPreferenceSnapshot *observedChanged);
 static void LoadPinnedClients();
-static bool SavePinnedClients();
+static bool SavePinnedClients(
+    const std::vector<std::wstring> *expectedOriginal = nullptr,
+    ClientPreferenceSnapshot *observedChanged = nullptr);
 static void PrunePinnedClients();
 static bool IsClientPinned(const std::wstring &clientName);
 static void LoadArchivedClients();
-static bool SaveArchivedClients();
+static bool SaveArchivedClients(
+    const std::vector<std::wstring> *expectedOriginal = nullptr,
+    ClientPreferenceSnapshot *observedChanged = nullptr);
 static void PruneArchivedClients();
 static bool IsClientArchived(const std::wstring &clientName);
 static void LoadRestoreTabsPreferences();
-static bool SaveRestoreTabsPreferences();
+static bool SaveRestoreTabsPreferences(
+    const std::vector<std::wstring> *expectedOriginal = nullptr,
+    ClientPreferenceSnapshot *observedChanged = nullptr);
 static void PruneRestoreTabsPreferences();
 static bool ShouldRestoreTabsForClient(const std::wstring &clientName,
                                        BrowserKind browser);
 static BrowserKind GetBrowserForCurrentSelection();
 static void UpdateRestoreTabsToggleState();
 static void ToggleRestoreTabsForSelectedClient();
+static void LoadGlobalTabLayoutPreference();
+static bool IsGlobalTabLayoutCommand(UINT command);
+static bool IsClientTabLayoutCommand(UINT command);
+static bool SetGlobalTabLayoutPreference(client_tab_layout::Layout layout);
+static bool SetClientTabLayoutPreference(
+    const std::wstring &clientName, client_tab_layout::Override choice);
+static bool ApplyBrowserTabLayoutPreference(
+    const fs::path &profilePath, BrowserKind browser,
+    client_tab_layout::Layout layout, std::wstring &errorDetails);
 static void UpdatePinButtonState();
 static void ToggleSelectedClientPin();
 static bool SelectPinnedClient(const std::wstring &clientName);
@@ -634,7 +697,7 @@ static bool OpenWebUrlForClient(const std::wstring &clientName,
                                 bool fromNotes = false);
 static std::optional<std::wstring> GetClipboardWebUrl();
 static void ShowPinnedClientOptionsMenu(HWND hWnd,
-                                        const std::wstring &clientName,
+                                        std::wstring clientName,
                                         POINT screenPoint);
 static bool CreateClientDesktopShortcut(const std::wstring &clientName,
                                          std::optional<BrowserKind> browser,
@@ -652,9 +715,11 @@ static void RefreshQuickTourPlacement();
 static void UpdateGuideIndicators();
 static bool RenameClientProfile(const std::wstring &oldName,
                                 const std::wstring &newName,
-                                std::wstring &errorMessage);
+                                std::wstring &errorMessage,
+                                client_deletion_safety::BoundTree *originalNamespace = nullptr);
 static bool ArchiveClientProfile(const std::wstring &clientName,
-                                 std::wstring &errorMessage);
+                                 std::wstring &errorMessage,
+                                 client_deletion_safety::BoundTree *originalNamespace = nullptr);
 static void GuiRenameClient();
 static void GuiArchiveClient();
 static void ShowArchivedClientsMenu(HWND hWnd);
@@ -823,11 +888,12 @@ public:
         break;
       if (params.finished)
         break;
-      if (msg.message == WM_KEYDOWN && msg.wParam == VK_ESCAPE) {
+      const bool inputTarget = msg.hwnd == hWnd || IsChild(hWnd, msg.hwnd);
+      if (inputTarget && msg.message == WM_KEYDOWN && msg.wParam == VK_ESCAPE) {
         DestroyWindow(hWnd);
         break;
       }
-      if (msg.message == WM_KEYDOWN && msg.wParam == VK_RETURN) {
+      if (inputTarget && msg.message == WM_KEYDOWN && msg.wParam == VK_RETURN) {
         HWND hFocus = GetFocus();
         const int command =
             hFocus == GetDlgItem(hWnd, IDCANCEL) ? IDCANCEL : IDOK;
@@ -837,13 +903,19 @@ public:
           break;
         continue;
       }
-      if (!IsDialogMessage(hWnd, &msg)) {
+      if (!inputTarget || !IsDialogMessage(hWnd, &msg)) {
         TranslateMessage(&msg);
         DispatchMessage(&msg);
       }
       if (!IsWindow(hWnd))
         break; // Window closed
     }
+
+    // A quit/error can end the message loop without a window-close command.
+    // Retire this window while its stack-owned InputParams is still alive.
+    if (IsWindow(hWnd) &&
+        GetWindowLongPtrW(hWnd, GWLP_USERDATA) == reinterpret_cast<LONG_PTR>(&params))
+      DestroyWindow(hWnd);
 
     if (owner) {
       EnableWindow(owner, TRUE);
@@ -1425,6 +1497,8 @@ static void UpdateIconPreviewForSelection(bool preferListSelection = false);
 static void BuildSessionTabRects(HWND hWnd, HDC hdc);
 static void DrawSessionTabs(HWND hWnd, HDC hdc);
 static void DrawPinnedClients(HDC hdc);
+static void PaintMainClient(HWND hWnd, HDC target);
+static void UpdateMainHover(HWND hWnd, int pinned, bool overflow, bool browser);
 static void BuildPinnedClientRects();
 static int HitTestPinnedClient(POINT point);
 static bool HitTestPinnedOverflow(POINT point);
@@ -1897,6 +1971,72 @@ static void DrawMainSurface(HDC hdc) {
   SelectObject(hdc, oldFont);
 }
 
+static void UpdateMainHover(HWND hWnd, int pinned, bool overflow, bool browser) {
+  // The launcher paints these items itself. Only the old and new hot items
+  // need new pixels; a pin hover must not erase the footer or other pins.
+  if (pinned != g_iHotPinnedClient) {
+    for (const int index : {g_iHotPinnedClient, pinned}) {
+      if (index >= 0 && index < static_cast<int>(g_pinnedClientRects.size()))
+        InvalidateRect(hWnd, &g_pinnedClientRects[index], FALSE);
+    }
+    g_iHotPinnedClient = pinned;
+  }
+  if (overflow != g_bHotPinnedOverflow) {
+    InvalidateRect(hWnd, &g_rcPinnedOverflow, FALSE);
+    g_bHotPinnedOverflow = overflow;
+  }
+  if (browser != g_bHotBrowserSelector) {
+    // GDI+ antialiasing reaches the adjacent physical pixel at the rounded
+    // outline. Include that fringe so a hover transition cannot leave pixels
+    // from the previous border just outside the logical selector rectangle.
+    RECT dirty=g_rcBrowserSelector;
+    InflateRect(&dirty,1,1);
+    InvalidateRect(hWnd, &dirty, FALSE);
+    g_bHotBrowserSelector = browser;
+  }
+}
+
+static void PaintMainClient(HWND hWnd, HDC target) {
+  if (!target)
+    return;
+  RECT area{};
+  if (!GetClientRect(hWnd, &area) || area.right <= 0 || area.bottom <= 0)
+    return;
+
+  // Keep the target's update/child clipping. Build each complete dirty band
+  // away from the screen, then present it once instead of exposing the erase
+  // between hover states. Do not perform pinned icon I/O for unrelated paints.
+  const bool utilityVisible = RectVisible(target, &g_rcUtilityBar) != FALSE;
+  const bool tabsVisible = RectVisible(target, &g_rcSessionTabs) != FALSE;
+  const bool pinnedVisible = RectVisible(target, &g_rcPinnedArea) != FALSE;
+  HDC memory = CreateCompatibleDC(target);
+  HBITMAP bitmap = memory ? CreateCompatibleBitmap(target, area.right, area.bottom) : nullptr;
+  HGDIOBJ previous = bitmap ? SelectObject(memory, bitmap) : nullptr;
+  const bool buffered = previous && previous != HGDI_ERROR;
+  HDC dc = buffered ? memory : target;
+
+  const auto paint = [&](HDC surface) {
+    FillRect(surface, &area, g_hbrThemeWindow ? g_hbrThemeWindow
+                                           : GetSysColorBrush(COLOR_BTNFACE));
+    if (utilityVisible)
+      DrawMainSurface(surface);
+    if (tabsVisible)
+      DrawSessionTabs(hWnd, surface);
+    if (pinnedVisible)
+      DrawPinnedClients(surface);
+  };
+  paint(dc);
+  if (buffered) {
+    if (!BitBlt(target, 0, 0, area.right, area.bottom, memory, 0, 0, SRCCOPY))
+      paint(target);
+    SelectObject(memory, previous);
+  }
+  if (bitmap)
+    DeleteObject(bitmap);
+  if (memory)
+    DeleteDC(memory);
+}
+
 static void ApplyThemeToWindow(HWND hWnd) {
   if (!hWnd || !IsWindow(hWnd))
     return;
@@ -2029,6 +2169,8 @@ static void RebuildConfigMenuForTheme(HWND hWnd) {
   HMENU hOldMenu = g_hConfigMenu;
   g_hConfigMenu = nullptr;
   g_hBrowserSubMenu = nullptr;
+  g_hGlobalTabLayoutMenu = nullptr;
+  g_hClientTabLayoutMenu = nullptr;
   DestroyMenu(hOldMenu);
 
   for (auto hBitmap : g_menuBitmaps) {
@@ -2040,9 +2182,9 @@ static void RebuildConfigMenuForTheme(HWND hWnd) {
   EnsureConfigMenu(hWnd);
 }
 
-static void ApplyTheme(int iMode, bool bPreview) {
+static bool ApplyTheme(int iMode, bool bPreview, bool persist = true) {
   if (g_bThemeApplyInProgress)
-    return;
+    return false;
   g_bThemeApplyInProgress = true;
   struct ThemeApplyReset {
     bool &flag;
@@ -2052,8 +2194,12 @@ static void ApplyTheme(int iMode, bool bPreview) {
   const int iNormalized = NormalizeThemeMode(iMode);
 
   if (!bPreview) {
+    const int previousMode = g_iThemeMode;
     g_iThemeMode = iNormalized;
-    SaveThemePreference();
+    if (persist && !SaveThemePreference()) {
+      g_iThemeMode = previousMode;
+      return false;
+    }
   }
 
   iMode = iNormalized;
@@ -2094,6 +2240,7 @@ static void ApplyTheme(int iMode, bool bPreview) {
     }
     UpdateIconPreviewForSelection(true);
   }
+  return true;
 }
 
 static HBRUSH HandleThemeCtlColor(UINT msg, HDC hdc, HWND hCtl) {
@@ -2416,6 +2563,17 @@ static void DrawThemedComboFrame(HWND hCombo) {
   ReleaseDC(hCombo, hdc);
 }
 
+static LRESULT CALLBACK ClientEditSurfaceSubclassProc(HWND hWnd, UINT msg,
+    WPARAM wParam, LPARAM lParam, UINT_PTR id, DWORD_PTR) {
+  // Owner drawing supplies the entire selector surface. Erasing it separately
+  // exposes a blank field when focus moves from the launcher into Notes.
+  if (msg == WM_ERASEBKGND)
+    return 1;
+  if (msg == WM_NCDESTROY)
+    RemoveWindowSubclass(hWnd, ClientEditSurfaceSubclassProc, id);
+  return DefSubclassProc(hWnd, msg, wParam, lParam);
+}
+
 static LRESULT CALLBACK ClientEditSubclassProc(HWND hWnd, UINT msg,
                                                 WPARAM wParam, LPARAM lParam,
                                                 UINT_PTR uIdSubclass,
@@ -2428,7 +2586,9 @@ static LRESULT CALLBACK ClientEditSubclassProc(HWND hWnd, UINT msg,
     if (hWnd == g_hClientEdit && g_hComboClient) {
       const bool dropped =
           SendMessageW(g_hComboClient, CB_GETDROPPEDSTATE, 0, 0) != 0;
-      if (wParam == VK_F4 ||
+      // Alt+F4 belongs to the top-level window, even while this edit has focus.
+      if ((wParam == VK_F4 && msg == WM_KEYDOWN &&
+           !(GetKeyState(VK_MENU) & 0x8000)) ||
           (wParam == VK_DOWN && (GetKeyState(VK_MENU) & 0x8000))) {
         g_bClientListNavigated = false;
         if (dropped)
@@ -2483,11 +2643,11 @@ static LRESULT CALLBACK ClientEditSubclassProc(HWND hWnd, UINT msg,
       RedrawWindow(g_hComboClient, nullptr, nullptr,
                    RDW_INVALIDATE | RDW_FRAME);
     if (g_hBtnClientIcon)
-      InvalidateRect(g_hBtnClientIcon, nullptr, TRUE);
+      InvalidateRect(g_hBtnClientIcon, nullptr, FALSE);
     if (g_hBtnClientDrop)
-      InvalidateRect(g_hBtnClientDrop, nullptr, TRUE);
+      InvalidateRect(g_hBtnClientDrop, nullptr, FALSE);
     if (g_hClientEditSurface)
-      InvalidateRect(g_hClientEditSurface, nullptr, TRUE);
+      InvalidateRect(g_hClientEditSurface, nullptr, FALSE);
     return result;
   }
   default:
@@ -2524,13 +2684,13 @@ static LRESULT CALLBACK ComboThemeSubclassProc(HWND hWnd, UINT msg,
   case WM_KILLFOCUS:
   case WM_ENABLE: {
     LRESULT lRes = DefSubclassProc(hWnd, msg, wParam, lParam);
-    InvalidateRect(hWnd, nullptr, TRUE);
+    InvalidateRect(hWnd, nullptr, FALSE);
     if (hWnd == g_hComboClient && g_hBtnClientDrop)
-      InvalidateRect(g_hBtnClientDrop, nullptr, TRUE);
+      InvalidateRect(g_hBtnClientDrop, nullptr, FALSE);
     if (hWnd == g_hComboClient && g_hBtnClientIcon)
-      InvalidateRect(g_hBtnClientIcon, nullptr, TRUE);
+      InvalidateRect(g_hBtnClientIcon, nullptr, FALSE);
     if (hWnd == g_hComboClient && g_hClientEditSurface)
-      InvalidateRect(g_hClientEditSurface, nullptr, TRUE);
+      InvalidateRect(g_hClientEditSurface, nullptr, FALSE);
     return lRes;
   }
   case CB_SHOWDROPDOWN: {
@@ -3081,8 +3241,8 @@ static void DrawThemedButtonCore(HDC hdc, const RECT &rc, int iId,
                                  UINT itemState, HWND hWndItem) {
   const bool bDisabled = (itemState & ODS_DISABLED) != 0;
   const bool bPressed = (itemState & ODS_SELECTED) != 0;
-  const bool bHot =
-      (itemState & ODS_HOTLIGHT) != 0 || (hWndItem && hWndItem == g_hHotButton);
+  const bool bHot = !bDisabled &&
+      ((itemState & ODS_HOTLIGHT) != 0 || (hWndItem && hWndItem == g_hHotButton));
   const bool bFocus = (itemState & ODS_FOCUS) != 0;
   const LRESULT defaultId = hWndItem ? SendMessageW(GetParent(hWndItem), DM_GETDEFID, 0, 0) : 0;
   const bool bDefault = (itemState & ODS_DEFAULT) != 0 ||
@@ -3108,10 +3268,12 @@ static void DrawThemedButtonCore(HDC hdc, const RECT &rc, int iId,
   }
 
   if (bHot) {
+    const COLORREF restingFill = crFill;
     crFill = bPrimary ? TintColor(crFill, g_bThemeIsDark ? 10 : -8)
                       : g_themeColors.crControlHot;
-    if (bUtility)
-      crBorder = g_themeColors.crAccent;
+    if (!bPrimary && crFill == restingFill)
+      crFill = TintColor(restingFill, g_bThemeIsDark ? 8 : -8);
+    crBorder = g_themeColors.crAccent;
   }
   if (bPressed) {
     crFill = TintColor(crFill, g_bThemeIsDark ? -12 : -12);
@@ -3296,8 +3458,7 @@ static void DrawRestoreTabsToggle(HDC hdc, const RECT &rc, UINT itemState,
   }
 }
 
-static void DrawOwnerDrawItem(const DRAWITEMSTRUCT &ds) {
-  if (ds.CtlType == ODT_STATIC && ds.CtlID == IDC_CLIENT_EDIT_SURFACE) {
+static void DrawClientEditSurfaceCore(const DRAWITEMSTRUCT &ds) {
     const bool focused = IsClientSelectorFocused();
     const bool disabled = !g_hClientEdit || !IsWindowEnabled(g_hClientEdit);
     COLORREF fill = g_themeColors.crControl;
@@ -3323,6 +3484,36 @@ static void DrawOwnerDrawItem(const DRAWITEMSTRUCT &ds) {
                   ds.rcItem.right, ds.rcItem.bottom};
     DrawClientIconTile(ds.hwndItem, ds.hDC);
     DrawModernComboChevron(ds.hDC, dropZone, text, dpi);
+}
+
+static void DrawClientEditSurface(const DRAWITEMSTRUCT &ds) {
+  const int width=ds.rcItem.right-ds.rcItem.left;
+  const int height=ds.rcItem.bottom-ds.rcItem.top;
+  if (!ds.hDC || width<=0 || height<=0)
+    return;
+  HDC memory=CreateCompatibleDC(ds.hDC);
+  HBITMAP bitmap=memory ? CreateCompatibleBitmap(ds.hDC,width,height) : nullptr;
+  HGDIOBJ previous=bitmap ? SelectObject(memory,bitmap) : nullptr;
+  const bool selected=previous && previous!=HGDI_ERROR;
+  const bool buffered=selected && SetViewportOrgEx(memory,-ds.rcItem.left,-ds.rcItem.top,nullptr);
+  DRAWITEMSTRUCT finished=ds;
+  if (buffered)
+    finished.hDC=memory;
+  DrawClientEditSurfaceCore(finished);
+  if (buffered && !BitBlt(ds.hDC,ds.rcItem.left,ds.rcItem.top,width,height,
+                           memory,ds.rcItem.left,ds.rcItem.top,SRCCOPY))
+    DrawClientEditSurfaceCore(ds);
+  if (selected)
+    SelectObject(memory,previous);
+  if (bitmap)
+    DeleteObject(bitmap);
+  if (memory)
+    DeleteDC(memory);
+}
+
+static void DrawOwnerDrawItem(const DRAWITEMSTRUCT &ds) {
+  if (ds.CtlType == ODT_STATIC && ds.CtlID == IDC_CLIENT_EDIT_SURFACE) {
+    DrawClientEditSurface(ds);
     return;
   }
 
@@ -3467,11 +3658,16 @@ static void DrawOwnerDrawItem(const DRAWITEMSTRUCT &ds) {
 }
 
 struct _7zUiCtx {
+  std::mutex progressMutex;
   HWND mainWnd = nullptr;
   std::wstring status;
   int lastPercent = -999;
   ULONGLONG lastTick = 0;
-  bool sentMarquee = false;
+  ULONGLONG startedTick = GetTickCount64();
+  bool hasDetailedPhase = false;
+  _7zProgressPhase detailedPhase = _7zProgressPhase::Preparing;
+  unsigned long long detailedBytes = 0;
+  unsigned long long detailedItems = 0;
 };
 
 struct AboutDlgState {
@@ -3484,20 +3680,9 @@ static void __stdcall _7zProgress(void *user, _7zOp op, unsigned int percent,
   auto *ctx = reinterpret_cast<_7zUiCtx *>(user);
   if (!ctx || !ctx->mainWnd || !IsWindow(ctx->mainWnd))
     return;
-
-  // Unknown progress -> marquee once.
-  if (percent < 0) {
-    if (!ctx->sentMarquee) {
-      ctx->sentMarquee = true;
-      ctx->lastPercent = -1;
-      ctx->lastTick = GetTickCount64();
-      ProgressUI_PostUpdate(ctx->mainWnd, ctx->status, -1);
-    }
-    return;
-  }
-
-  if (percent < 0)
-    percent = 0;
+  std::lock_guard<std::mutex> lock(ctx->progressMutex);
+  // Legacy callbacks are explicitly 0..100. Detailed reports carry unknown
+  // totals separately instead of comparing an unsigned percent with zero.
   if (percent > 100)
     percent = 100;
 
@@ -3514,7 +3699,56 @@ static void __stdcall _7zProgress(void *user, _7zOp op, unsigned int percent,
   ProgressUI_PostUpdate(ctx->mainWnd, ctx->status, percent);
 }
 
+static void __stdcall BackupDetailedProgress(void *user,
+                                             const _7zProgressInfo &reported) {
+  auto *ctx = static_cast<_7zUiCtx *>(user);
+  if (!ctx || !ctx->mainWnd || !IsWindow(ctx->mainWnd)) return;
+  std::lock_guard<std::mutex> lock(ctx->progressMutex);
+  if(ctx->hasDetailedPhase && reported.phase<ctx->detailedPhase)return;
+  const bool changed=!ctx->hasDetailedPhase || reported.phase!=ctx->detailedPhase;
+  const auto now=GetTickCount64();
+  if(!changed && now-ctx->lastTick<100 &&
+      !(reported.totalKnown && reported.totalBytes && reported.completedBytes>=reported.totalBytes))return;
+  _7zProgressInfo info=reported;
+  if(changed){ctx->detailedBytes=0;ctx->detailedItems=0;}
+  ctx->detailedBytes=(std::max)(ctx->detailedBytes,info.completedBytes);
+  ctx->detailedItems=(std::max)(ctx->detailedItems,info.processedItems);
+  info.completedBytes=ctx->detailedBytes;info.processedItems=ctx->detailedItems;
+  ctx->hasDetailedPhase=true;ctx->detailedPhase=info.phase;ctx->lastTick=now;
+  const auto presentation=FormatBackupProgress(info,now-ctx->startedTick);
+  ProgressUI_PostUpdate(ctx->mainWnd,presentation.title,presentation.percent,
+                       presentation.details);
+}
+
 ActiveProfileMap g_activeProfiles;
+
+static std::shared_ptr<void> RetainLaunchedProcess(HANDLE process, DWORD pid) {
+  if (!process || process == INVALID_HANDLE_VALUE || !pid ||
+      GetProcessId(process) != pid)
+    return {};
+  HANDLE retained = nullptr;
+  if (!DuplicateHandle(GetCurrentProcess(), process, GetCurrentProcess(),
+                        &retained, 0, FALSE, DUPLICATE_SAME_ACCESS))
+    return {};
+  return std::shared_ptr<void>(retained,
+      [](void *handle) { CloseHandle(handle); });
+}
+
+static std::shared_ptr<void> GetTrackedProfileProcess(DWORD pid) {
+  std::shared_ptr<void> process;
+  {
+    std::lock_guard<std::mutex> lock(g_activeProfilesMutex);
+    for (const auto &[key, active] : g_activeProfiles) {
+      if (active.pid == pid) {
+        process = active.process;
+        break;
+      }
+    }
+  }
+  if (!process || GetProcessId(process.get()) != pid)
+    return {};
+  return process;
+}
 
 void GuiProfOpen();
 void GuiSetIcon();
@@ -3532,9 +3766,11 @@ void SetUiState(bool enabled);
 bool ExtractResourceToFile(UINT resourceID, const fs::path &destPath,
                            bool overwrite = false);
 bool EnsureBundledDefaultTemplate();
-bool extDef(const fs::path &profileDataPath, const wchar_t *statusText);
+bool extDef(const fs::path &profileDataPath, const wchar_t *statusText,
+            const std::shared_ptr<transient_profile::Identity> &reservation = {});
 bool SetBrowserStartupPreference(const fs::path &profilePath,
-                                 bool restoreTabs);
+                                 bool restoreTabs,
+                                 std::wstring *errorDetails = nullptr);
 bool ClearBrowserStartupState(const fs::path &profilePath);
 bool PrepareFreshProfileState(const fs::path &profilePath);
 bool SetWindowAppId(HWND hWnd, const std::wstring &appId,
@@ -3563,7 +3799,8 @@ static void StopReaperThreads();
 static void ReaperThread(DWORD pid, std::wstring clientName,
                          BrowserKind browser, ProfileType type,
                          HANDLE processHandle);
-static void HandleClosedDefaultProfile();
+static void HandleClosedDefaultProfile(
+    const std::shared_ptr<transient_profile::Identity> &directory = {});
 static bool HandleProfileExitOnUiThread(const ProfileExitPayload &payload);
 static bool PostProfileExitMessage(DWORD pid,
                                    const std::wstring &clientName,
@@ -3577,7 +3814,8 @@ DWORD LaunchProfile(const std::wstring &clientName, bool isTemp,
                     fs::path *launchedProfilePath = nullptr,
                     fs::path *launchedExecutablePath = nullptr,
                     std::wstring *launchError = nullptr,
-                    bool *freshTransientProfile = nullptr);
+                    bool *freshTransientProfile = nullptr,
+                    std::shared_ptr<transient_profile::Identity> *createdDirectory = nullptr);
 bool FindBrowsers();
 void RequestCloseAllProfiles();
 std::wstring GetExeVersion(const fs::path &filePath);
@@ -3592,6 +3830,9 @@ static bool IsClientActiveAnyBrowser(const std::wstring &clientName);
 static ProfileUseState ProbeClientProfilesInUse(
     const std::wstring &clientName, std::wstring &errorDetails,
     const CleanupScanCancellation *cancellation = nullptr);
+static std::optional<std::vector<std::wstring>> ChooseBackupClients(const fs::path &sourceDir);
+static bool ProbeBackupSelectionClosed(const std::vector<std::wstring> &selected,
+                                       std::wstring &errorDetails);
 static ProfileUseState ProbeExactBrowserProfileInUse(
     const fs::path &profilePath, std::wstring &errorDetails);
 static ProfileUseState ProbeAnySitesProfileInUse(std::wstring &errorDetails);
@@ -3665,12 +3906,18 @@ static void SetClientInputText(const std::wstring &text) {
   const HWND clientEdit = g_hClientEdit;
   if (!clientEdit)
     return;
-  if (GetClientInputText() == text)
+  const bool valid = std::all_of(text.begin(), text.end(), IsValidFilenameChar);
+  if (GetClientInputText() == text) {
+    if (valid)
+      g_sLastValidComboText = text;
     return;
+  }
   const bool wasSyncing = g_bSyncingClientInput;
   g_bSyncingClientInput = true;
-  SetWindowTextW(clientEdit, text.c_str());
+  const bool changed = SetWindowTextW(clientEdit, text.c_str()) != FALSE;
   g_bSyncingClientInput = wasSyncing;
+  if (changed && valid && GetClientInputText() == text)
+    g_sLastValidComboText = text;
 }
 
 static bool SyncClientInputFromComboSelection(bool selectAll) {
@@ -3832,13 +4079,13 @@ static bool HideLauncherInTray(HWND window) {
 }
 static void LauncherTrayMenu(HWND window) {
   HMENU menu=CreatePopupMenu();if (!menu) return;
-  AppendMenuW(menu,MF_STRING,1,L"Show ctSpaces");
-  AppendMenuW(menu,MF_SEPARATOR,0,nullptr);AppendMenuW(menu,MF_STRING,2,L"Exit ctSpaces");
+  AppendMenuW(menu,MF_STRING,1,L"Show launcher");
+  AppendMenuW(menu,MF_SEPARATOR,0,nullptr);AppendMenuW(menu,MF_STRING,2,L"Exit ctSpaces and Notes");
   POINT point{};GetCursorPos(&point);SetForegroundWindow(window);
   const UINT action=TrackThemedNotesMenu(menu,TPM_RETURNCMD|TPM_RIGHTBUTTON,point.x,point.y,window);
   DestroyMenu(menu);PostMessageW(window,WM_NULL,0,0);
   if (action==1) ShowLauncherForeground(window);
-  else if (action==2) {ShowLauncherForeground(window);PostMessageW(window,WM_CLOSE,0,0);}
+  else if (action==2) {ShowLauncherForeground(window);PostMessageW(window,WM_APP_EXIT_CTSPACES,0,0);}
 }
 static std::optional<int>
 GetExistingInstanceExitCode(const fs::path &currentExePath,
@@ -4441,6 +4688,12 @@ static bool RemoveNestedCacheDirectory(const fs::path &profileRoot,
   if (!IsStrictChildPath(target, profileRoot))
     return false;
 
+  // Bind this cache and its ancestors before the attribute-only preflight.
+  // A different profile moved into the same cache name must never be cleaned.
+  client_deletion_safety::BoundTree originalCache;
+  std::wstring cacheError;
+  const bool captured = originalCache.CaptureNamespace(target, cacheError);
+
   fs::path current = profileRoot;
   for (const auto &part : relativePath) {
     current /= part;
@@ -4457,9 +4710,8 @@ static bool RemoveNestedCacheDirectory(const fs::path &profileRoot,
     }
   }
 
-  std::error_code removeError;
-  fs::remove_all(target, removeError);
-  if (removeError)
+  if (!captured || !originalCache.CaptureContents(cacheError) ||
+      !originalCache.RemoveRemaining(cacheError))
     return false;
   std::error_code existsError;
   removed = !fs::exists(target, existsError) && !existsError;
@@ -4483,18 +4735,37 @@ static fs::path GetCurrentExecutablePath() {
   return {};
 }
 
+static std::optional<std::wstring> FindStartupArgument(
+    const std::wstring &arguments,std::wstring_view option,bool takesValue=true) {
+  const std::wstring commandLine=L"ctSpaces.exe "+arguments;
+  int count=0;LPWSTR *values=CommandLineToArgvW(commandLine.c_str(),&count);
+  if (!values) return std::nullopt;
+  struct ArgumentCleanup {LPWSTR *values;~ArgumentCleanup(){LocalFree(values);}} cleanup{values};
+  for (int i=1;i<count;++i) {
+    const std::wstring_view argument(values[i]);
+    // These values belong to the client request even when their text happens
+    // to look like an internal startup option. Never scan inside that value.
+    if (!_wcsicmp(values[i],L"--client") || !_wcsicmp(values[i],L"--url") || !_wcsicmp(values[i],L"--browser")) {
+      if (i+1<count) ++i;
+      continue;
+    }
+    if (!takesValue && argument==option) return std::wstring{};
+    if (takesValue && argument.size()>option.size() && argument.starts_with(option) && argument[option.size()]==L'=')
+      return std::wstring(argument.substr(option.size()+1));
+  }
+  return std::nullopt;
+}
+
 static void WaitForPreviousLauncher(const wchar_t *commandLine) {
   if (!commandLine || !*commandLine)
     return;
 
-  std::wsmatch match;
-  const std::wstring arguments(commandLine);
-  const std::wregex waitPattern(LR"((?:^|\s)--wait-for-pid=(\d+)(?:\s|$))");
-  if (!std::regex_search(arguments, match, waitPattern) || match.size() < 2)
+  const auto value=FindStartupArgument(commandLine,L"--wait-for-pid");
+  if (!value || value->empty() || !std::all_of(value->begin(),value->end(),[](wchar_t c){return c>=L'0' && c<=L'9';}))
     return;
 
   try {
-    const DWORD processId = (DWORD)std::stoul(match[1].str());
+    const DWORD processId = (DWORD)std::stoul(*value);
     if (processId == 0 || processId == GetCurrentProcessId())
       return;
 
@@ -4545,19 +4816,16 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE,
   }
   g_sExeDir = currentExePath.parent_path();
 
-  std::wsmatch qaInstanceMatch;
   const std::wstring commandLine(lpCmdLine ? lpCmdLine : L"");
-  const std::wregex qaInstancePattern(
-      LR"((?:^|\s)--qa-instance=([A-Za-z0-9_-]{1,40})(?:\s|$))");
+  const auto qaInstanceValue=FindStartupArgument(commandLine,L"--qa-instance");
   const bool isQaInstance =
-      std::regex_search(commandLine, qaInstanceMatch, qaInstancePattern) &&
-      qaInstanceMatch.size() > 1;
+      qaInstanceValue && std::regex_match(*qaInstanceValue,std::wregex(LR"([A-Za-z0-9_-]{1,40})"));
   g_bQaInstance = isQaInstance;
 
   std::wstring mutexName =
       L"Local\\{E19C159D-62C3-4412-A0A3-1A55A67C8C56}";
   if (isQaInstance)
-    mutexName += L"-QA-" + qaInstanceMatch[1].str();
+    mutexName += L"-QA-" + *qaInstanceValue;
   SetLastError(ERROR_SUCCESS);
   HANDLE hMutex = CreateMutexW(NULL, TRUE, mutexName.c_str());
   if (!hMutex) {
@@ -4605,20 +4873,15 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE,
     CoTaskMemFree(path);
 
   if (isQaInstance) {
-    std::wsmatch qaDataMatch;
-    const std::wregex qaDataPattern(
-        LR"QA((?:^|\s)--qa-data-dir=(?:"([^"]+)"|([^\s]+))(?:\s|$))QA");
-    if (!std::regex_search(commandLine, qaDataMatch, qaDataPattern)) {
+    const auto qaDataValue=FindStartupArgument(commandLine,L"--qa-data-dir");
+    if (!qaDataValue || qaDataValue->empty()) {
       MessageBoxW(nullptr,
                   L"A QA instance requires an explicit isolated "
                    L"--qa-data-dir folder.",
                    L"Missing QA Data Folder", MB_OK | MB_ICONERROR);
       return 1;
     }
-    const std::wstring qaDataValue = qaDataMatch[1].matched
-                                         ? qaDataMatch[1].str()
-                                         : qaDataMatch[2].str();
-    const fs::path qaDataPath(qaDataValue);
+    const fs::path qaDataPath(*qaDataValue);
     if (!qaDataPath.is_absolute() ||
         !IsStrictChildPath(qaDataPath, g_sExeDir)) {
       MessageBoxW(nullptr,
@@ -4629,15 +4892,8 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE,
     }
     g_sDataDir = NormalizePathForScope(qaDataPath);
 
-    std::wsmatch qaShortcutMatch;
-    const std::wregex qaShortcutPattern(
-        LR"QA((?:^|\s)--qa-shortcut-dir=(?:"([^"]+)"|([^\s]+))(?:\s|$))QA");
-    if (std::regex_search(commandLine, qaShortcutMatch,
-                          qaShortcutPattern)) {
-      const std::wstring qaShortcutValue = qaShortcutMatch[1].matched
-                                               ? qaShortcutMatch[1].str()
-                                               : qaShortcutMatch[2].str();
-      const fs::path qaShortcutPath(qaShortcutValue);
+    if (const auto qaShortcutValue=FindStartupArgument(commandLine,L"--qa-shortcut-dir")) {
+      const fs::path qaShortcutPath(*qaShortcutValue);
       if (!qaShortcutPath.is_absolute() ||
           !IsStrictChildPath(qaShortcutPath, g_sExeDir)) {
         MessageBoxW(nullptr,
@@ -4655,8 +4911,7 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE,
   }
 
   const bool qaGuideStartup =
-      std::regex_search(commandLine,
-                        std::wregex(LR"((?:^|\s)--qa-guide-startup(?:\s|$))"));
+      FindStartupArgument(commandLine,L"--qa-guide-startup",false).has_value();
   const bool freshGuideCandidate =
       guided_walkthrough::IsFreshDataFolder(g_sDataDir);
 
@@ -4692,6 +4947,7 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE,
     LoadClientTitlePreference();
     g_minimizeToTray=GetPrivateProfileIntW(L"user",L"minimize_to_tray",0,g_sConfigPath.c_str())!=0;
     LoadBrowserPreference();
+    LoadGlobalTabLayoutPreference();
     LoadArchivedClients();
     LoadPinnedClients();
     LoadRestoreTabsPreferences();
@@ -5011,6 +5267,8 @@ BOOL InitInstance(HINSTANCE hInstance, int nCmdShow) {
       ScaleByDpi(1, dpi), ScaleByDpi(1, dpi), ScaleByDpi(100, dpi),
       ScaleByDpi(34, dpi), g_hGui,
       (HMENU)(INT_PTR)IDC_CLIENT_EDIT_SURFACE, hInstance, nullptr);
+  if (g_hClientEditSurface)
+    SetWindowSubclass(g_hClientEditSurface, ClientEditSurfaceSubclassProc, 1, 0);
   g_hClientEdit = CreateWindowExW(
       0, L"EDIT", L"",
       WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS | WS_TABSTOP | ES_AUTOHSCROLL,
@@ -5216,7 +5474,7 @@ BOOL InitInstance(HINSTANCE hInstance, int nCmdShow) {
   LayoutClientComboChildren(g_hComboClient);
   UpdateClientsComboBox();
   UpdateCloseAllButtonState();
-  ApplyTheme(g_iThemeMode, false);
+  ApplyTheme(g_iThemeMode, false, false);
   FocusClientEdit();
   ShowWindow(g_hGui, nCmdShow);
   if (IsWindowVisible(g_hGui) && !IsIconic(g_hGui)) ShowLauncherForeground(g_hGui);
@@ -5295,7 +5553,9 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam,
         return 0;
       }
       if (wmEvent == EN_KILLFOCUS) {
-        UpdateIconPreviewForSelection(false);
+        // Input changes and accepted selections already update the preview.
+        // A focus transition only changes the selector outline; do not reload
+        // its icon and synchronously repaint neighboring controls here.
         return 0;
       }
     } else if (wmId == IDC_CLIENT_EDIT_SURFACE &&
@@ -5357,7 +5617,6 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam,
         return 0;
       }
       if (wmEvent == CBN_KILLFOCUS) {
-        UpdateIconPreviewForSelection(false);
         return 0;
       }
     } else if (wmId == IDOK) {
@@ -5431,6 +5690,22 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam,
       if (SaveConfigMutations(L"minimize-to-tray preference",{{L"user",std::wstring(L"minimize_to_tray"),std::wstring(next ? L"1" : L"0")}}))
         g_minimizeToTray=next;
       UpdateConfigMenuEnabledState();
+    } else if (IsGlobalTabLayoutCommand(wmId)) {
+      const auto layout = wmId == IDM_TAB_LAYOUT_GLOBAL_VERTICAL
+                              ? client_tab_layout::Layout::Vertical
+                          : wmId == IDM_TAB_LAYOUT_GLOBAL_HORIZONTAL
+                              ? client_tab_layout::Layout::Horizontal
+                              : client_tab_layout::Layout::Browser;
+      SetGlobalTabLayoutPreference(layout);
+      UpdateConfigMenuEnabledState();
+    } else if (IsClientTabLayoutCommand(wmId)) {
+      const auto choice = wmId == IDM_TAB_LAYOUT_CLIENT_VERTICAL
+                              ? client_tab_layout::Override::Vertical
+                          : wmId == IDM_TAB_LAYOUT_CLIENT_HORIZONTAL
+                              ? client_tab_layout::Override::Horizontal
+                              : client_tab_layout::Override::FollowGlobal;
+      SetClientTabLayoutPreference(GetSelectedClientNameSanitized(false), choice);
+      UpdateConfigMenuEnabledState();
     } else if (wmId == IDM_CTX_CLIENT_TITLE_FIRST) {
       const bool previousValue = g_bClientTitleFirst.load();
       g_bClientTitleFirst = !previousValue;
@@ -5453,26 +5728,34 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam,
     } else if (wmId == IDM_ABOUT) {
       ShowAboutDialog();
     } else if (wmId == IDM_BROWSER_EDGE) {
+      const BrowserKind previousBrowser = g_selectedBrowser;
       g_selectedBrowser = BrowserKind::Edge;
-      SaveBrowserPreference();
+      if (!SaveBrowserPreference())
+        g_selectedBrowser = previousBrowser;
       UpdateRestoreTabsToggleState();
       UpdateConfigMenuEnabledState();
       InvalidateRect(g_hGui, &g_rcUtilityBar, TRUE);
     } else if (wmId == IDM_BROWSER_CHROME) {
+      const BrowserKind previousBrowser = g_selectedBrowser;
       g_selectedBrowser = BrowserKind::Chrome;
-      SaveBrowserPreference();
+      if (!SaveBrowserPreference())
+        g_selectedBrowser = previousBrowser;
       UpdateRestoreTabsToggleState();
       UpdateConfigMenuEnabledState();
       InvalidateRect(g_hGui, &g_rcUtilityBar, TRUE);
     } else if (wmId == IDM_BROWSER_BRAVE) {
+      const BrowserKind previousBrowser = g_selectedBrowser;
       g_selectedBrowser = BrowserKind::Brave;
-      SaveBrowserPreference();
+      if (!SaveBrowserPreference())
+        g_selectedBrowser = previousBrowser;
       UpdateRestoreTabsToggleState();
       UpdateConfigMenuEnabledState();
       InvalidateRect(g_hGui, &g_rcUtilityBar, TRUE);
     } else if (wmId == IDM_BROWSER_FIREFOX) {
+      const BrowserKind previousBrowser = g_selectedBrowser;
       g_selectedBrowser = BrowserKind::Firefox;
-      SaveBrowserPreference();
+      if (!SaveBrowserPreference())
+        g_selectedBrowser = previousBrowser;
       UpdateRestoreTabsToggleState();
       UpdateConfigMenuEnabledState();
       InvalidateRect(g_hGui, &g_rcUtilityBar, TRUE);
@@ -5516,28 +5799,13 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam,
         g_bUiEnabled && HitTestPinnedOverflow(point);
     const bool hotBrowser =
         g_bUiEnabled && PtInRect(&g_rcBrowserSelector, point);
-    if (hotPinned != g_iHotPinnedClient ||
-        hotOverflow != g_bHotPinnedOverflow ||
-        hotBrowser != g_bHotBrowserSelector) {
-      g_iHotPinnedClient = hotPinned;
-      g_bHotPinnedOverflow = hotOverflow;
-      g_bHotBrowserSelector = hotBrowser;
-      InvalidateRect(hWnd, &g_rcPinnedArea, TRUE);
-      InvalidateRect(hWnd, &g_rcUtilityBar, FALSE);
-    }
+    UpdateMainHover(hWnd, hotPinned, hotOverflow, hotBrowser);
     TRACKMOUSEEVENT tracking{sizeof(TRACKMOUSEEVENT), TME_LEAVE, hWnd, 0};
     TrackMouseEvent(&tracking);
     return 0;
   }
   case WM_MOUSELEAVE:
-    if (g_iHotPinnedClient >= 0 || g_bHotPinnedOverflow ||
-        g_bHotBrowserSelector) {
-      g_iHotPinnedClient = -1;
-      g_bHotPinnedOverflow = false;
-      g_bHotBrowserSelector = false;
-      InvalidateRect(hWnd, &g_rcPinnedArea, TRUE);
-      InvalidateRect(hWnd, &g_rcUtilityBar, FALSE);
-    }
+    UpdateMainHover(hWnd, -1, false, false);
     return 0;
   case WM_LBUTTONUP: {
     int x = (int)(short)LOWORD(lParam);
@@ -5581,6 +5849,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam,
       const bool savePinnedOrder = g_bPinnedOrderChanged;
       g_mainDragKind = MainDragKind::None;
       g_iMainDragIndex = -1;
+      g_mainDragSessionIdentity = 0;
       g_bMainDragActive = false;
       g_bPinnedOrderChanged = false;
       FinishPinnedDragPersistence(savePinnedOrder);
@@ -5621,12 +5890,13 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam,
   case WM_PAINT: {
     PAINTSTRUCT ps{};
     HDC hdc = BeginPaint(hWnd, &ps);
-    DrawMainSurface(hdc);
-    DrawSessionTabs(hWnd, hdc);
-    DrawPinnedClients(hdc);
+    PaintMainClient(hWnd, hdc);
     EndPaint(hWnd, &ps);
     return 0;
   }
+  case WM_PRINTCLIENT:
+    PaintMainClient(hWnd, reinterpret_cast<HDC>(wParam));
+    return 0;
   case WM_DRAWITEM: {
     const DRAWITEMSTRUCT *vDraw = reinterpret_cast<DRAWITEMSTRUCT *>(lParam);
     if (vDraw) {
@@ -5658,27 +5928,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam,
     return (INT_PTR)HandleThemeCtlColor(message, (HDC)wParam, (HWND)lParam);
   }
   case WM_ERASEBKGND: {
-    HDC hdc = (HDC)wParam;
-    RECT rc{};
-    GetClientRect(hWnd, &rc);
-    const int iSaved = SaveDC(hdc);
-    if (g_hIconPreview) {
-      RECT rcIcon{};
-      GetWindowRect(g_hIconPreview, &rcIcon);
-      MapWindowPoints(nullptr, hWnd, (LPPOINT)&rcIcon, 2);
-      ExcludeClipRect(hdc, rcIcon.left, rcIcon.top, rcIcon.right,
-                      rcIcon.bottom);
-    }
-    if (g_hLblIcon) {
-      RECT rcLbl{};
-      GetWindowRect(g_hLblIcon, &rcLbl);
-      MapWindowPoints(nullptr, hWnd, (LPPOINT)&rcLbl, 2);
-      ExcludeClipRect(hdc, rcLbl.left, rcLbl.top, rcLbl.right, rcLbl.bottom);
-    }
-    FillRect(hdc, &rc,
-             g_hbrThemeWindow ? g_hbrThemeWindow
-                              : (HBRUSH)GetSysColorBrush(COLOR_BTNFACE));
-    RestoreDC(hdc, iSaved);
+    // PaintMainClient supplies the complete background with the decorations.
     return 1;
   }
   case WM_APP_PROGRESS_SHOW: {
@@ -5695,7 +5945,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam,
       if (p->text.empty())
         ProgressUI_Update(p->percent);
       else
-        ProgressUI_Update(p->text, p->percent);
+        ProgressUI_Update(p->text, p->percent,p->details);
       delete p;
     }
     return 0;
@@ -5783,8 +6033,10 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam,
     }
     const std::vector<std::wstring> originalPinnedClients = g_pinnedClients;
     MovePinnedClientForDrag(fromIndex, toIndex);
-    if (!SavePinnedClients()) {
-      g_pinnedClients = originalPinnedClients;
+    ClientPreferenceSnapshot observedChanged;
+    if (!SavePinnedClients(&originalPinnedClients, &observedChanged)) {
+      g_pinnedClients = observedChanged ? std::move(*observedChanged)
+                                       : originalPinnedClients;
       BuildPinnedClientRects();
       InvalidateRect(g_hGui, &g_rcPinnedArea, TRUE);
       g_iMainDragIndex = -1;
@@ -5817,10 +6069,30 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam,
                              (DWORD)std::size(newName),
                              g_sConfigPath.c_str());
     std::wstring errorMessage;
-    return RenameClientProfile(GetSelectedClientNameSanitized(false), newName,
-                               errorMessage)
-               ? TRUE
-               : FALSE;
+    const std::wstring inputName = GetClientInputText();
+    const std::wstring oldName = GetSelectedClientNameSanitized(false);
+    const bool renamed = RenameClientProfile(oldName, newName, errorMessage);
+    // QA-only receipts preserve the exact rejected request and underlying
+    // diagnostic; the test used to discard both when returning a Boolean.
+    try {
+      const std::wstring receipt = std::format(
+          L"tick={} input={} old={} new={} result={} error={}\n",
+          GetTickCount64(), inputName, oldName, newName,
+          renamed ? L"success" : L"failure", errorMessage);
+      const int bytes = WideCharToMultiByte(CP_UTF8, 0, receipt.data(),
+          static_cast<int>(receipt.size()), nullptr, 0, nullptr, nullptr);
+      if (bytes > 0) {
+        std::string utf8(static_cast<size_t>(bytes), '\0');
+        WideCharToMultiByte(CP_UTF8, 0, receipt.data(),
+            static_cast<int>(receipt.size()), utf8.data(), bytes, nullptr, nullptr);
+        std::ofstream output(g_sDataDir / L"qa-client-lifecycle.log",
+                             std::ios::binary | std::ios::app);
+        output.write(utf8.data(), static_cast<std::streamsize>(utf8.size()));
+      }
+    } catch (...) {
+      // Evidence capture must not change the action's success/failure result.
+    }
+    return renamed ? TRUE : FALSE;
   }
   case WM_APP_QA_ARCHIVE_CLIENT: {
     if (!g_bQaInstance)
@@ -5870,7 +6142,10 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam,
     FocusClientEdit();
     if (g_bClosePendingDuringLaunch) {
       g_bClosePendingDuringLaunch = false;
-      PostMessageW(hWnd, WM_CLOSE, 0, 0);
+      const UINT closeMessage = g_bExplicitExitPendingDuringLaunch
+                                    ? WM_APP_EXIT_CTSPACES : WM_CLOSE;
+      g_bExplicitExitPendingDuringLaunch = false;
+      PostMessageW(hWnd, closeMessage, 0, 0);
     }
     return 0;
   }
@@ -5929,8 +6204,8 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam,
       return 0;
     }
     break;
+  case WM_APP_EXIT_CTSPACES:
   case WM_CLOSE: {
-    if (!PrepareNotesForClientChange()) return 0;
     if (g_bClientNotesBusy.load() || g_bCloseAllClientsPending) {
       MessageBeep(MB_ICONINFORMATION);
       return 0;
@@ -5951,8 +6226,22 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam,
       MessageBeep(MB_ICONINFORMATION);
       return 0;
     }
+    // Notes is an independent top-level workspace. Closing just the launcher
+    // keeps its message loop and existing tray entry available while Notes
+    // continues editing/autosaving. Explicit tray Exit still uses the save gate.
+    if (message == WM_CLOSE && g_hNotesWindow && IsWindow(g_hNotesWindow)) {
+      if (!IsWindowEnabled(g_hNotesWindow)) {
+        SetForegroundWindow(GetLastActivePopup(g_hNotesWindow));
+        return 0;
+      }
+      if (!HideLauncherInTray(hWnd)) ShowWindow(hWnd, SW_MINIMIZE);
+      return 0;
+    }
+    if (!PrepareNotesForClientChange()) return 0;
     if (g_isLaunchInFlight.load()) {
       g_bClosePendingDuringLaunch = true;
+      g_bExplicitExitPendingDuringLaunch =
+          g_bExplicitExitPendingDuringLaunch || message == WM_APP_EXIT_CTSPACES;
       SetUiState(false);
       return 0;
     }
@@ -6016,6 +6305,9 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam,
       DestroyMenu(g_hConfigMenu);
       g_hConfigMenu = nullptr;
     }
+    g_hBrowserSubMenu = nullptr;
+    g_hGlobalTabLayoutMenu = nullptr;
+    g_hClientTabLayoutMenu = nullptr;
     if (g_hIconBtnTemp) {
       DestroyIcon(g_hIconBtnTemp);
       g_hIconBtnTemp = nullptr;
@@ -6187,6 +6479,28 @@ void GuiProfVacuum() {
     return;
   }
 
+  client_deletion_safety::BoundTree clientNamespace;
+  std::vector<ClientBrowserProfileLocation> profileLocations;
+  std::vector<std::unique_ptr<client_deletion_safety::BoundTree>> profileNamespaces;
+  std::wstring namespaceError;
+  if (!clientNamespace.CaptureNamespace(profileRoot, namespaceError) ||
+      !CollectClientBrowserProfileLocations(clientName, profileRoot, profileLocations)) {
+    MessageBoxW(g_hGui, L"The client's original folders could not be protected. No cache data was removed.",
+                L"Action Denied", MB_OK | MB_ICONWARNING);
+    SetUiState(true);
+    return;
+  }
+  for (const auto &location : profileLocations) {
+    auto guard = std::make_unique<client_deletion_safety::BoundTree>();
+    if (!guard->CaptureNamespace(location.profileRoot, namespaceError)) {
+      MessageBoxW(g_hGui, L"A browser profile could not be protected. No cache data was removed.",
+                  L"Action Denied", MB_OK | MB_ICONWARNING);
+      SetUiState(true);
+      return;
+    }
+    profileNamespaces.push_back(std::move(guard));
+  }
+
   std::wstring profileUseError;
   if (ProbeClientProfilesInUse(clientName, profileUseError) !=
       ProfileUseState::NotInUse) {
@@ -6211,9 +6525,8 @@ void GuiProfVacuum() {
     return;
   }
 
-  std::vector<ClientBrowserProfileLocation> profileLocations;
-  if (!CollectClientBrowserProfileLocations(clientName, profileRoot,
-                                             profileLocations)) {
+  if (!clientNamespace.Verify(namespaceError) ||
+      std::ranges::any_of(profileNamespaces, [&](const auto &guard) {return !guard->Verify(namespaceError);})) {
     MessageBoxW(g_hGui,
                 L"The client's browser-profile layout is unsafe or "
                 L"conflicting. No cache data was removed.",
@@ -6250,7 +6563,8 @@ void GuiProfVacuum() {
                                     L"shader-cache", L"thumbnails"};
     for (const auto &relativePath : cachePaths) {
       std::vector<ClientBrowserProfileLocation> currentLocations;
-      const bool locationStillValid =
+      const bool locationStillValid = clientNamespace.Verify(namespaceError) &&
+          std::ranges::all_of(profileNamespaces, [&](const auto &guard) {return guard->Verify(namespaceError);}) &&
           CollectClientBrowserProfileLocations(clientName, profileRoot,
                                                currentLocations) &&
           std::ranges::any_of(
@@ -6367,6 +6681,7 @@ static void ClearClientIconCache(const std::wstring &clientName) {
   }
   if (watcherQuiescent)
     DestroyRetiredIconsForClientLocked(clientName);
+  if (g_hNotesWindow) PostMessageW(g_hNotesWindow,WM_APP_REFRESH_NOTES_ICON,0,0);
 }
 
 static fs::path MakeClientIconWorkPath(const fs::path &destIconPath,
@@ -6631,6 +6946,14 @@ void GuiSetIcon() {
     SetUiState(true);
     return;
   }
+  client_deletion_safety::BoundTree clientNamespace;
+  std::wstring namespaceError;
+  if (!clientNamespace.CaptureNamespace(clientRoot, namespaceError)) {
+    MessageBoxW(g_hGui, L"The selected client folder could not be protected. Its icon was left unchanged.",
+                L"Action Denied", MB_OK | MB_ICONWARNING);
+    SetUiState(true);
+    return;
+  }
 
   std::wstring filter;
   std::wstring allSupportedExtensions = L"*.ico";
@@ -6671,7 +6994,8 @@ void GuiSetIcon() {
     std::wstring errorDetails;
 
     try {
-      if (!RevalidateSafeClientContainerPath(clientName, clientRoot))
+      if (!clientNamespace.Verify(namespaceError) ||
+          !RevalidateSafeClientContainerPath(clientName, clientRoot))
         throw std::runtime_error("The client folder changed before icon staging");
       stagedIconPath =
           MakeClientIconWorkPath(destIconPath, L"manual", L".ico");
@@ -6687,7 +7011,8 @@ void GuiSetIcon() {
       }
 
       if (errorDetails.empty()) {
-        if (!RevalidateSafeClientContainerPath(clientName, clientRoot)) {
+        if (!clientNamespace.Verify(namespaceError) ||
+            !RevalidateSafeClientContainerPath(clientName, clientRoot)) {
           errorDetails = L"The client folder changed before icon commit.";
         } else {
           success = CommitPreparedClientIcon(stagedIconPath, destIconPath,
@@ -6777,6 +7102,23 @@ void GuiAutoIcon() {
     return;
   }
 
+  fs::path clientRoot;
+  if (!TryGetSafeClientProfilePath(clientName, clientRoot) ||
+      !IsSafeExistingDirectory(clientRoot)) {
+    MessageBoxW(g_hGui, L"Select an existing safe client first.",
+                L"Action Denied", MB_OK | MB_ICONWARNING);
+    SetUiState(true);
+    return;
+  }
+  client_deletion_safety::BoundTree clientNamespace;
+  std::wstring namespaceError;
+  if (!clientNamespace.CaptureNamespace(clientRoot, namespaceError)) {
+    MessageBoxW(g_hGui, L"The selected client folder could not be protected. Its icon was left unchanged.",
+                L"Action Denied", MB_OK | MB_ICONWARNING);
+    SetUiState(true);
+    return;
+  }
+
   std::wstring prompt = L"Website domain";
 
   std::optional<std::wstring> enteredDomain =
@@ -6793,15 +7135,6 @@ void GuiAutoIcon() {
     SetUiState(true);
     return;
   }
-  fs::path clientRoot;
-  if (!TryGetSafeClientProfilePath(clientName, clientRoot) ||
-      !IsSafeExistingDirectory(clientRoot)) {
-    MessageBoxW(g_hGui, L"Select an existing safe client first.",
-                L"Action Denied", MB_OK | MB_ICONWARNING);
-    SetUiState(true);
-    return;
-  }
-
   const fs::path destIcon = clientRoot / "client.ico";
   fs::path downloadPath;
   fs::path stagedIconPath;
@@ -6809,7 +7142,8 @@ void GuiAutoIcon() {
   std::wstring errorDetails;
 
   try {
-    if (!RevalidateSafeClientContainerPath(clientName, clientRoot))
+    if (!clientNamespace.Verify(namespaceError) ||
+        !RevalidateSafeClientContainerPath(clientName, clientRoot))
       throw std::runtime_error("The client folder changed before icon download");
     downloadPath = MakeClientIconWorkPath(destIcon, L"download", L".png");
     stagedIconPath = MakeClientIconWorkPath(destIcon, L"fetched", L".ico");
@@ -6823,7 +7157,8 @@ void GuiAutoIcon() {
       success = false;
     } else if (!ConvertImageToIcon(downloadPath, stagedIconPath)) {
       errorDetails = L"The downloaded image could not be converted to an icon.";
-    } else if (!RevalidateSafeClientContainerPath(clientName, clientRoot)) {
+    } else if (!clientNamespace.Verify(namespaceError) ||
+               !RevalidateSafeClientContainerPath(clientName, clientRoot)) {
       errorDetails = L"The client folder changed before icon commit.";
     } else {
       success = CommitPreparedClientIcon(stagedIconPath, destIcon, errorDetails);
@@ -6876,6 +7211,14 @@ void GuiRemoveIcon() {
     SetUiState(true);
     return;
   }
+  client_deletion_safety::BoundTree clientNamespace;
+  std::wstring namespaceError;
+  if (!clientNamespace.CaptureNamespace(clientRoot, namespaceError)) {
+    MessageBoxW(g_hGui, L"The selected client folder could not be protected. Its icon was left unchanged.",
+                L"Action Denied", MB_OK | MB_ICONWARNING);
+    SetUiState(true);
+    return;
+  }
 
   if (MessageBox(g_hGui, L"Remove custom icon and revert to default?",
                   L"Confirm", MB_YESNO | MB_ICONQUESTION) == IDYES) {
@@ -6885,18 +7228,22 @@ void GuiRemoveIcon() {
 
     bool removed = false;
     try {
-      if (!RevalidateSafeClientContainerPath(clientName, clientRoot))
+      if (!clientNamespace.Verify(namespaceError) ||
+          !RevalidateSafeClientContainerPath(clientName, clientRoot))
         throw std::runtime_error("The client folder changed before icon removal");
-      if (fs::exists(destIconPath)) {
-        if (!IsSafeExistingRegularFile(destIconPath))
-          throw std::runtime_error("The client icon path is unsafe");
+      const bool hasIcon = fs::exists(destIconPath);
+      const bool hasPng = fs::exists(destPngPath);
+      if (hasIcon && !IsSafeExistingRegularFile(destIconPath))
+        throw std::runtime_error("The client icon path is unsafe");
+      if (hasPng && !IsSafeExistingRegularFile(destPngPath))
+        throw std::runtime_error("The temporary icon path is unsafe");
+      // A failed auxiliary cleanup must leave the selected icon and its cache
+      // intact so the user can release the lock and retry the same action.
+      if (hasPng)
+        fs::remove(destPngPath);
+      if (hasIcon) {
         fs::remove(destIconPath);
         removed = true;
-      }
-      if (fs::exists(destPngPath)) {
-        if (!IsSafeExistingRegularFile(destPngPath))
-          throw std::runtime_error("The temporary icon path is unsafe");
-        fs::remove(destPngPath); // Cleanup just in case
       }
 
       if (removed) {
@@ -6909,7 +7256,7 @@ void GuiRemoveIcon() {
         MessageBox(g_hGui, L"No custom icon found to remove.", L"Info",
                    MB_OK | MB_ICONINFORMATION);
       }
-    } catch (const fs::filesystem_error &e) {
+    } catch (const std::exception &e) {
       MessageBox(g_hGui, AnsiToWide(e.what()).c_str(), L"Error",
                  MB_OK | MB_ICONERROR);
     }
@@ -7254,9 +7601,18 @@ static CtBackup::Result
 NormalizeLegacyZipStaging(const fs::path &stagingRoot,
                           CtBackup::StagedRestore &stagedRestore) {
   try {
+    stagedRestore = {};
+    const DWORD rootAttributes = GetFileAttributesW(stagingRoot.c_str());
+    if (rootAttributes == INVALID_FILE_ATTRIBUTES ||
+        (rootAttributes & FILE_ATTRIBUTE_DIRECTORY) == 0 ||
+        (rootAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0)
+      return {E_INVALIDARG, L"The legacy restore staging root is not a real directory."};
     const fs::path sitesPayload = stagingRoot / L"Sites";
     if (fs::exists(sitesPayload)) {
-      if (!fs::is_directory(sitesPayload))
+      const DWORD payloadAttributes = GetFileAttributesW(sitesPayload.c_str());
+      if (payloadAttributes == INVALID_FILE_ATTRIBUTES ||
+          (payloadAttributes & FILE_ATTRIBUTE_DIRECTORY) == 0 ||
+          (payloadAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0)
         return {E_INVALIDARG,
                 L"The legacy backup contains an invalid Sites entry."};
       for (const fs::directory_entry &entry :
@@ -7304,7 +7660,9 @@ NormalizeLegacyZipStaging(const fs::path &stagingRoot,
               L"The legacy backup did not contain any client profiles."};
 
     stagedRestore = {stagingRoot, sitesPayload, profileCount};
-    return {};
+    const CtBackup::Result sealed = CtBackup::CaptureStagedRestoreIdentity(stagedRestore);
+    if (!sealed.ok()) stagedRestore = {};
+    return sealed;
   } catch (const std::exception &error) {
     return {E_FAIL, AnsiToWide(error.what())};
   }
@@ -7330,22 +7688,63 @@ static std::wstring ArchiveFailureMessage(const wchar_t *heading,
 }
 
 void GuiProfExportAll() {
-  SetUiState(false);
-  std::wstring profileUseError;
-  if (ProbeAnySitesProfileInUse(profileUseError) !=
-      ProfileUseState::NotInUse) {
-    MessageBoxW(
-        g_hGui,
-        (L"Close all browsers using ctSpaces client profiles before creating "
-         L"a backup. Backup is blocked when process inspection is uncertain."
-         L"\n\n" +
-         profileUseError)
-            .c_str(),
-        L"Export Data", MB_OK | MB_ICONINFORMATION);
-    SetUiState(true);
+  // Progress and file-picker message loops must not start a second backup or
+  // mutate the client tree. Notes remains usable until the final snapshot.
+  if (g_bClientNotesBusy.exchange(true))
     return;
-  }
-
+  struct BackupUiGuard {
+    std::vector<HWND> disabledNotesWindows;
+    ~BackupUiGuard() {
+      for (const HWND window : disabledNotesWindows) {
+        // A property identifies this exact window even if a modal callback
+        // destroys it and Windows subsequently reuses its HWND.
+        if (GetPropW(window, L"ctSpaces.backup-disabled") == this) {
+          RemovePropW(window, L"ctSpaces.backup-disabled");
+          EnableWindow(window, TRUE);
+        }
+      }
+      g_bClientNotesBusy.store(false);
+      SetUiState(true);
+      auto deferred = std::move(g_notesDeferredExits);
+      g_notesDeferredExits.clear();
+      for (auto &payload : deferred) {
+        if (PostMessageW(g_hGui, WM_APP_PROFILE_EXITED, 0,
+                         reinterpret_cast<LPARAM>(payload.get())))
+          payload.release();
+        else
+          HandleProfileExitOnUiThread(*payload);
+      }
+    }
+    bool FreezeNotes() {
+      if (!g_hNotesWindow || !IsWindow(g_hNotesWindow))
+        return true;
+      struct FreezeContext {
+        BackupUiGuard *guard;
+        HWND notes;
+        bool failed = false;
+      } context{this, g_hNotesWindow};
+      // A Notes modal dialog disables its owner, but remains independently
+      // interactive while the launcher's archive progress pumps messages.
+      const bool enumerated = EnumThreadWindows(
+          GetCurrentThreadId(), [](HWND window, LPARAM data) -> BOOL {
+            auto &state = *reinterpret_cast<FreezeContext *>(data);
+            HWND owner = window;
+            while (owner && owner != state.notes)
+              owner = GetWindow(owner, GW_OWNER);
+            if (owner != state.notes || !IsWindowEnabled(window))
+              return TRUE;
+            if (!SetPropW(window, L"ctSpaces.backup-disabled", state.guard)) {
+              state.failed = true;
+              return FALSE;
+            }
+            state.guard->disabledNotesWindows.push_back(window);
+            EnableWindow(window, FALSE);
+            return TRUE;
+          }, reinterpret_cast<LPARAM>(&context)) != FALSE;
+      return enumerated && !context.failed;
+    }
+  } uiGuard;
+  SetUiState(false);
   fs::path sourceDir = g_sDataDir / "Sites";
   if (!fs::exists(sourceDir) || !fs::is_directory(sourceDir)) {
     MessageBox(g_hGui, L"No profile data was found to export yet.",
@@ -7354,19 +7753,29 @@ void GuiProfExportAll() {
     return;
   }
 
-  unsigned long long profileCount = 0;
-  try {
-    for (const fs::directory_entry &entry : fs::directory_iterator(sourceDir)) {
-      if (entry.is_directory())
-        ++profileCount;
-    }
-  } catch (...) {
-    profileCount = 0;
-  }
-  if (profileCount == 0) {
-    MessageBox(g_hGui, L"No client profiles were found to back up.",
-               L"Back Up Data", MB_OK | MB_ICONINFORMATION);
-    SetUiState(true);
+  const auto selectedClients = ChooseBackupClients(sourceDir);
+  if (!selectedClients || selectedClients->empty()) return;
+  const auto flushNotes = [&]() {
+    std::wstring saveError;
+    if (FlushClientNotesForBackup(*selectedClients, saveError))
+      return true;
+    MessageBoxW(g_hGui,
+                (L"Save the selected clients' open Notes changes before "
+                 L"creating a backup. No backup was created.\n\n" + saveError).c_str(),
+                L"Backup Cancelled", MB_OK | MB_ICONWARNING);
+    return false;
+  };
+  if (!flushNotes())
+    return;
+  CtBackup::BackupOptions backupOptions;
+  backupOptions.selectedClientNames = *selectedClients;
+  const auto profileCount = selectedClients->size();
+  std::wstring profileUseError;
+  if (!ProbeBackupSelectionClosed(*selectedClients,profileUseError)) {
+    MessageBoxW(g_hGui,
+        (L"Close the browsers for the selected clients before backing them up. "
+         L"No backup was created.\n\n"+profileUseError).c_str(),
+        L"Back Up Data",MB_OK|MB_ICONINFORMATION);
     return;
   }
 
@@ -7388,12 +7797,22 @@ void GuiProfExportAll() {
 
   if (GetSaveFileNameW(&ofn)) {
     fs::path destPath(ofn.lpstrFile);
+    // The picker can pump Notes edits/autosave. Flush again with interaction
+    // disabled, then hold the stable notebook through compression and CRC.
+    if (!uiGuard.FreezeNotes()) {
+      MessageBoxW(g_hGui,
+                  L"The open Notes windows could not be paused safely. "
+                  L"No backup was created. Close Notes and try again.",
+                  L"Backup Cancelled", MB_OK | MB_ICONWARNING);
+      return;
+    }
+    if (!flushNotes())
+      return;
     profileUseError.clear();
-    if (ProbeAnySitesProfileInUse(profileUseError) !=
-        ProfileUseState::NotInUse) {
+    if (!ProbeBackupSelectionClosed(*selectedClients,profileUseError)) {
       MessageBoxW(
           g_hGui,
-          (L"A browser began using a ctSpaces client profile or could not be "
+          (L"A selected client's browser began using its profile or could not be "
            L"reverified after the backup location was selected. No backup was "
            L"created.\n\n" +
            profileUseError)
@@ -7403,10 +7822,13 @@ void GuiProfExportAll() {
       return;
     }
     const CtBackup::Result result = RunArchiveTaskWithProgress(
-        L"Creating and verifying backup...", [&](auto &context) {
+        L"Preparing backup...", [&](auto &context) {
+          auto operationOptions=backupOptions;
+          operationOptions.detailedProgress=&BackupDetailedProgress;
+          operationOptions.detailedProgressUser=&context;
           return CtBackup::CreateValidated7zBackup(
-              sourceDir, destPath, CTSPACES_VERSION_TEXT, &_7zProgress,
-              &context);
+              sourceDir, destPath, CTSPACES_VERSION_TEXT, nullptr,
+              nullptr,operationOptions);
         });
     if (result.ok()) {
       const std::wstring message =
@@ -7426,7 +7848,64 @@ void GuiProfExportAll() {
   SetUiState(true);
 }
 
+#ifdef CTSPACES_RESTORE_GUI_TEST_HOOKS
+extern BOOL CtSpacesRestoreGuiTestPickArchive(OPENFILENAMEW *picker);
+extern std::wstring CtSpacesRestoreGuiTestStageSuffix(unsigned attempt);
+extern CtBackup::Result CtSpacesRestoreGuiTestRunStage(
+    const std::function<CtBackup::Result(_7zUiCtx &)> &operation);
+extern void CtSpacesRestoreGuiTestAfterStage(CtBackup::StagedRestore &staged);
+extern void CtSpacesRestoreGuiTestBeforeCommitGuard();
+#endif
+
+static CtBackup::Result CreateRestoreStagingDirectory(fs::path &staging) {
+  staging.clear();
+  try {
+    fs::create_directories(g_sDataDir);
+    if (!IsSafeExistingDirectory(g_sDataDir))
+      return {E_INVALIDARG, L"The restore data folder is not a real safe directory."};
+    for (unsigned attempt = 0; attempt < 64; ++attempt) {
+      std::wstring suffix;
+#ifdef CTSPACES_RESTORE_GUI_TEST_HOOKS
+      suffix = CtSpacesRestoreGuiTestStageSuffix(attempt);
+#else
+      GUID identity{};
+      const HRESULT created = CoCreateGuid(&identity);
+      if (FAILED(created)) return {created, L"A unique restore staging identity could not be created."};
+      suffix = std::format(L"{:08x}", identity.Data1);
+#endif
+      const fs::path candidate = g_sDataDir / (L"Restore_Temp_" + suffix);
+      if (CreateDirectoryW(candidate.c_str(), nullptr)) {
+        staging = candidate;
+        return {};
+      }
+      const DWORD error = GetLastError();
+      if (error != ERROR_ALREADY_EXISTS)
+        return {HRESULT_FROM_WIN32(error), L"The restore staging folder could not be created."};
+    }
+    return {HRESULT_FROM_WIN32(ERROR_ALREADY_EXISTS), L"No unused restore staging name could be reserved. Existing folders were left untouched."};
+  } catch (const std::exception &error) {
+    return {E_FAIL, AnsiToWide(error.what())};
+  }
+}
+
 void GuiProfRestoreAll() {
+  if (g_bClientNotesBusy.exchange(true))
+    return;
+  struct RestoreUiGuard {
+    ~RestoreUiGuard() {
+      g_bClientNotesBusy.store(false);
+      SetUiState(true);
+      auto deferred = std::move(g_notesDeferredExits);
+      g_notesDeferredExits.clear();
+      for (auto &payload : deferred) {
+        if (PostMessageW(g_hGui, WM_APP_PROFILE_EXITED, 0,
+                         reinterpret_cast<LPARAM>(payload.get())))
+          payload.release();
+        else
+          HandleProfileExitOnUiThread(*payload);
+      }
+    }
+  } uiGuard;
   if (!PrepareNotesForClientChange()) return;
   SetUiState(false);
 
@@ -7459,7 +7938,13 @@ void GuiProfRestoreAll() {
   ofn.lpstrDefExt = L"7z";
   ofn.Flags = OFN_PATHMUSTEXIST | OFN_FILEMUSTEXIST | OFN_NOCHANGEDIR;
 
-  if (!GetOpenFileNameW(&ofn)) {
+  BOOL picked = FALSE;
+#ifdef CTSPACES_RESTORE_GUI_TEST_HOOKS
+  picked = CtSpacesRestoreGuiTestPickArchive(&ofn);
+#else
+  picked = GetOpenFileNameW(&ofn);
+#endif
+  if (!picked) {
     SetUiState(true);
     return;
   }
@@ -7479,11 +7964,14 @@ void GuiProfRestoreAll() {
 
   const wchar_t *confirmation = legacyZip
       ? L"Restore this older ZIP backup?\n\nZIP restore is retained for "
-        L"backward compatibility. Current profile data will be preserved in "
-        L"a pre-restore recovery folder first."
+        L"backward compatibility. Your current client list will be replaced "
+        L"by the clients in this backup. All current profile data, including "
+        L"clients absent from the backup, will be kept in a pre-restore "
+        L"recovery folder first."
       : L"Restore this validated ctSpaces backup?\n\nThe archive will be "
-        L"checked before current profile data is moved to a pre-restore "
-        L"recovery folder.";
+        L"checked before your current client list is replaced by the clients "
+        L"in this backup. All current profile data, including clients you "
+        L"left out of the backup, will be kept in a pre-restore recovery folder.";
   if (MessageBox(g_hGui, confirmation, L"Restore Data",
                  MB_YESNO | MB_ICONQUESTION) != IDYES) {
     SetUiState(true);
@@ -7505,29 +7993,20 @@ void GuiProfRestoreAll() {
   }
 
   const std::wstring stamp = GetBackupTimestamp();
-  const fs::path tempDir =
-      g_sDataDir /
-      std::format(L"Restore_Temp_{}-{}-{}", stamp, GetCurrentProcessId(),
-                  GetTickCount64());
+  fs::path tempDir;
   const fs::path sitesDir = g_sDataDir / "Sites";
   const fs::path backupDir = UniqueRecoveryPath(g_sDataDir, stamp);
 
-  try {
-    fs::create_directories(g_sDataDir);
-    fs::remove_all(tempDir);
-    fs::create_directories(tempDir);
-  } catch (const fs::filesystem_error &e) {
-    MessageBox(g_hGui, AnsiToWide(e.what()).c_str(), L"Restore Data",
+  const CtBackup::Result reservation = CreateRestoreStagingDirectory(tempDir);
+  if (!reservation.ok()) {
+    MessageBox(g_hGui, ArchiveFailureMessage(L"A restore staging folder could not be reserved.", reservation).c_str(), L"Restore Data",
                MB_OK | MB_ICONERROR);
     SetUiState(true);
     return;
   }
 
   CtBackup::StagedRestore stagedRestore;
-  CtBackup::Result stageResult = RunArchiveTaskWithProgress(
-      legacyZip ? L"Reading older ZIP backup..."
-                : L"Validating and staging backup...",
-      [&](auto &context) {
+  const auto stageOperation = [&](auto &context) {
         if (!legacyZip)
           return CtBackup::StageValidated7zRestore(
               archivePath, tempDir, &_7zProgress, &context, stagedRestore);
@@ -7535,30 +8014,39 @@ void GuiProfRestoreAll() {
         if (!result.ok())
           return result;
         return NormalizeLegacyZipStaging(tempDir, stagedRestore);
-      });
+      };
+  CtBackup::Result stageResult;
+#ifdef CTSPACES_RESTORE_GUI_TEST_HOOKS
+  stageResult = CtSpacesRestoreGuiTestRunStage(stageOperation);
+#else
+  stageResult = RunArchiveTaskWithProgress(
+      legacyZip ? L"Reading older ZIP backup..." : L"Validating and staging backup...", stageOperation);
+#endif
 
   if (!stageResult.ok()) {
-    std::error_code cleanupError;
-    fs::remove_all(tempDir, cleanupError);
-    const std::wstring message = ArchiveFailureMessage(
+    std::wstring message = ArchiveFailureMessage(
         L"The selected backup could not be restored.", stageResult);
+    if (GetFileAttributesW(tempDir.c_str()) != INVALID_FILE_ATTRIBUTES)
+      message += L"\n\nAny incomplete staging data was retained here:\n" + tempDir.wstring();
     MessageBox(g_hGui, message.c_str(), L"Restore Data",
                MB_OK | MB_ICONERROR);
     SetUiState(true);
     return;
   }
 
+#ifdef CTSPACES_RESTORE_GUI_TEST_HOOKS
+  CtSpacesRestoreGuiTestAfterStage(stagedRestore);
+#endif
+
   profileUseError.clear();
   if (ProbeAnySitesProfileInUse(profileUseError) !=
       ProfileUseState::NotInUse) {
-    std::error_code cleanupError;
-    fs::remove_all(tempDir, cleanupError);
     MessageBoxW(
         g_hGui,
         (L"A browser began using a ctSpaces client profile or could not be "
          L"reverified while the backup was staged. Current profile data was "
          L"left unchanged.\n\n" +
-         profileUseError)
+         profileUseError + L"\n\nThe verified staging data was retained here:\n" + tempDir.wstring())
             .c_str(),
         L"Restore Cancelled", MB_OK | MB_ICONWARNING);
     SetUiState(true);
@@ -7567,6 +8055,9 @@ void GuiProfRestoreAll() {
 
   const auto finalRestoreCommitGuard =
       [](void *, std::wstring &failureDetails) -> bool {
+#ifdef CTSPACES_RESTORE_GUI_TEST_HOOKS
+    CtSpacesRestoreGuiTestBeforeCommitGuard();
+#endif
     std::wstring finalProfileUseError;
     if (ProbeAnySitesProfileInUse(finalProfileUseError) ==
         ProfileUseState::NotInUse) {
@@ -7583,12 +8074,12 @@ void GuiProfRestoreAll() {
   const CtBackup::Result commitResult = CtBackup::CommitStagedRestore(
       stagedRestore, sitesDir, backupDir, finalRestoreCommitGuard, nullptr);
   if (!commitResult.ok()) {
-    std::error_code cleanupError;
-    fs::remove_all(tempDir, cleanupError);
-    const std::wstring message = ArchiveFailureMessage(
-        L"The restored data could not be installed. The previous Sites "
-        L"folder was left in place or rolled back.",
+    std::wstring message = ArchiveFailureMessage(
+        L"The restored data could not be installed. No retained staging or recovery data was deleted.",
         commitResult);
+    message += L"\n\nRestore staging location:\n" + tempDir.wstring();
+    if (GetFileAttributesW(backupDir.c_str()) != INVALID_FILE_ATTRIBUTES)
+      message += L"\n\nRetained recovery location:\n" + backupDir.wstring();
     MessageBox(g_hGui, message.c_str(), L"Restore Data",
                MB_OK | MB_ICONERROR);
     SetUiState(true);
@@ -7710,8 +8201,10 @@ using NtQueryInformationProcessFn =
 
 static bool TryGetProcessCommandLine(DWORD processId,
                                      std::wstring &commandLine,
-                                     std::wstring &errorDetails) {
+                                     std::wstring &errorDetails,
+                                     bool &processExited) {
   commandLine.clear();
+  processExited = false;
   HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
   auto queryProcess =
       ntdll ? reinterpret_cast<NtQueryInformationProcessFn>(
@@ -7723,11 +8216,13 @@ static bool TryGetProcessCommandLine(DWORD processId,
   }
 
   HANDLE process =
-      OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, processId);
+      OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, FALSE, processId);
   if (!process) {
+    const DWORD error = GetLastError();
+    processExited = error == ERROR_INVALID_PARAMETER;
     errorDetails = std::format(
         L"Browser process {} could not be opened (Windows error {}).", processId,
-        GetLastError());
+        error);
     return false;
   }
 
@@ -7757,6 +8252,8 @@ static bool TryGetProcessCommandLine(DWORD processId,
       return true;
     }
 
+    if (finalStatus == browser_process_exit::kProcessIsTerminating)
+      break;
     size_t nextSize = requiredBytes > buffer.size()
                           ? static_cast<size_t>(requiredBytes)
                           : buffer.size() * 2;
@@ -7764,21 +8261,13 @@ static bool TryGetProcessCommandLine(DWORD processId,
       break;
     buffer.resize(nextSize);
   }
+  processExited = browser_process_exit::ConfirmExitAfterQueryFailure(process, finalStatus);
   CloseHandle(process);
   errorDetails = std::format(
       L"Browser process {} command line could not be inspected (NTSTATUS "
       L"0x{:08X}).",
       processId, static_cast<unsigned long>(finalStatus));
   return false;
-}
-
-static bool IsProcessStillRunning(DWORD processId) {
-  HANDLE process = OpenProcess(SYNCHRONIZE, FALSE, processId);
-  if (!process)
-    return GetLastError() != ERROR_INVALID_PARAMETER;
-  const DWORD state = WaitForSingleObject(process, 0);
-  CloseHandle(process);
-  return state != WAIT_OBJECT_0;
 }
 
 static std::optional<BrowserKind>
@@ -7825,25 +8314,33 @@ static BrowserProfileArgument ExtractBrowserProfileArgument(
         browser == BrowserKind::Firefox &&
         _wcsicmp(argument.c_str(), L"-profile") == 0;
     if (exactLong || exactFirefoxShort) {
+      if (result.present) {
+        result.valid = false;
+        break;
+      }
       result.present = true;
       if (index + 1 >= argumentCount || !arguments[index + 1][0]) {
         result.valid = false;
       } else {
         result.path = fs::path(arguments[index + 1]);
+        ++index;
       }
-      break;
+      continue;
     }
 
     if (_wcsnicmp(argument.c_str(), longOption, longOptionLength) == 0 &&
         argument.size() > longOptionLength &&
         argument[longOptionLength] == L'=') {
+      if (result.present) {
+        result.valid = false;
+        break;
+      }
       result.present = true;
       const std::wstring value = argument.substr(longOptionLength + 1);
       if (value.empty())
         result.valid = false;
       else
         result.path = fs::path(value);
-      break;
     }
   }
   LocalFree(arguments);
@@ -7891,9 +8388,10 @@ static ProfileUseState ProbeBrowserProcessesAgainstProfiles(
 
     std::wstring commandLine;
     std::wstring commandError;
+    bool processExited = false;
     if (!TryGetProcessCommandLine(entry.th32ProcessID, commandLine,
-                                  commandError)) {
-      if (!IsProcessStillRunning(entry.th32ProcessID))
+                                  commandError, processExited)) {
+      if (processExited)
         continue;
       CloseHandle(snapshot);
       errorDetails = commandError;
@@ -7973,8 +8471,8 @@ static ProfileUseState ProbeClientProfilesInUse(
   {
     std::lock_guard<std::mutex> lock(g_activeProfilesMutex);
     if (std::ranges::any_of(g_activeProfiles, [&](const auto &active) {
-          return _wcsicmp(active.first.clientName.c_str(), clientName.c_str()) ==
-                 0;
+          return client_name_comparison::EqualIgnoringCase(
+              active.first.clientName, clientName);
         })) {
       errorDetails = L"ctSpaces is still tracking an open browser for this client.";
       return ProfileUseState::InUse;
@@ -8043,60 +8541,9 @@ static bool IsValidWebUrl(const std::wstring &url) {
 }
 
 static bool SetFirefoxStartupPreference(const fs::path &profilePath,
-                                        bool restoreTabs) {
-  const fs::path preferencesPath = profilePath / L"user.js";
-  std::string preferences;
-  try {
-    if (fs::exists(preferencesPath)) {
-      if (!fs::is_regular_file(preferencesPath) ||
-          fs::file_size(preferencesPath) > 4ull * 1024ull * 1024ull) {
-        return false;
-      }
-      std::ifstream input(preferencesPath, std::ios::binary);
-      if (!input)
-        return false;
-      preferences.assign(std::istreambuf_iterator<char>(input),
-                         std::istreambuf_iterator<char>());
-    }
-
-    const std::string managedPreference =
-        std::string("user_pref(\"browser.startup.page\", ") +
-        (restoreTabs ? "3" : "1") + ");";
-    const std::regex startupPreference(
-        R"(user_pref\("browser\.startup\.page"\s*,\s*\d+\s*\);)");
-    if (std::regex_search(preferences, startupPreference)) {
-      preferences =
-          std::regex_replace(preferences, startupPreference, managedPreference);
-    } else {
-      if (!preferences.empty() && preferences.back() != '\n')
-        preferences += "\r\n";
-      preferences += managedPreference + "\r\n";
-    }
-
-    const fs::path stagedPath =
-        profilePath /
-        std::format(L".user.js.ctspaces-{}-{}", GetCurrentProcessId(),
-                    GetTickCount64());
-    {
-      std::ofstream output(stagedPath, std::ios::binary | std::ios::trunc);
-      if (!output)
-        return false;
-      output.write(preferences.data(),
-                   static_cast<std::streamsize>(preferences.size()));
-      output.flush();
-      if (!output)
-        return false;
-    }
-    if (!MoveFileExW(stagedPath.c_str(), preferencesPath.c_str(),
-                     MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
-      std::error_code cleanupError;
-      fs::remove(stagedPath, cleanupError);
-      return false;
-    }
-    return true;
-  } catch (...) {
-    return false;
-  }
+                                        bool restoreTabs,
+                                        std::wstring *errorDetails = nullptr) {
+  return firefox_preferences::UpdateStartupPreferenceFile(profilePath, restoreTabs, errorDetails);
 }
 
 static DWORD StartBrowserProcess(BrowserKind browser,
@@ -8126,11 +8573,13 @@ static DWORD StartBrowserProcess(BrowserKind browser,
 
   std::wstring cmdLine = QuoteCommandLineArgument(exePath.wstring());
   if (browser == BrowserKind::Firefox) {
-    if (!SetFirefoxStartupPreference(profilePath, restoreLastSession)) {
+    std::wstring preferenceError;
+    if (!SetFirefoxStartupPreference(profilePath, restoreLastSession, &preferenceError)) {
       if (launchError) {
         *launchError =
             L"Firefox startup preferences could not be updated safely. "
             L"The browser was not started.";
+        if (!preferenceError.empty()) *launchError += L"\n\n" + preferenceError;
       }
       return 0;
     }
@@ -8179,35 +8628,102 @@ static DWORD StartBrowserProcess(BrowserKind browser,
 }
 
 static bool RemoveProfileDirectoryAndVerify(const fs::path &profilePath,
-                                             std::wstring &errorDetails) {
+                                             std::wstring &errorDetails,
+                                             HANDLE &original) {
   constexpr int kCleanupAttempts = 20;
   constexpr DWORD kCleanupRetryDelayMs = 50;
-  std::error_code lastError;
+  BY_HANDLE_FILE_INFORMATION expected{};
+  if (!GetFileInformationByHandle(original, &expected)) {
+    errorDetails = L"The original disposable profile identity is unavailable.";
+    return false;
+  }
 
   for (int attempt = 0; attempt < kCleanupAttempts; ++attempt) {
-    std::error_code removeError;
-    fs::remove_all(profilePath, removeError);
-
-    std::error_code existsError;
-    const bool stillExists = fs::exists(profilePath, existsError);
-    if (!removeError && !existsError && !stillExists) {
-      errorDetails.clear();
-      return true;
+    client_deletion_safety::BoundTree captured;
+    if (captured.CaptureNamespace(profilePath, errorDetails)) {
+      HANDLE observed = CreateFileW(
+          profilePath.c_str(), FILE_READ_ATTRIBUTES,
+          FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+          OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+          nullptr);
+      BY_HANDLE_FILE_INFORMATION actual{};
+      const bool same = observed != INVALID_HANDLE_VALUE &&
+          GetFileInformationByHandle(observed, &actual) &&
+          actual.dwVolumeSerialNumber == expected.dwVolumeSerialNumber &&
+          actual.nFileIndexHigh == expected.nFileIndexHigh &&
+          actual.nFileIndexLow == expected.nFileIndexLow;
+      if (observed != INVALID_HANDLE_VALUE)
+        CloseHandle(observed);
+      if (!same) {
+        errorDetails = L"The disposable profile path changed during cleanup. "
+                       L"The replacement was left unchanged.";
+        return false;
+      }
+      if (captured.CaptureContents(errorDetails) &&
+          captured.RemoveRemaining(errorDetails)) {
+        // Release the identity observer before checking absence: its handle
+        // can keep the correctly disposed directory pending deletion.
+        CloseHandle(original);
+        original = INVALID_HANDLE_VALUE;
+        const DWORD attributes = GetFileAttributesW(profilePath.c_str());
+        const DWORD code = GetLastError();
+        if (attributes == INVALID_FILE_ATTRIBUTES &&
+            (code == ERROR_FILE_NOT_FOUND || code == ERROR_PATH_NOT_FOUND)) {
+          errorDetails.clear();
+          return true;
+        }
+        errorDetails = L"The original disposable profile was removed, but its "
+                       L"path became occupied or could not be verified. No "
+                       L"replacement was removed.";
+        return false;
+      }
     }
-
-    lastError = removeError ? removeError : existsError;
     if (attempt + 1 < kCleanupAttempts)
       Sleep(kCleanupRetryDelayMs);
   }
-
-  errorDetails = L"The disposable browser profile could not be removed.";
-  if (lastError)
-    errorDetails += L" " + AnsiToWide(lastError.message());
+  errorDetails = L"The disposable browser profile could not be removed. " + errorDetails;
   return false;
 }
 
 static bool RemoveTransientProfileIfIdleAndVerify(
-    const fs::path &profilePath, std::wstring &errorDetails) {
+    const fs::path &profilePath, std::wstring &errorDetails,
+    const std::shared_ptr<transient_profile::Identity> &directory = {}) {
+  // Preserve the original identity across process inspection and all retries.
+  // Share DELETE so directory disposal can complete once this observer closes.
+  HANDLE original = CreateFileW(
+      profilePath.c_str(), FILE_READ_ATTRIBUTES | FILE_LIST_DIRECTORY,
+      FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+      OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+      nullptr);
+  const DWORD openError = GetLastError();
+  struct CloseOriginal {
+    HANDLE &handle;
+    ~CloseOriginal() { if (handle != INVALID_HANDLE_VALUE) CloseHandle(handle); }
+  } closeOriginal{original};
+  BY_HANDLE_FILE_INFORMATION information{};
+  if (original != INVALID_HANDLE_VALUE &&
+      (!GetFileInformationByHandle(original, &information) ||
+       !(information.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) ||
+       (information.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT))) {
+    errorDetails = L"The disposable profile is not a safe directory. It was left unchanged.";
+    return false;
+  }
+  if (original == INVALID_HANDLE_VALUE && openError != ERROR_FILE_NOT_FOUND &&
+      openError != ERROR_PATH_NOT_FOUND) {
+    errorDetails = L"The disposable profile could not be inspected safely. It was left unchanged.";
+    return false;
+  }
+  if (directory) {
+    if (original == INVALID_HANDLE_VALUE || !directory->Matches(original)) {
+      errorDetails = L"The created disposable profile no longer matches its "
+                     L"launch identity. The current path was left unchanged.";
+      return false;
+    }
+    // The local observer now carries the same original identity through the
+    // process probe and all cleanup retries. Drop the launch namespace lease
+    // before acquiring DELETE access for those exact objects.
+    directory->Release();
+  }
   std::wstring profileUseError;
   if (ProbeExactBrowserProfileInUse(profilePath, profileUseError) !=
       ProfileUseState::NotInUse) {
@@ -8218,13 +8734,25 @@ static bool RemoveTransientProfileIfIdleAndVerify(
       errorDetails += L"\n\n" + profileUseError;
     return false;
   }
-  return RemoveProfileDirectoryAndVerify(profilePath, errorDetails);
+  if (original == INVALID_HANDLE_VALUE) {
+    const DWORD attributes = GetFileAttributesW(profilePath.c_str());
+    const DWORD code = GetLastError();
+    if (attributes == INVALID_FILE_ATTRIBUTES &&
+        (code == ERROR_FILE_NOT_FOUND || code == ERROR_PATH_NOT_FOUND)) {
+      errorDetails.clear();
+      return true;
+    }
+    errorDetails = L"A disposable profile appeared during inspection. It was left unchanged.";
+    return false;
+  }
+  return RemoveProfileDirectoryAndVerify(profilePath, errorDetails, original);
 }
 
 static bool IsClientActiveAnyBrowser(const std::wstring &clientName) {
   std::lock_guard<std::mutex> lock(g_activeProfilesMutex);
   return std::ranges::any_of(g_activeProfiles, [&](const auto &active) {
-    return _wcsicmp(active.first.clientName.c_str(), clientName.c_str()) == 0;
+    return client_name_comparison::EqualIgnoringCase(
+        active.first.clientName, clientName);
   });
 }
 
@@ -8240,7 +8768,9 @@ GetActiveProfile(const std::wstring &clientName, BrowserKind browser) {
 
 static bool CreateUniqueWorkDirectory(const fs::path &base,
                                       const std::wstring &label,
-                                      fs::path &workRoot) {
+                                      fs::path &workRoot,
+                                      client_deletion_safety::BoundTree &workNamespace,
+                                      std::wstring &errorDetails) {
   try {
     fs::create_directories(base);
   } catch (...) {
@@ -8248,17 +8778,38 @@ static bool CreateUniqueWorkDirectory(const fs::path &base,
   }
   if (!IsSafeExistingDirectory(base) || !IsStrictChildPath(base, g_sDataDir))
     return false;
+  if (!workNamespace.PinAncestor(base, false, errorDetails) ||
+      !workNamespace.ProtectEmptyParent(base, errorDetails))
+    return false;
 
   for (unsigned attempt = 0; attempt < 32; ++attempt) {
     workRoot =
         base / std::format(L"{}-{}-{}-{}", label, GetCurrentProcessId(),
                            GetTickCount64(), attempt);
     if (CreateDirectoryW(workRoot.c_str(), nullptr))
-      return IsSafeExistingDirectory(workRoot);
+      return workNamespace.CaptureNamespace(workRoot, errorDetails);
     if (GetLastError() != ERROR_ALREADY_EXISTS)
       return false;
   }
   return false;
+}
+
+static void CleanupOwnedProfileWorkRoot(
+    const fs::path &workRoot, const fs::path &workBase,
+    client_deletion_safety::BoundTree &workNamespace,
+    std::wstring &errorDetails) {
+  // A failed stage can contain independently added or replaced contents.
+  // Dispose only the bound original directory when it is empty. Retain a
+  // nonempty/changed stage rather than recursively guessing child ownership.
+  std::wstring cleanupDetails;
+  if (!workNamespace.Verify(cleanupDetails) ||
+      !workNamespace.UpgradeRoot(cleanupDetails) ||
+      !workNamespace.Remove(workRoot, cleanupDetails)) {
+    errorDetails += L" Staged browser data was retained at " +
+                    workRoot.wstring() + L". " + cleanupDetails;
+    return;
+  }
+  workNamespace.RemoveEmptyPinnedAncestor(workBase);
 }
 
 static bool CreateV2ClientSkeleton(const fs::path &clientRoot) {
@@ -8277,12 +8828,20 @@ static bool CreateV2ClientSkeleton(const fs::path &clientRoot) {
 
 static bool CreateStagedBrowserSlot(const fs::path &slotRoot,
                                     BrowserKind browser,
-                                    const wchar_t *statusText) {
+                                    const wchar_t *statusText,
+                                    client_deletion_safety::BoundTree *ownedNamespace = nullptr) {
   if (fs::exists(slotRoot) ||
       !CreateDirectoryW(slotRoot.c_str(), nullptr) ||
       !IsSafeExistingDirectory(slotRoot)) {
     return false;
   }
+
+  client_deletion_safety::BoundTree localNamespace;
+  auto &originalNamespace = ownedNamespace ? *ownedNamespace : localNamespace;
+  std::wstring bindingDetails;
+  if (!originalNamespace.CaptureNamespace(slotRoot, bindingDetails) ||
+      !fs::is_empty(slotRoot))
+    return false;
 
   const fs::path profileRoot = slotRoot / L"Profile";
   bool profileReady = false;
@@ -8299,7 +8858,8 @@ static bool CreateStagedBrowserSlot(const fs::path &slotRoot,
   if (!profileReady)
     return false;
 
-  return WriteDurableMarker(slotRoot / kBrowserSchemaMarkerName,
+  return originalNamespace.Verify(bindingDetails) &&
+         WriteDurableMarker(slotRoot / kBrowserSchemaMarkerName,
                             GetBrowserMarkerText(browser)) &&
          IsValidBrowserSlot(slotRoot, profileRoot, browser);
 }
@@ -8336,12 +8896,18 @@ static bool EnsureBrowserSlotForClient(const std::wstring &clientName,
     return false;
   }
 
+  client_deletion_safety::BoundTree clientNamespace;
+  if (!clientNamespace.CaptureNamespace(clientRoot, errorDetails))
+    return false;
+
   const fs::path workBase = g_sDataDir / L"_ProfileCreate";
   fs::path workRoot;
-  if (!CreateUniqueWorkDirectory(workBase, L"slot", workRoot)) {
+  client_deletion_safety::BoundTree workNamespace;
+  if (!CreateUniqueWorkDirectory(workBase, L"slot", workRoot,
+                                 workNamespace, errorDetails)) {
     errorDetails =
         L"The ctSpaces data-folder path is too long, or a safe browser-slot "
-        L"staging folder could not be created.";
+        L"staging folder could not be created. " + errorDetails;
     return false;
   }
 
@@ -8349,6 +8915,7 @@ static bool EnsureBrowserSlotForClient(const std::wstring &clientName,
   bool committed = false;
   bool renameCommitted = false;
   try {
+    client_deletion_safety::BoundTree stagedNamespace;
     if (!CtBackup::Detail::IsNewClientTargetPathWithinLegacyBudget(
             workRoot, L"Slot")) {
       throw std::runtime_error(
@@ -8357,14 +8924,16 @@ static bool EnsureBrowserSlotForClient(const std::wstring &clientName,
     }
     const std::wstring status =
         std::format(L"Creating {} profile...", GetBrowserDisplayName(browser));
-    if (!CreateStagedBrowserSlot(stagedSlot, browser, status.c_str()))
+    if (!CreateStagedBrowserSlot(stagedSlot, browser, status.c_str(),
+                                 &stagedNamespace))
       throw std::runtime_error("The staged browser slot failed validation");
 
     const fs::path browsersRoot = clientRoot / L"Browsers";
     const bool containerStillValid =
         pureV2 ? IsV2ClientContainer(clientRoot)
                : IsSafeHybridClientRoot(clientRoot);
-    if (!RevalidateSafeClientContainerPath(clientName, clientRoot) ||
+    if (!clientNamespace.Verify(errorDetails) ||
+        !RevalidateSafeClientContainerPath(clientName, clientRoot) ||
         !containerStillValid) {
       throw std::runtime_error("The client container changed during staging");
     }
@@ -8382,17 +8951,20 @@ static bool EnsureBrowserSlotForClient(const std::wstring &clientName,
           "The generated browser slot would exceed the legacy Windows path "
           "budget");
     }
-    if (!MoveFileExW(stagedSlot.c_str(), slotRoot.c_str(),
-                     MOVEFILE_WRITE_THROUGH)) {
-      throw std::system_error((int)GetLastError(), std::system_category(),
-                              "Could not commit the browser slot");
+    {
+      if (!stagedNamespace.Verify(errorDetails) ||
+          !stagedNamespace.PinAncestor(browsersRoot, false, errorDetails) ||
+          !stagedNamespace.ProtectEmptyParent(browsersRoot, errorDetails) ||
+          !stagedNamespace.MoveRoot(slotRoot, errorDetails))
+        throw std::runtime_error("The original staged browser slot could not be committed safely");
+      renameCommitted = true;
+      if (!IsValidBrowserSlot(slotRoot, profileRoot, browser) ||
+          !stagedNamespace.Verify(errorDetails))
+        throw std::runtime_error("The committed browser slot failed validation");
+      if (!pureV2 && !IsSafeHybridClientRoot(clientRoot))
+        throw std::runtime_error("The committed hybrid client failed validation");
+      committed = true;
     }
-    renameCommitted = true;
-    if (!IsValidBrowserSlot(slotRoot, profileRoot, browser))
-      throw std::runtime_error("The committed browser slot failed validation");
-    if (!pureV2 && !IsSafeHybridClientRoot(clientRoot))
-      throw std::runtime_error("The committed hybrid client failed validation");
-    committed = true;
   } catch (const std::exception &error) {
     errorDetails = AnsiToWide(error.what());
   }
@@ -8408,13 +8980,7 @@ static bool EnsureBrowserSlotForClient(const std::wstring &clientName,
         slotRoot.wstring();
   }
 
-  std::error_code cleanupError;
-  fs::remove_all(workRoot, cleanupError);
-  cleanupError.clear();
-  if (fs::is_directory(workBase, cleanupError) &&
-      fs::is_empty(workBase, cleanupError)) {
-    fs::remove(workBase, cleanupError);
-  }
+  CleanupOwnedProfileWorkRoot(workRoot, workBase, workNamespace, errorDetails);
   return committed;
 }
 
@@ -8444,12 +9010,21 @@ static bool CreateNewV2Client(const std::wstring &clientName,
     return false;
   }
 
+  client_deletion_safety::BoundTree targetNamespace;
+  const fs::path sitesRoot = targetRoot.parent_path();
+  if (!targetNamespace.CaptureNamespace(sitesRoot, errorDetails) ||
+      !targetNamespace.PinAncestor(sitesRoot, false, errorDetails) ||
+      !targetNamespace.ProtectEmptyParent(sitesRoot, errorDetails))
+    return false;
+
   const fs::path workBase = g_sDataDir / L"_ProfileCreate";
   fs::path workRoot;
-  if (!CreateUniqueWorkDirectory(workBase, L"client", workRoot)) {
+  client_deletion_safety::BoundTree workNamespace;
+  if (!CreateUniqueWorkDirectory(workBase, L"client", workRoot,
+                                 workNamespace, errorDetails)) {
     errorDetails =
         L"The ctSpaces data-folder path is too long, or a safe client staging "
-        L"folder could not be created.";
+        L"folder could not be created. " + errorDetails;
     return false;
   }
 
@@ -8457,6 +9032,7 @@ static bool CreateNewV2Client(const std::wstring &clientName,
   bool committed = false;
   bool renameCommitted = false;
   try {
+    client_deletion_safety::BoundTree stagedNamespace;
     if (!CtBackup::Detail::IsNewClientTargetPathWithinLegacyBudget(
             workRoot, L"Client")) {
       throw std::runtime_error(
@@ -8464,6 +9040,8 @@ static bool CreateNewV2Client(const std::wstring &clientName,
           "path room for a temporary client stage");
     }
     if (!CreateDirectoryW(stagedClient.c_str(), nullptr) ||
+        !stagedNamespace.CaptureNamespace(stagedClient, errorDetails) ||
+        !fs::is_empty(stagedClient) ||
         !CreateV2ClientSkeleton(stagedClient)) {
       throw std::runtime_error("The staged client container could not be marked");
     }
@@ -8485,18 +9063,20 @@ static bool CreateNewV2Client(const std::wstring &clientName,
       throw std::runtime_error(
           "The generated client would exceed the legacy Windows path budget");
     }
-    if (!MoveFileExW(stagedClient.c_str(), targetRoot.c_str(),
-                     MOVEFILE_WRITE_THROUGH)) {
-      throw std::system_error((int)GetLastError(), std::system_category(),
-                              "Could not atomically commit the new client");
+    {
+      if (!targetNamespace.Verify(errorDetails) ||
+          !stagedNamespace.Verify(errorDetails) ||
+          !stagedNamespace.PinAncestor(sitesRoot, false, errorDetails) ||
+          !stagedNamespace.MoveRoot(targetRoot, errorDetails))
+        throw std::runtime_error("The original staged client could not be committed safely");
+      renameCommitted = true;
+      fs::path slotRoot;
+      if (!GetBrowserSlotPaths(targetRoot, browser, slotRoot, profileRoot) ||
+          !IsValidBrowserSlot(slotRoot, profileRoot, browser) ||
+          !stagedNamespace.Verify(errorDetails))
+        throw std::runtime_error("The committed new client failed validation");
+      committed = true;
     }
-    renameCommitted = true;
-    fs::path slotRoot;
-    if (!GetBrowserSlotPaths(targetRoot, browser, slotRoot, profileRoot) ||
-        !IsValidBrowserSlot(slotRoot, profileRoot, browser)) {
-      throw std::runtime_error("The committed new client failed validation");
-    }
-    committed = true;
   } catch (const std::exception &error) {
     errorDetails = AnsiToWide(error.what());
   }
@@ -8511,13 +9091,7 @@ static bool CreateNewV2Client(const std::wstring &clientName,
         targetRoot.wstring();
   }
 
-  std::error_code cleanupError;
-  fs::remove_all(workRoot, cleanupError);
-  cleanupError.clear();
-  if (fs::is_directory(workBase, cleanupError) &&
-      fs::is_empty(workBase, cleanupError)) {
-    fs::remove(workBase, cleanupError);
-  }
+  CleanupOwnedProfileWorkRoot(workRoot, workBase, workNamespace, errorDetails);
   return committed;
 }
 
@@ -8602,7 +9176,8 @@ DWORD LaunchProfile(const std::wstring &clientName, bool isTemp,
                     fs::path *launchedProfilePath,
                     fs::path *launchedExecutablePath,
                     std::wstring *launchError,
-                    bool *freshTransientProfile) {
+                    bool *freshTransientProfile,
+                    std::shared_ptr<transient_profile::Identity> *createdDirectory) {
   if (processHandle)
     *processHandle = nullptr;
   if (launchedProfilePath)
@@ -8613,6 +9188,9 @@ DWORD LaunchProfile(const std::wstring &clientName, bool isTemp,
     launchError->clear();
   if (freshTransientProfile)
     *freshTransientProfile = false;
+  if (createdDirectory)
+    createdDirectory->reset();
+  std::shared_ptr<transient_profile::Identity> transientDirectory;
 
   fs::path profilePath;
   const auto profileUseBlocksAction =
@@ -8706,9 +9284,19 @@ DWORD LaunchProfile(const std::wstring &clientName, bool isTemp,
       MessageBoxW(g_hGui, message, profileLabel, MB_OK | MB_ICONWARNING);
       return 0;
     }
-    // From this point on, any data at this exact transient path was created by
-    // this launch attempt. A failure may clean it without risking an older,
-    // unsaved Default editor directory that we could not replace.
+    // Only successful exclusive creation grants this attempt cleanup authority.
+    // A directory appearing after the old profile was removed belongs to
+    // neither this launch nor its failure rollback.
+    transientDirectory = transient_profile::Identity::Create(profilePath);
+    if (!transientDirectory) {
+      MessageBoxW(g_hGui,
+                  L"The disposable profile folder could not be reserved. "
+                  L"Any existing folder was left unchanged; please retry.",
+                  L"Cannot Open Profile", MB_OK | MB_ICONWARNING);
+      return 0;
+    }
+    if (createdDirectory)
+      *createdDirectory = transientDirectory;
     if (freshTransientProfile)
       *freshTransientProfile = true;
   }
@@ -8716,19 +9304,32 @@ DWORD LaunchProfile(const std::wstring &clientName, bool isTemp,
   if (isTemp || isDefault) {
     bool transientReady = false;
     if (browser == BrowserKind::Firefox) {
-      transientReady = !isDefault &&
-                       CreateDirectoryW(profilePath.c_str(), nullptr) != FALSE &&
-                       IsSafeExistingDirectory(profilePath);
+      transientReady = !isDefault && IsSafeExistingDirectory(profilePath);
     } else {
       const wchar_t *status = isDefault ? L"Loading Default Profile..."
                                         : L"Loading Temp Profile...";
-      transientReady = extDef(profilePath, status);
+      transientReady = extDef(profilePath, status, transientDirectory);
     }
     if (!transientReady) {
       MessageBoxW(g_hGui,
                   L"The disposable browser profile could not be created "
                   L"safely.",
                   L"Cannot Open Profile", MB_OK | MB_ICONERROR);
+      return 0;
+    }
+  }
+
+  client_deletion_safety::BoundTree tabLayoutNamespace;
+  if (!isDefault) {
+    std::wstring namespaceError;
+    if (!tabLayoutNamespace.CaptureNamespace(IsChromiumBrowser(browser) ? profilePath / L"Default" : profilePath, namespaceError)) {
+      std::wstring message =
+          L"The original browser-profile namespace could not be protected "
+          L"while preparing its tab layout. The profile was not opened.";
+      if (!namespaceError.empty()) message += L"\n\n" + namespaceError;
+      if (launchError) *launchError = message;
+      else MessageBoxW(g_hGui, message.c_str(), L"Cannot Open Profile",
+                       MB_OK | MB_ICONERROR);
       return 0;
     }
   }
@@ -8741,12 +9342,58 @@ DWORD LaunchProfile(const std::wstring &clientName, bool isTemp,
             L"safely. Its startup preferences were left unchanged.")) {
       return 0;
     }
-    if (!SetBrowserStartupPreference(profilePath, restoreLastSession)) {
-      MessageBoxW(g_hGui,
-                  L"The Chromium startup preferences could not be updated "
-                  L"safely. The profile was not opened.",
+    std::wstring preferenceError;
+    if (!SetBrowserStartupPreference(profilePath, restoreLastSession,
+                                     &preferenceError)) {
+      std::wstring message =
+          L"The Chromium startup preferences could not be updated "
+          L"safely. The profile was not opened.";
+      if (!preferenceError.empty())
+        message += L"\n\n" + preferenceError;
+      MessageBoxW(g_hGui, message.c_str(),
                   L"Cannot Open Profile", MB_OK | MB_ICONERROR);
       return 0;
+    }
+  }
+
+  if (!isDefault) {
+    // Resolve once for this launch, after the exact browser slot exists.
+    // The setting is client-wide; Temp follows only the global preference.
+    auto tabLayout = g_globalTabLayout.load();
+    std::wstring layoutError;
+    if (!isTemp) {
+      fs::path clientRoot;
+      client_tab_layout::Override choice{};
+      if (!TryGetSafeClientProfilePath(clientName, clientRoot) ||
+          !client_tab_layout::Read(clientRoot, choice, &layoutError)) {
+        if (layoutError.empty())
+          layoutError = L"The client's tab-layout preference could not be read safely.";
+        if (launchError) *launchError = layoutError;
+        else MessageBoxW(g_hGui, layoutError.c_str(), L"Cannot Open Profile",
+                         MB_OK | MB_ICONERROR);
+        return 0;
+      }
+      tabLayout = client_tab_layout::Resolve(tabLayout, choice);
+    }
+    // Firefox must also release our previous user.js override when the
+    // browser's own choice is selected. Chromium has no persistent override.
+    if (tabLayout != client_tab_layout::Layout::Browser ||
+        browser == BrowserKind::Firefox) {
+      if (profileUseBlocksAction(
+              L"The browser profile is already active or could not be "
+              L"inspected safely. Its tab layout was left unchanged."))
+        return 0;
+      if (!ApplyBrowserTabLayoutPreference(profilePath, browser, tabLayout,
+                                           layoutError)) {
+        std::wstring message =
+            L"The browser's tab-layout preference could not be updated "
+            L"safely. The profile was not opened.";
+        if (!layoutError.empty()) message += L"\n\n" + layoutError;
+        if (launchError) *launchError = message;
+        else MessageBoxW(g_hGui, message.c_str(), L"Cannot Open Profile",
+                         MB_OK | MB_ICONERROR);
+        return 0;
+      }
     }
   }
 
@@ -8754,6 +9401,16 @@ DWORD LaunchProfile(const std::wstring &clientName, bool isTemp,
           L"The browser profile became active in another process or could "
           L"not be reverified immediately before launch.")) {
     return 0;
+  }
+
+  if (!isDefault) {
+    std::wstring namespaceError;
+    if (!tabLayoutNamespace.Verify(namespaceError)) {
+      if (launchError) *launchError = namespaceError;
+      else MessageBoxW(g_hGui, namespaceError.c_str(), L"Cannot Open Profile",
+                       MB_OK | MB_ICONERROR);
+      return 0;
+    }
   }
 
   const fs::path executablePath = GetBrowserExecutable(browser);
@@ -8874,7 +9531,7 @@ std::wstring ResolveExistingClientName(const std::wstring &name) {
           continue;
         const std::wstring existing = entry.path().filename().wstring();
         fs::path safeProfilePath;
-        if (_wcsicmp(existing.c_str(), sanitized.c_str()) == 0 &&
+        if (client_name_comparison::EqualIgnoringCase(existing, sanitized) &&
             TryGetSafeClientProfilePath(existing, safeProfilePath))
           return existing;
       }
@@ -8897,6 +9554,8 @@ static bool IsExistingClientProfile(const std::wstring &clientName) {
     return false;
   }
 }
+
+#include "BrowserTabLayoutUi.inl"
 
 static config_persistence::DirectChildDirectoryState
 ProbeClientProfileForPruning(const std::wstring &storedName,
@@ -8921,7 +9580,7 @@ static auto FindPinnedClient(const std::wstring &clientName) {
   return std::find_if(
       g_pinnedClients.begin(), g_pinnedClients.end(),
       [&clientName](const std::wstring &pinnedName) {
-        return _wcsicmp(pinnedName.c_str(), clientName.c_str()) == 0;
+        return client_name_comparison::EqualIgnoringCase(pinnedName, clientName);
       });
 }
 
@@ -8929,10 +9588,18 @@ static bool IsClientPinned(const std::wstring &clientName) {
   return FindPinnedClient(clientName) != g_pinnedClients.end();
 }
 
-static bool SavePinnedClients() {
+static bool SavePinnedClients(const std::vector<std::wstring> *expectedOriginal,
+                             ClientPreferenceSnapshot *observedChanged) {
+  if (observedChanged) observedChanged->reset();
   if (g_sConfigPath.empty())
     return false;
+  if (expectedOriginal)
+    return SaveClientListSnapshot(L"pinned", L"count", L"client",
+        MAX_PINNED_CLIENTS, false, *expectedOriginal, g_pinnedClients,
+        observedChanged);
 
+  // Initial serialization is retained for private fixture setup. Runtime
+  // maintenance/reorder callers must supply their pre-change snapshot above.
   std::vector<config_persistence::IniMutation> mutations;
   mutations.push_back({L"pinned", std::nullopt, std::nullopt});
   const std::wstring count = std::to_wstring(g_pinnedClients.size());
@@ -8940,7 +9607,7 @@ static bool SavePinnedClients() {
       {L"pinned", std::wstring(L"count"), count});
   for (size_t i = 0; i < g_pinnedClients.size(); ++i) {
     const std::wstring key = std::format(L"client{}", i);
-    mutations.push_back({L"pinned", key, g_pinnedClients[i]});
+    mutations.push_back({L"pinned", key, client_preference_encoding::ForIni(g_pinnedClients[i])});
   }
   return SaveConfigMutations(L"pinned-client list", mutations);
 }
@@ -8961,7 +9628,7 @@ static void PrunePinnedClients() {
     const bool duplicate = std::any_of(
         validClients.begin(), validClients.end(),
         [&clientName](const std::wstring &existing) {
-          return _wcsicmp(existing.c_str(), clientName.c_str()) == 0;
+          return client_name_comparison::EqualIgnoringCase(existing, clientName);
         });
     if (profileState ==
             config_persistence::DirectChildDirectoryState::Present &&
@@ -8980,9 +9647,22 @@ static void PrunePinnedClients() {
   }
   if (changed) {
     std::vector<std::wstring> originalClients = g_pinnedClients;
+    const bool ownsUnsavedDragOrder =
+        g_mainDragKind == MainDragKind::PinnedClient &&
+        g_bPinnedDragSnapshotValid && !g_bPinnedDragCancelled &&
+        g_pinnedClients == g_pinnedClientsExpectedDuringDrag &&
+        std::is_permutation(g_pinnedClients.begin(), g_pinnedClients.end(),
+                            g_pinnedClientsBeforeDrag.begin(),
+                            g_pinnedClientsBeforeDrag.end());
+    // A known unsaved drag changed only the order in memory. Its saved baseline
+    // is still the pre-drag list; independently saved changes must still fail CAS.
+    const std::vector<std::wstring> expectedClients =
+        ownsUnsavedDragOrder ? g_pinnedClientsBeforeDrag : originalClients;
     g_pinnedClients = std::move(validClients);
-    if (!SavePinnedClients())
-      g_pinnedClients = std::move(originalClients);
+    ClientPreferenceSnapshot observedChanged;
+    if (!SavePinnedClients(&expectedClients, &observedChanged))
+      g_pinnedClients = observedChanged ? std::move(*observedChanged)
+                                       : std::move(originalClients);
   }
 }
 
@@ -9011,8 +9691,324 @@ static bool ContainsClientName(const std::vector<std::wstring> &clients,
   return std::any_of(
       clients.begin(), clients.end(),
       [&clientName](const std::wstring &storedName) {
-        return _wcsicmp(storedName.c_str(), clientName.c_str()) == 0;
+        return client_name_comparison::EqualIgnoringCase(storedName, clientName);
       });
+}
+
+enum class ClientListStageRewrite { NotApplicable, Applied, Failed };
+#ifdef CTSPACES_CLIENT_PREFERENCE_TEST_HOOKS
+extern BOOL CtSpacesClientPreferenceStageWrite(HANDLE file, const void *bytes,
+                                               DWORD count, DWORD *written);
+#endif
+
+static ClientListStageRewrite TryRewriteCanonicalClientListStage(
+    const fs::path &stagedPath, const wchar_t *section,
+    const std::vector<std::wstring> &seen,
+    const std::vector<std::wstring> &committed, std::wstring &error,
+    const wchar_t *countKey = L"count", const wchar_t *rowPrefix = L"client") {
+  constexpr size_t maximumBytes = 16 * 1024 * 1024;
+  // Evict the profile API's staged-file cache before direct I/O. Otherwise its
+  // later flush could restore the pre-edit contents of this private stage.
+  (void)WritePrivateProfileStringW(nullptr, nullptr, nullptr, stagedPath.c_str());
+  struct StageHandle {
+    HANDLE value = INVALID_HANDLE_VALUE;
+    ~StageHandle() { if (value != INVALID_HANDLE_VALUE) CloseHandle(value); }
+    bool Close() {
+      const HANDLE closing = value;
+      value = INVALID_HANDLE_VALUE;
+      return CloseHandle(closing) != FALSE;
+    }
+  } file{CreateFileW(stagedPath.c_str(), GENERIC_READ | GENERIC_WRITE,
+                    FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+                    FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT,
+                    nullptr)};
+  const auto failed = [&](const wchar_t *details) {
+    error = details;
+    return ClientListStageRewrite::Failed;
+  };
+  if (file.value == INVALID_HANDLE_VALUE)
+    return failed(L"The staged client settings could not be opened safely.");
+  BY_HANDLE_FILE_INFORMATION information{};
+  LARGE_INTEGER size{};
+  if (!GetFileInformationByHandle(file.value, &information) ||
+      (information.dwFileAttributes &
+       (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) ||
+      information.nNumberOfLinks != 1 || !GetFileSizeEx(file.value, &size) ||
+      size.QuadPart < 2 || size.QuadPart > maximumBytes || size.QuadPart % 2)
+    return failed(L"The staged client settings are not a bounded, ordinary Unicode file.");
+  std::wstring text(static_cast<size_t>(size.QuadPart) / sizeof(wchar_t), L'\0');
+  DWORD read = 0;
+  if (!ReadFile(file.value, text.data(), static_cast<DWORD>(size.QuadPart),
+                &read, nullptr) || read != size.QuadPart)
+    return failed(L"The complete staged client settings could not be read.");
+  if (text.front() != L'\xFEFF' || text.find(L'\0') != std::wstring::npos)
+    return failed(L"The staged client settings have an invalid Unicode signature or embedded null.");
+
+  struct Replacement { size_t begin, end; std::wstring text; };
+  std::vector<Replacement> replacements;
+  std::vector<bool> foundRows(seen.size(), false);
+  bool inTarget = false, foundCount = false;
+  unsigned targetSections = 0;
+  size_t sectionEnd = text.size();
+  const auto trimmed = [](std::wstring_view value) {
+    const size_t first = value.find_first_not_of(L" \t");
+    if (first == std::wstring_view::npos) return std::wstring_view{};
+    return value.substr(first, value.find_last_not_of(L" \t") - first + 1);
+  };
+  const std::wstring sectionHeader = L"[" + std::wstring(section) + L"]";
+  const size_t prefixLength = wcslen(rowPrefix);
+  const auto notApplicable = [&]() {
+    return file.Close() ? ClientListStageRewrite::NotApplicable
+                        : failed(L"The staged client settings could not be closed.");
+  };
+  // Only canonical CRLF syntax is edited directly. The native INI path retains
+  // its established interpretation of other valid formatting and ambiguities.
+  for (size_t position = 1; position < text.size();) {
+    const size_t newline = text.find(L'\n', position);
+    if (newline == std::wstring::npos || newline == position ||
+        text[newline - 1] != L'\r')
+      return notApplicable();
+    const size_t end = newline + 1;
+    const std::wstring_view line(text.data() + position, newline - position - 1);
+    if (std::any_of(line.begin(), line.end(), [](wchar_t character) {
+          return character < L' ' && character != L'\t';
+        }))
+      return notApplicable();
+    const auto clean = trimmed(line);
+    if (!clean.empty() && clean.front() == L'[') {
+      if (clean.size() < 2 || clean.back() != L']' || clean != line ||
+          clean.substr(1, clean.size() - 2).find_first_of(L"[]") != std::wstring_view::npos)
+        return notApplicable();
+      const std::wstring name(clean.substr(1, clean.size() - 2));
+      if (name.empty() || trimmed(name) != name)
+        return notApplicable();
+      const bool target = client_name_comparison::EqualIgnoringCase(name, section);
+      if (inTarget) sectionEnd = position;
+      inTarget = target;
+      if (target && (++targetSections != 1 || line != sectionHeader))
+        return notApplicable();
+    } else if (inTarget && !clean.empty() && clean.front() != L';') {
+      const size_t equals = clean.find(L'=');
+      const auto key = trimmed(clean.substr(0, equals));
+      const std::wstring keyText(key);
+      const bool isCount = client_name_comparison::EqualIgnoringCase(keyText, countKey);
+      bool indexedKey = key.size() > prefixLength &&
+          CompareStringOrdinal(key.data(), static_cast<int>(prefixLength),
+                               rowPrefix, static_cast<int>(prefixLength), TRUE) == CSTR_EQUAL;
+      size_t index = 0;
+      if (indexedKey) {
+        for (wchar_t digit : key.substr(prefixLength)) {
+          if (digit < L'0' || digit > L'9') { indexedKey = false; break; }
+          if (index > seen.size() / 10) return notApplicable();
+          index = index * 10 + static_cast<size_t>(digit - L'0');
+          if (index >= seen.size()) return notApplicable();
+        }
+      }
+      if (isCount) {
+        if (foundCount || line != std::wstring(countKey) + L"=" + std::to_wstring(seen.size()))
+          return notApplicable();
+        foundCount = true;
+        replacements.push_back({position, end,
+            std::wstring(countKey) + L"=" + std::to_wstring(committed.size()) + L"\r\n"});
+      } else if (indexedKey) {
+        if (foundRows[index] || line != std::wstring(rowPrefix) + std::to_wstring(index) + L"=" + client_preference_encoding::ForIni(seen[index]))
+          return notApplicable();
+        foundRows[index] = true;
+        replacements.push_back({position, end, index < committed.size()
+            ? std::wstring(rowPrefix) + std::to_wstring(index) + L"=" + client_preference_encoding::ForIni(committed[index]) + L"\r\n"
+            : L""});
+      }
+    }
+    position = end;
+  }
+  if (targetSections != 1 || !foundCount ||
+      std::find(foundRows.begin(), foundRows.end(), false) != foundRows.end())
+    return notApplicable();
+  std::wstring appended;
+  for (size_t index = seen.size(); index < committed.size(); ++index)
+    appended += std::wstring(rowPrefix) + std::to_wstring(index) + L"=" + client_preference_encoding::ForIni(committed[index]) + L"\r\n";
+  if (!appended.empty()) replacements.push_back({sectionEnd, sectionEnd, std::move(appended)});
+  std::sort(replacements.begin(), replacements.end(),
+            [](const auto &left, const auto &right) { return left.begin < right.begin; });
+  std::wstring rewritten;
+  size_t copied = 0;
+  for (const auto &replacement : replacements) {
+    rewritten.append(text, copied, replacement.begin - copied);
+    rewritten += replacement.text;
+    copied = replacement.end;
+  }
+  rewritten.append(text, copied, text.size() - copied);
+  if (rewritten.size() > maximumBytes / sizeof(wchar_t))
+    return failed(L"The staged client settings exceed their supported size.");
+  if (rewritten != text) {
+    LARGE_INTEGER beginning{};
+    if (!SetFilePointerEx(file.value, beginning, nullptr, FILE_BEGIN))
+      return failed(L"The staged client settings could not be rewound.");
+    DWORD written = 0;
+    const DWORD bytes = static_cast<DWORD>(rewritten.size() * sizeof(wchar_t));
+#ifdef CTSPACES_CLIENT_PREFERENCE_TEST_HOOKS
+    const BOOL wrote = CtSpacesClientPreferenceStageWrite(file.value, rewritten.data(), bytes, &written);
+#else
+    const BOOL wrote = WriteFile(file.value, rewritten.data(), bytes, &written, nullptr);
+#endif
+    if (!wrote || written != bytes || !SetEndOfFile(file.value) ||
+        !FlushFileBuffers(file.value))
+      return failed(L"The complete staged client settings could not be written and flushed. Existing settings were kept.");
+  }
+  if (!file.Close())
+    return failed(L"The staged client settings could not be closed.");
+
+  wchar_t countText[32]{};
+  GetPrivateProfileStringW(section, countKey, L"", countText,
+                           (DWORD)std::size(countText), stagedPath.c_str());
+  if (countText != std::to_wstring(committed.size()))
+    return failed(L"The rewritten client-list count could not be verified.");
+  for (size_t i = 0; i < committed.size(); ++i) {
+    wchar_t value[512]{};
+    const auto key = std::wstring(rowPrefix) + std::to_wstring(i);
+    GetPrivateProfileStringW(section, key.c_str(), L"", value,
+                             (DWORD)std::size(value), stagedPath.c_str());
+    if (value != committed[i])
+      return failed(L"The rewritten client-list entries could not be verified.");
+  }
+  return ClientListStageRewrite::Applied;
+}
+
+static bool ReadStagedClientList(
+    const fs::path &stagedPath, const wchar_t *section,
+    const wchar_t *countKey, const wchar_t *rowPrefix, size_t maximum,
+    bool browserPreferences, std::vector<std::wstring> &values,
+    std::wstring &error);
+
+static bool VerifyStagedClientList(
+    const fs::path &stagedPath, const wchar_t *section,
+    const wchar_t *countKey, const wchar_t *rowPrefix, size_t maximum,
+    bool browserPreferences, const std::vector<std::wstring> &expected,
+    std::wstring &error) {
+  std::vector<std::wstring> observed;
+  if (!ReadStagedClientList(stagedPath, section, countKey, rowPrefix, maximum,
+                           browserPreferences, observed, error)) return false;
+  if (observed != expected) {
+    error = L"The saved client identities could not be verified exactly. Existing settings were kept.";
+    return false;
+  }
+  return true;
+}
+
+static bool MutateStagedClientList(const fs::path &stagedPath,
+                                  const wchar_t *section, size_t maximum,
+                                  const std::wstring &clientName, bool present,
+                                  std::vector<std::wstring> &committed,
+                                  std::wstring &error) {
+  wchar_t countText[32]{};
+  const DWORD countLength = GetPrivateProfileStringW(
+      section, L"count", L"0", countText, (DWORD)std::size(countText),
+      stagedPath.c_str());
+  size_t count = 0;
+  if (!countLength || countLength >= std::size(countText) - 1) {
+    error = L"The saved client-list count is invalid. Existing settings were kept.";
+    return false;
+  }
+  for (DWORD i = 0; i < countLength; ++i) {
+    if (countText[i] < L'0' || countText[i] > L'9' || count > maximum / 10) {
+      error = L"The saved client-list count is invalid. Existing settings were kept.";
+      return false;
+    }
+    count = count * 10 + static_cast<size_t>(countText[i] - L'0');
+    if (count > maximum) {
+      error = L"The saved client list exceeds its supported size. Existing settings were kept.";
+      return false;
+    }
+  }
+
+  committed.clear();
+  std::vector<std::wstring> seen;
+  for (size_t i = 0; i < count; ++i) {
+    wchar_t value[256]{};
+    const std::wstring key = std::format(L"client{}", i);
+    const DWORD length = GetPrivateProfileStringW(
+        section, key.c_str(), L"", value, (DWORD)std::size(value),
+        stagedPath.c_str());
+    const std::wstring name(value);
+    if (!length || length >= std::size(value) - 1 ||
+        SanitizeName(name) != name || ContainsClientName(seen, name)) {
+      error = L"A saved client-list entry is missing, invalid, too long or duplicated. Existing settings were kept.";
+      return false;
+    }
+    seen.push_back(name);
+    if (!client_name_comparison::EqualIgnoringCase(name, clientName))
+      committed.push_back(name);
+    else if (present)
+      committed.push_back(name);
+  }
+  if (present && !ContainsClientName(committed, clientName)) {
+    if (committed.size() >= maximum) {
+      error = maximum == MAX_PINNED_CLIENTS
+                  ? L"You can pin up to eight clients. Unpin one before adding another."
+                  : L"The archived-client list is full.";
+      return false;
+    }
+    committed.push_back(clientName);
+  }
+
+  const auto rewrite = TryRewriteCanonicalClientListStage(
+      stagedPath, section, seen, committed, error);
+  if (rewrite != ClientListStageRewrite::NotApplicable)
+    return rewrite == ClientListStageRewrite::Applied;
+
+  // Change only the indexed rows and count owned by this list. Preserve future
+  // keys and unrelated settings from the current publication snapshot.
+  for (size_t i = 0; i < (std::max)(count, committed.size()); ++i) {
+    if (i < seen.size() && i < committed.size() && seen[i] == committed[i])
+      continue;
+    const std::wstring key = std::format(L"client{}", i);
+    const auto encoded = i < committed.size()
+        ? client_preference_encoding::ForIni(committed[i]) : std::wstring{};
+    if (!WritePrivateProfileStringW(section, key.c_str(),
+            i < committed.size() ? encoded.c_str() : nullptr,
+            stagedPath.c_str()))
+      return false;
+  }
+  if (count != committed.size()) {
+    const std::wstring updatedCount = std::to_wstring(committed.size());
+    if (!WritePrivateProfileStringW(section, L"count", updatedCount.c_str(),
+                                    stagedPath.c_str())) return false;
+  }
+  return VerifyStagedClientList(stagedPath, section, L"count", L"client",
+                               maximum, false, committed, error);
+}
+
+static bool SaveClientPreferenceDelta(const std::wstring &clientName,
+                                     std::optional<bool> pinned,
+                                     std::optional<bool> archived) {
+  if (g_sConfigPath.empty() || clientName.empty() ||
+      SanitizeName(clientName) != clientName)
+    return false;
+  std::vector<std::wstring> committedPinned, committedArchived;
+  std::wstring details;
+  const bool saved = config_persistence::MutateIniFileAtomically(
+      g_sConfigPath, [&](const fs::path &stagedPath, std::wstring &error) {
+        return (!archived || MutateStagedClientList(
+                    stagedPath, L"archived", MAX_ARCHIVED_CLIENTS, clientName,
+                    *archived, committedArchived, error)) &&
+               (!pinned || MutateStagedClientList(
+                    stagedPath, L"pinned", MAX_PINNED_CLIENTS, clientName,
+                    *pinned, committedPinned, error));
+      }, &details);
+  if (saved) {
+    if (pinned)
+      g_pinnedClients = std::move(committedPinned);
+    if (archived)
+      g_archivedClients = std::move(committedArchived);
+  } else {
+    std::wstring message = L"The client settings could not be saved safely. "
+                           L"Existing saved settings were kept. Please retry.";
+    if (!details.empty())
+      message += L"\n\n" + details;
+    MessageBoxW(g_hGui, message.c_str(), L"Configuration Was Not Saved",
+                MB_OK | MB_ICONWARNING);
+  }
+  return saved;
 }
 
 static std::wstring MakeClientBrowserPreferenceKey(
@@ -9038,6 +10034,133 @@ static bool TryParseClientBrowserPreferenceKey(
   return false;
 }
 
+static bool ValidClientListValue(const std::wstring &value,
+                                bool browserPreferences) {
+  std::wstring clientName = value;
+  BrowserKind browser = BrowserKind::Edge;
+  if (browserPreferences)
+    TryParseClientBrowserPreferenceKey(value, clientName, browser);
+  return !clientName.empty() && SanitizeName(clientName) == clientName;
+}
+
+static bool ReadStagedClientList(
+    const fs::path &stagedPath, const wchar_t *section,
+    const wchar_t *countKey, const wchar_t *rowPrefix, size_t maximum,
+    bool browserPreferences, std::vector<std::wstring> &values,
+    std::wstring &error) {
+  wchar_t countText[32]{};
+  const DWORD length = GetPrivateProfileStringW(
+      section, countKey, L"0", countText, (DWORD)std::size(countText), stagedPath.c_str());
+  size_t count = 0;
+  if (!length || length >= std::size(countText) - 1) {
+    error = L"The saved client-list count is invalid. Existing settings were kept.";
+    return false;
+  }
+  for (DWORD i = 0; i < length; ++i) {
+    if (countText[i] < L'0' || countText[i] > L'9' || count > maximum / 10) {
+      error = L"The saved client-list count is invalid. Existing settings were kept.";
+      return false;
+    }
+    count = count * 10 + static_cast<size_t>(countText[i] - L'0');
+    if (count > maximum) {
+      error = L"The saved client list exceeds its supported size. Existing settings were kept.";
+      return false;
+    }
+  }
+  values.clear();
+  for (size_t i = 0; i < count; ++i) {
+    wchar_t value[512]{};
+    const auto key = std::wstring(rowPrefix) + std::to_wstring(i);
+    const DWORD valueLength = GetPrivateProfileStringW(
+        section, key.c_str(), L"", value, (DWORD)std::size(value), stagedPath.c_str());
+    if (!valueLength || valueLength >= std::size(value) - 1 ||
+        !ValidClientListValue(value, browserPreferences) || ContainsClientName(values, value)) {
+      error = L"A saved client-list entry is missing, invalid, too long or duplicated. Existing settings were kept.";
+      return false;
+    }
+    values.emplace_back(value);
+  }
+  return true;
+}
+
+static bool WriteStagedClientListSnapshot(
+    const fs::path &stagedPath, const wchar_t *section,
+    const wchar_t *countKey, const wchar_t *rowPrefix, size_t maximum,
+    bool browserPreferences,
+    const std::vector<std::wstring> &current,
+    const std::vector<std::wstring> &replacement, std::wstring &error) {
+  const auto rewrite = TryRewriteCanonicalClientListStage(
+      stagedPath, section, current, replacement, error, countKey, rowPrefix);
+  if (rewrite != ClientListStageRewrite::NotApplicable)
+    return rewrite == ClientListStageRewrite::Applied;
+  for (size_t i = 0; i < (std::max)(current.size(), replacement.size()); ++i) {
+    if (i < current.size() && i < replacement.size() && current[i] == replacement[i])
+      continue;
+    const auto key = std::wstring(rowPrefix) + std::to_wstring(i);
+    const auto encoded = i < replacement.size()
+        ? client_preference_encoding::ForIni(replacement[i]) : std::wstring{};
+    if (!WritePrivateProfileStringW(section, key.c_str(),
+            i < replacement.size() ? encoded.c_str() : nullptr,
+            stagedPath.c_str())) return false;
+  }
+  if (current.size() != replacement.size()) {
+    const auto count = std::to_wstring(replacement.size());
+    if (!WritePrivateProfileStringW(section, countKey, count.c_str(),
+                                    stagedPath.c_str())) return false;
+  }
+  return VerifyStagedClientList(stagedPath, section, countKey, rowPrefix,
+                               maximum, browserPreferences, replacement, error);
+}
+
+static bool SaveClientListSnapshot(
+    const wchar_t *section, const wchar_t *countKey, const wchar_t *rowPrefix,
+    size_t maximum, bool browserPreferences,
+    const std::vector<std::wstring> &expectedOriginal,
+    const std::vector<std::wstring> &replacement,
+    ClientPreferenceSnapshot *observedChanged) {
+  if (observedChanged) observedChanged->reset();
+  if (g_sConfigPath.empty()) return false;
+  const std::vector<std::wstring> committed = replacement;
+  std::wstring details;
+  bool saved = false;
+  std::vector<std::wstring> validated;
+  if (committed.size() <= maximum &&
+      std::all_of(committed.begin(), committed.end(), [&](const auto &value) {
+        if (!ValidClientListValue(value, browserPreferences) ||
+            ContainsClientName(validated, value)) return false;
+        validated.push_back(value);
+        return true;
+      })) {
+    saved = config_persistence::MutateIniFileAtomically(
+        g_sConfigPath, [&](const fs::path &stagedPath, std::wstring &error) {
+          std::vector<std::wstring> current;
+          if (!ReadStagedClientList(stagedPath, section, countKey, rowPrefix,
+                                   maximum, browserPreferences, current, error))
+            return false;
+          // This is an ordered snapshot comparison, including exact spelling.
+          // Reordering/pruning must not erase a newer membership or ordering.
+          if (current != expectedOriginal) {
+            if (observedChanged) *observedChanged = current;
+            error = L"This saved client list changed before the update. Its newer list was kept. Please retry.";
+            return false;
+          }
+          return WriteStagedClientListSnapshot(stagedPath, section, countKey,
+                                                rowPrefix, maximum, browserPreferences,
+                                                current, committed, error);
+        }, &details);
+  } else {
+    details = L"The requested client list is invalid or exceeds its supported size.";
+  }
+  if (!saved) {
+    std::wstring message = L"The client settings could not be saved safely. "
+                           L"Existing saved settings were kept. Please retry.";
+    if (!details.empty()) message += L"\n\n" + details;
+    MessageBoxW(g_hGui, message.c_str(), L"Configuration Was Not Saved",
+                MB_OK | MB_ICONWARNING);
+  }
+  return saved;
+}
+
 static BrowserKind GetBrowserForCurrentSelection() {
   if (g_iSelectedSessionTab > 0 &&
       g_iSelectedSessionTab <= (int)g_sessions.size()) {
@@ -9050,9 +10173,15 @@ static bool IsClientArchived(const std::wstring &clientName) {
   return ContainsClientName(g_archivedClients, clientName);
 }
 
-static bool SaveArchivedClients() {
+static bool SaveArchivedClients(const std::vector<std::wstring> *expectedOriginal,
+                               ClientPreferenceSnapshot *observedChanged) {
+  if (observedChanged) observedChanged->reset();
   if (g_sConfigPath.empty())
     return false;
+  if (expectedOriginal)
+    return SaveClientListSnapshot(L"archived", L"count", L"client",
+        MAX_ARCHIVED_CLIENTS, false, *expectedOriginal, g_archivedClients,
+        observedChanged);
 
   std::vector<config_persistence::IniMutation> mutations;
   mutations.push_back({L"archived", std::nullopt, std::nullopt});
@@ -9061,7 +10190,7 @@ static bool SaveArchivedClients() {
       {L"archived", std::wstring(L"count"), count});
   for (size_t i = 0; i < g_archivedClients.size(); ++i) {
     const std::wstring key = std::format(L"client{}", i);
-    mutations.push_back({L"archived", key, g_archivedClients[i]});
+    mutations.push_back({L"archived", key, client_preference_encoding::ForIni(g_archivedClients[i])});
   }
   return SaveConfigMutations(L"archived-client list", mutations);
 }
@@ -9094,8 +10223,10 @@ static void PruneArchivedClients() {
   if (changed) {
     std::vector<std::wstring> originalClients = g_archivedClients;
     g_archivedClients = std::move(validClients);
-    if (!SaveArchivedClients())
-      g_archivedClients = std::move(originalClients);
+    ClientPreferenceSnapshot observedChanged;
+    if (!SaveArchivedClients(&originalClients, &observedChanged))
+      g_archivedClients = observedChanged ? std::move(*observedChanged)
+                                         : std::move(originalClients);
   }
 }
 
@@ -9120,7 +10251,10 @@ static void LoadArchivedClients() {
   PruneArchivedClients();
 }
 
-static bool SaveRestoreTabsPreferences() {
+static bool SaveRestoreTabsPreferences(
+    const std::vector<std::wstring> *expectedOriginal,
+    ClientPreferenceSnapshot *observedChanged) {
+  if (observedChanged) observedChanged->reset();
   if (g_sConfigPath.empty())
     return false;
 
@@ -9129,6 +10263,10 @@ static bool SaveRestoreTabsPreferences() {
     std::lock_guard<std::mutex> lock(g_restoreTabsPreferenceMutex);
     disabledClients = g_clientsWithoutTabRestore;
   }
+  if (expectedOriginal)
+    return SaveClientListSnapshot(L"restore_tabs", L"disabled_count",
+        L"disabled_client", MAX_RESTORE_TAB_PREFERENCES, true,
+        *expectedOriginal, disabledClients, observedChanged);
 
   std::vector<config_persistence::IniMutation> mutations;
   mutations.push_back({L"restore_tabs", std::nullopt, std::nullopt});
@@ -9137,9 +10275,94 @@ static bool SaveRestoreTabsPreferences() {
       {L"restore_tabs", std::wstring(L"disabled_count"), count});
   for (size_t i = 0; i < disabledClients.size(); ++i) {
     const std::wstring key = std::format(L"disabled_client{}", i);
-    mutations.push_back({L"restore_tabs", key, disabledClients[i]});
+    mutations.push_back({L"restore_tabs", key, client_preference_encoding::ForIni(disabledClients[i])});
   }
   return SaveConfigMutations(L"Restore tabs preference", mutations);
+}
+
+static bool SaveRestoreTabsPreference(const std::wstring &preferenceKey,
+                                      bool disabled) {
+  std::wstring clientName;
+  BrowserKind browser = BrowserKind::Edge;
+  if (g_sConfigPath.empty() ||
+      !TryParseClientBrowserPreferenceKey(preferenceKey, clientName, browser) ||
+      !IsExistingClientProfile(clientName))
+    return false;
+
+  std::vector<std::wstring> committed;
+  std::wstring details;
+  const bool saved = config_persistence::MutateIniFileAtomically(
+      g_sConfigPath, [&](const fs::path &stagedPath, std::wstring &error) {
+        wchar_t countText[32]{};
+        const DWORD countLength = GetPrivateProfileStringW(
+            L"restore_tabs", L"disabled_count", L"0", countText,
+            (DWORD)std::size(countText), stagedPath.c_str());
+        UINT count = 0;
+        if (!countLength || countLength >= std::size(countText) - 1) {
+          error = L"The saved Restore tabs count is invalid. Existing settings were kept.";
+          return false;
+        }
+        for (DWORD i = 0; i < countLength; ++i) {
+          if (countText[i] < L'0' || countText[i] > L'9' ||
+              count > MAX_RESTORE_TAB_PREFERENCES / 10) {
+            error = L"The saved Restore tabs count is invalid. Existing settings were kept.";
+            return false;
+          }
+          count = count * 10 + static_cast<UINT>(countText[i] - L'0');
+          if (count > MAX_RESTORE_TAB_PREFERENCES) {
+            error = L"The saved Restore tabs list exceeds its supported size. Existing settings were kept.";
+            return false;
+          }
+        }
+        committed.clear();
+        for (UINT i = 0; i < count; ++i) {
+          wchar_t value[512]{};
+          const std::wstring key = std::format(L"disabled_client{}", i);
+          const DWORD length = GetPrivateProfileStringW(
+              L"restore_tabs", key.c_str(), L"", value,
+              (DWORD)std::size(value), stagedPath.c_str());
+          if (!length || length >= std::size(value) - 1) {
+            error = L"A saved Restore tabs entry is missing or too long. Existing settings were kept.";
+            return false;
+          }
+          if (!client_name_comparison::EqualIgnoringCase(value, preferenceKey))
+            committed.emplace_back(value);
+        }
+        if (disabled) {
+          if (committed.size() >= MAX_RESTORE_TAB_PREFERENCES) {
+            error = L"The Restore tabs list is full. Existing settings were kept.";
+            return false;
+          }
+          committed.push_back(preferenceKey);
+        }
+        // Apply only this client/browser delta to the current staged section.
+        // A retry must preserve preferences written by another settings owner.
+        for (size_t i = 0; i < (std::max)(static_cast<size_t>(count), committed.size()); ++i) {
+          const std::wstring key = std::format(L"disabled_client{}", i);
+          const auto encoded = i < committed.size()
+              ? client_preference_encoding::ForIni(committed[i]) : std::wstring{};
+          if (!WritePrivateProfileStringW(L"restore_tabs", key.c_str(),
+                  i < committed.size() ? encoded.c_str() : nullptr,
+                  stagedPath.c_str())) return false;
+        }
+        const std::wstring updatedCount = std::to_wstring(committed.size());
+        if (!WritePrivateProfileStringW(L"restore_tabs", L"disabled_count",
+                   updatedCount.c_str(), stagedPath.c_str())) return false;
+        return VerifyStagedClientList(stagedPath, L"restore_tabs", L"disabled_count",
+                                     L"disabled_client", MAX_RESTORE_TAB_PREFERENCES,
+                                     true, committed, error);
+      }, &details);
+  if (saved) {
+    std::lock_guard<std::mutex> lock(g_restoreTabsPreferenceMutex);
+    g_clientsWithoutTabRestore = std::move(committed);
+  } else {
+    std::wstring message = L"The Restore tabs preference could not be saved safely. "
+                           L"Existing saved settings were kept. Please retry.";
+    if (!details.empty()) message += L"\n\n" + details;
+    MessageBoxW(g_hGui, message.c_str(), L"Configuration Was Not Saved",
+                MB_OK | MB_ICONWARNING);
+  }
+  return saved;
 }
 
 static void PruneRestoreTabsPreferences() {
@@ -9192,9 +10415,11 @@ static void PruneRestoreTabsPreferences() {
     std::lock_guard<std::mutex> lock(g_restoreTabsPreferenceMutex);
     g_clientsWithoutTabRestore = std::move(validClients);
   }
-  if (!SaveRestoreTabsPreferences()) {
+  ClientPreferenceSnapshot observedChanged;
+  if (!SaveRestoreTabsPreferences(&storedClients, &observedChanged)) {
     std::lock_guard<std::mutex> lock(g_restoreTabsPreferenceMutex);
-    g_clientsWithoutTabRestore = std::move(storedClients);
+    g_clientsWithoutTabRestore = observedChanged ? std::move(*observedChanged)
+                                                : std::move(storedClients);
   }
 }
 
@@ -9260,32 +10485,12 @@ static void ToggleRestoreTabsForSelectedClient() {
   const std::wstring preferenceKey =
       MakeClientBrowserPreferenceKey(clientName, browser);
 
-  std::vector<std::wstring> originalPreferences;
+  bool disabled = false;
   {
     std::lock_guard<std::mutex> lock(g_restoreTabsPreferenceMutex);
-    originalPreferences = g_clientsWithoutTabRestore;
-    const auto disabled = std::find_if(
-        g_clientsWithoutTabRestore.begin(),
-        g_clientsWithoutTabRestore.end(),
-        [&preferenceKey](const std::wstring &storedName) {
-          return _wcsicmp(storedName.c_str(), preferenceKey.c_str()) == 0;
-        });
-    if (disabled == g_clientsWithoutTabRestore.end()) {
-      if (g_clientsWithoutTabRestore.size() >=
-          MAX_RESTORE_TAB_PREFERENCES) {
-        MessageBeep(MB_ICONWARNING);
-        return;
-      }
-      g_clientsWithoutTabRestore.push_back(preferenceKey);
-    } else {
-      g_clientsWithoutTabRestore.erase(disabled);
-    }
+    disabled = !ContainsClientName(g_clientsWithoutTabRestore, preferenceKey);
   }
-
-  if (!SaveRestoreTabsPreferences()) {
-    std::lock_guard<std::mutex> lock(g_restoreTabsPreferenceMutex);
-    g_clientsWithoutTabRestore = std::move(originalPreferences);
-  }
+  SaveRestoreTabsPreference(preferenceKey, disabled);
   UpdateRestoreTabsToggleState();
 }
 
@@ -9324,23 +10529,8 @@ static void ToggleSelectedClientPin() {
     return;
 
   const bool hadPinnedClients = !g_pinnedClients.empty();
-  const std::vector<std::wstring> originalPinnedClients = g_pinnedClients;
-  const auto pinned = FindPinnedClient(clientName);
-  if (pinned != g_pinnedClients.end()) {
-    g_pinnedClients.erase(pinned);
-  } else {
-    if (g_pinnedClients.size() >= MAX_PINNED_CLIENTS) {
-      MessageBoxW(g_hGui,
-                  L"You can pin up to eight clients. Unpin one before adding "
-                  L"another.",
-                  L"Pinned Clients", MB_OK | MB_ICONINFORMATION);
-      return;
-    }
-    g_pinnedClients.push_back(clientName);
-  }
-
-  if (!SavePinnedClients())
-    g_pinnedClients = originalPinnedClients;
+  const bool pin = !IsClientPinned(clientName);
+  SaveClientPreferenceDelta(clientName, pin, std::nullopt);
   UpdatePinButtonState();
   if (g_hGui && hadPinnedClients != !g_pinnedClients.empty()) {
     ResizeMainWindowForDpi(g_hGui, GetDpiForWindow(g_hGui));
@@ -9371,7 +10561,7 @@ static void OpenPinnedClient(const std::wstring &clientName,
     return;
 
   for (int i = 0; i < (int)g_sessions.size(); ++i) {
-    if (_wcsicmp(g_sessions[i].clientName.c_str(), clientName.c_str()) == 0 &&
+    if (client_name_comparison::EqualIgnoringCase(g_sessions[i].clientName, clientName) &&
         g_sessions[i].browser == browser) {
       SelectSessionTab(i + 1, true);
       return;
@@ -9392,7 +10582,7 @@ static bool ReplaceClientName(std::vector<std::wstring> &clients,
                               const std::wstring &newName) {
   bool changed = false;
   for (auto &storedName : clients) {
-    if (_wcsicmp(storedName.c_str(), oldName.c_str()) == 0) {
+    if (client_name_comparison::EqualIgnoringCase(storedName, oldName)) {
       storedName = newName;
       changed = true;
       continue;
@@ -9401,7 +10591,7 @@ static bool ReplaceClientName(std::vector<std::wstring> &clients,
     BrowserKind browser = BrowserKind::Edge;
     if (TryParseClientBrowserPreferenceKey(storedName, qualifiedClient,
                                            browser) &&
-        _wcsicmp(qualifiedClient.c_str(), oldName.c_str()) == 0) {
+        client_name_comparison::EqualIgnoringCase(qualifiedClient, oldName)) {
       storedName = MakeClientBrowserPreferenceKey(newName, browser);
       changed = true;
     }
@@ -9422,11 +10612,15 @@ static std::optional<std::wstring> GetClipboardWebUrl() {
   std::optional<std::wstring> result;
   HANDLE clipboardData = GetClipboardData(CF_UNICODETEXT);
   if (clipboardData) {
-    const wchar_t *text =
-        static_cast<const wchar_t *>(GlobalLock(clipboardData));
+    const SIZE_T bytes = GlobalSize(clipboardData);
+    const size_t scanLimit =
+        (std::min)(static_cast<size_t>(bytes / sizeof(wchar_t)), size_t{8193});
+    const wchar_t *text = bytes >= sizeof(wchar_t) && bytes % sizeof(wchar_t) == 0
+                              ? static_cast<const wchar_t *>(GlobalLock(clipboardData))
+                              : nullptr;
     if (text) {
-      const size_t length = wcsnlen_s(text, 8193);
-      if (length > 0 && length <= 8192) {
+      const size_t length = wcsnlen_s(text, scanLimit);
+      if (length > 0 && length < scanLimit && length <= 8192) {
         std::wstring url(text, length);
         while (!url.empty() && std::iswspace(url.front()))
           url.erase(url.begin());
@@ -9445,6 +10639,10 @@ static std::optional<std::wstring> GetClipboardWebUrl() {
 static bool OpenWebUrlForClient(const std::wstring &clientName,
                                 const std::wstring &url,
                                 BrowserKind browser, bool fromNotes) {
+  // A popup can outlive the launcher state in which it was opened. Apply the
+  // same busy gate before both the active-session and new-launch routes.
+  if (!fromNotes && (!g_bUiEnabled || g_isLaunchInFlight.load()))
+    return false;
   if (!IsExistingClientProfile(clientName) || IsClientArchived(clientName) ||
       !IsValidWebUrl(url)) {
     return false;
@@ -10534,29 +11732,41 @@ ParseClientLaunchRequest(const std::wstring &arguments) {
     return std::nullopt;
 
   ClientLaunchRequest request;
-  bool browserSeen = false;
+  bool clientSeen = false,urlSeen = false,browserSeen = false;
   for (int i = 1; i < argumentCount; ++i) {
     const std::wstring argument = argumentValues[i];
-    if (_wcsicmp(argument.c_str(), L"--client") == 0 &&
-        i + 1 < argumentCount) {
+    if (_wcsicmp(argument.c_str(), L"--client") == 0) {
+      if (clientSeen || i+1>=argumentCount) {LocalFree(argumentValues);return std::nullopt;}
+      clientSeen=true;
       request.clientName = argumentValues[++i];
     } else if (_wcsnicmp(argument.c_str(), L"--client=", 9) == 0) {
+      if (clientSeen) {LocalFree(argumentValues);return std::nullopt;}
+      clientSeen=true;
       request.clientName = argument.substr(9);
-    } else if (_wcsicmp(argument.c_str(), L"--url") == 0 &&
-               i + 1 < argumentCount) {
+    } else if (_wcsicmp(argument.c_str(), L"--url") == 0) {
+      if (urlSeen || i+1>=argumentCount) {LocalFree(argumentValues);return std::nullopt;}
+      urlSeen=true;
       request.url = argumentValues[++i];
     } else if (_wcsnicmp(argument.c_str(), L"--url=", 6) == 0) {
+      if (urlSeen) {LocalFree(argumentValues);return std::nullopt;}
+      urlSeen=true;
       request.url = argument.substr(6);
-    } else if (_wcsicmp(argument.c_str(), L"--browser") == 0 &&
-               i + 1 < argumentCount && !browserSeen) {
+    } else if (_wcsicmp(argument.c_str(), L"--browser") == 0) {
+      if (browserSeen || i + 1 >= argumentCount) {
+        LocalFree(argumentValues);
+        return std::nullopt;
+      }
       browserSeen = true;
       request.browser = ParseBrowserKind(argumentValues[++i]);
       if (!request.browser) {
         LocalFree(argumentValues);
         return std::nullopt;
       }
-    } else if (_wcsnicmp(argument.c_str(), L"--browser=", 10) == 0 &&
-               !browserSeen) {
+    } else if (_wcsnicmp(argument.c_str(), L"--browser=", 10) == 0) {
+      if (browserSeen) {
+        LocalFree(argumentValues);
+        return std::nullopt;
+      }
       browserSeen = true;
       request.browser = ParseBrowserKind(argument.substr(10));
       if (!request.browser) {
@@ -10582,7 +11792,8 @@ static bool ProcessClientLaunchRequest(const std::wstring &arguments,
     return false;
 
   const std::wstring clientName =
-      ResolveExistingClientName(request->clientName);
+      SanitizeName(request->clientName) == request->clientName
+          ? ResolveExistingClientName(request->clientName) : std::wstring{};
   if (clientName.empty() || !IsExistingClientProfile(clientName)) {
     if (showErrors) {
       MessageBoxW(g_hGui, L"That client shortcut no longer matches a profile.",
@@ -10658,14 +11869,17 @@ using StagedDirectoryPreMoveGuard =
 static StagedDirectoryMoveOutcome MoveDirectoryThroughUniqueSibling(
     const fs::path &source, const fs::path &destination,
     const wchar_t *stageSuffix, std::wstring &errorDetails,
+    client_deletion_safety::BoundTree &originalNamespace,
     const StagedDirectoryPreMoveGuard &preMoveGuard =
         StagedDirectoryPreMoveGuard()) {
   errorDetails.clear();
-  if (_wcsicmp(source.parent_path().c_str(),
-               destination.parent_path().c_str()) != 0 ||
+  if (!client_name_comparison::EqualIgnoringCase(source.parent_path().native(),
+                                                destination.parent_path().native()) ||
       source.filename().wstring() == destination.filename().wstring() ||
-      _wcsicmp(source.filename().c_str(), destination.filename().c_str()) != 0 ||
-      !HasExactSafeDirectoryEntryName(source)) {
+      !client_name_comparison::EqualIgnoringCase(source.filename().native(),
+                                                destination.filename().native()) ||
+      !HasExactSafeDirectoryEntryName(source) ||
+      !originalNamespace.IsAt(source) || !originalNamespace.Verify(errorDetails)) {
     errorDetails = L"The case-only rename source is no longer the exact safe "
                    L"directory entry that was validated.";
     return StagedDirectoryMoveOutcome::SourcePreserved;
@@ -10704,11 +11918,7 @@ static StagedDirectoryMoveOutcome MoveDirectoryThroughUniqueSibling(
     }
   }
 
-  if (!MoveFileExW(source.c_str(), intermediatePath.c_str(),
-                   MOVEFILE_WRITE_THROUGH)) {
-    const DWORD error = GetLastError();
-    errorDetails = std::format(
-        L"The case-only rename could not be staged (Windows error {}).", error);
+  if (!originalNamespace.MoveRoot(intermediatePath, errorDetails)) {
     return HasExactSafeDirectoryEntryName(source)
                ? StagedDirectoryMoveOutcome::SourcePreserved
                : StagedDirectoryMoveOutcome::Indeterminate;
@@ -10722,8 +11932,7 @@ static StagedDirectoryMoveOutcome MoveDirectoryThroughUniqueSibling(
                                  const std::wstring &failure) {
     fs::path rollbackSource = currentPath;
     if (_wcsicmp(currentPath.c_str(), intermediatePath.c_str()) != 0) {
-      if (!MoveFileExW(currentPath.c_str(), intermediatePath.c_str(),
-                       MOVEFILE_WRITE_THROUGH) ||
+      if (!originalNamespace.MoveRoot(intermediatePath, errorDetails) ||
           !HasExactSafeDirectoryEntryName(intermediatePath)) {
         errorDetails = failure +
                        L" The profile could not be returned to its staging "
@@ -10732,8 +11941,7 @@ static StagedDirectoryMoveOutcome MoveDirectoryThroughUniqueSibling(
       }
       rollbackSource = intermediatePath;
     }
-    if (MoveFileExW(rollbackSource.c_str(), source.c_str(),
-                    MOVEFILE_WRITE_THROUGH) &&
+    if (originalNamespace.MoveRoot(source, errorDetails) &&
         HasExactSafeDirectoryEntryName(source)) {
       errorDetails = failure + L" The original exact directory name was restored.";
       return StagedDirectoryMoveOutcome::SourcePreserved;
@@ -10761,14 +11969,11 @@ static StagedDirectoryMoveOutcome MoveDirectoryThroughUniqueSibling(
                     destinationError));
   }
 
-  if (!MoveFileExW(intermediatePath.c_str(), destination.c_str(),
-                   MOVEFILE_WRITE_THROUGH)) {
-    const DWORD error = GetLastError();
+  if (!originalNamespace.MoveRoot(destination, errorDetails)) {
+    const std::wstring commitError = errorDetails;
     return restoreSource(
         intermediatePath,
-        std::format(L"The case-only rename could not be committed (Windows "
-                    L"error {}).",
-                    error));
+        L"The case-only rename could not be committed. " + commitError);
   }
   if (!HasExactSafeDirectoryEntryName(destination)) {
     return restoreSource(
@@ -10780,8 +11985,21 @@ static StagedDirectoryMoveOutcome MoveDirectoryThroughUniqueSibling(
 
 static bool RenameClientProfile(const std::wstring &oldName,
                                 const std::wstring &newName,
-                                std::wstring &errorMessage) {
+                                std::wstring &errorMessage,
+                                client_deletion_safety::BoundTree *suppliedNamespace) {
   errorMessage.clear();
+  fs::path oldPath;
+  if (!TryGetSafeClientProfilePath(oldName, oldPath)) {
+    errorMessage = L"Select an existing client first.";
+    return false;
+  }
+  client_deletion_safety::BoundTree capturedNamespace;
+  auto &originalNamespace = suppliedNamespace ? *suppliedNamespace : capturedNamespace;
+  if (!(suppliedNamespace ? originalNamespace.IsAt(oldPath) && originalNamespace.Verify(errorMessage)
+                         : originalNamespace.CaptureNamespace(oldPath, errorMessage))) {
+    errorMessage = L"The original client directory could not be pinned safely.\n\n" + errorMessage;
+    return false;
+  }
   if (!PrepareNotesForClientChange(oldName)) { errorMessage = L"Save or recover the open notes before renaming this client."; return false; }
   if (!IsExistingClientProfile(oldName)) {
     errorMessage = L"Select an existing client first.";
@@ -10803,13 +12021,12 @@ static bool RenameClientProfile(const std::wstring &oldName,
   }
   if (newName == oldName)
     return true;
-  if (_wcsicmp(newName.c_str(), oldName.c_str()) != 0 &&
+  if (!client_name_comparison::EqualIgnoringCase(newName, oldName) &&
       IsExistingClientProfile(newName)) {
     errorMessage = L"A client with that name already exists.";
     return false;
   }
 
-  fs::path oldPath;
   fs::path newPath;
   if (!TryGetSafeClientProfilePath(oldName, oldPath) ||
       !TryGetSafeClientProfilePath(newName, newPath)) {
@@ -10884,7 +12101,7 @@ static bool RenameClientProfile(const std::wstring &oldName,
   }
 
   const bool caseOnlyRename =
-      oldName != newName && _wcsicmp(oldName.c_str(), newName.c_str()) == 0;
+      oldName != newName && client_name_comparison::EqualIgnoringCase(oldName, newName);
   bool profileMoved = false;
   const auto restoreMemory = [&]() {
     g_pinnedClients = originalPinnedClients;
@@ -10911,7 +12128,7 @@ static bool RenameClientProfile(const std::wstring &oldName,
           };
       const auto outcome = MoveDirectoryThroughUniqueSibling(
           newPath, oldPath, L"rename-rollback", rollbackDetails,
-          caseOnlyRollbackGuard);
+          originalNamespace, caseOnlyRollbackGuard);
       if (outcome == StagedDirectoryMoveOutcome::DestinationCommitted) {
         profileMoved = false;
         return true;
@@ -10930,15 +12147,14 @@ static bool RenameClientProfile(const std::wstring &oldName,
         rollbackDetails += L"\n\n" + rollbackProfileUseError;
       return false;
     }
-    if (MoveFileExW(newPath.c_str(), oldPath.c_str(), MOVEFILE_WRITE_THROUGH) &&
+    if (originalNamespace.MoveRoot(oldPath, rollbackDetails) &&
         HasExactSafeDirectoryEntryName(oldPath)) {
       profileMoved = false;
       return true;
     }
-    rollbackDetails = std::format(
-        L"The renamed profile could not be restored to its original path "
-        L"(Windows error {}).",
-        GetLastError());
+    rollbackDetails = L"The original client profile could not be restored to "
+        L"its original path. It remains preserved at " + newPath.wstring() +
+        L".\n\n" + rollbackDetails;
     return false;
   };
 
@@ -10960,7 +12176,7 @@ static bool RenameClientProfile(const std::wstring &oldName,
           };
       const auto outcome = MoveDirectoryThroughUniqueSibling(
           oldPath, newPath, L"rename-stage", moveDetails,
-          caseOnlyForwardGuard);
+          originalNamespace, caseOnlyForwardGuard);
       if (outcome != StagedDirectoryMoveOutcome::DestinationCommitted) {
         profileMoved = outcome == StagedDirectoryMoveOutcome::Indeterminate;
         errorMessage =
@@ -10986,12 +12202,8 @@ static bool RenameClientProfile(const std::wstring &oldName,
           errorMessage += L"\n\n" + immediateMoveProfileUseError;
         return false;
       }
-      if (!MoveFileExW(oldPath.c_str(), newPath.c_str(),
-                       MOVEFILE_WRITE_THROUGH)) {
-        errorMessage = std::format(
-            L"The client profile could not be renamed safely (Windows error "
-            L"{}).",
-            GetLastError());
+      if (!originalNamespace.MoveRoot(newPath, errorMessage)) {
+        errorMessage = L"The original client profile could not be renamed safely.\n\n" + errorMessage;
         return false;
       }
       profileMoved = true;
@@ -11010,44 +12222,64 @@ static bool RenameClientProfile(const std::wstring &oldName,
     }
     profileMoved = true;
 
-    const bool pinnedChanged =
-        ReplaceClientName(g_pinnedClients, oldName, newName);
-    bool restoreChanged = false;
+    // Apply this rename to current staged settings. The launcher's cached
+    // lists may predate another saved pin/archive/restore choice.
+    std::vector<std::wstring> committedPinned, committedArchived,
+        committedRestore;
+    std::wstring settingsError;
+    bool settingsSaved = false;
     {
-      std::lock_guard<std::mutex> lock(g_restoreTabsPreferenceMutex);
-      restoreChanged = ReplaceClientName(g_clientsWithoutTabRestore, oldName,
-                                         newName);
-    }
-    const bool archivedChanged =
-        ReplaceClientName(g_archivedClients, oldName, newName);
-    std::vector<config_persistence::IniMutation> mutations;
-    const auto appendClientList =
-        [&mutations](const wchar_t *section, const wchar_t *countKey,
-                     const wchar_t *itemPrefix,
-                     const std::vector<std::wstring> &items) {
-          mutations.push_back({section, std::nullopt, std::nullopt});
-          mutations.push_back(
-              {section, std::wstring(countKey), std::to_wstring(items.size())});
-          for (size_t index = 0; index < items.size(); ++index) {
-            mutations.push_back(
-                {section, std::format(L"{}{}", itemPrefix, index), items[index]});
-          }
-        };
-    if (pinnedChanged)
-      appendClientList(L"pinned", L"count", L"client", g_pinnedClients);
-    if (restoreChanged) {
-      std::vector<std::wstring> restorePreferences;
-      {
-        std::lock_guard<std::mutex> lock(g_restoreTabsPreferenceMutex);
-        restorePreferences = g_clientsWithoutTabRestore;
+      // Acquire the only required memory-publication lock before committing
+      // the file, so publishing the three prepared vectors cannot fail later
+      // while acquiring it.
+      std::unique_lock<std::mutex> restoreLock(g_restoreTabsPreferenceMutex);
+      settingsSaved = !g_sConfigPath.empty() &&
+          config_persistence::MutateIniFileAtomically(
+              g_sConfigPath,
+              [&](const fs::path &stagedPath, std::wstring &error) {
+                const auto renameSavedList =
+                    [&](const wchar_t *section, const wchar_t *countKey,
+                        const wchar_t *rowPrefix, size_t maximum,
+                        bool browserPreferences,
+                        std::vector<std::wstring> &replacement) {
+                      std::vector<std::wstring> current;
+                      if (!ReadStagedClientList(stagedPath, section, countKey,
+                              rowPrefix, maximum, browserPreferences,
+                              current, error))
+                        return false;
+                      replacement = current;
+                      if (!ReplaceClientName(replacement, oldName, newName))
+                        return true;
+                      std::vector<std::wstring> validated;
+                      for (const auto &value : replacement) {
+                        if (!ValidClientListValue(value, browserPreferences) ||
+                            ContainsClientName(validated, value)) {
+                          error = L"The new client name conflicts with a saved "
+                                  L"client preference. Existing settings were kept.";
+                          return false;
+                        }
+                        validated.push_back(value);
+                      }
+                      return WriteStagedClientListSnapshot(
+                          stagedPath, section, countKey, rowPrefix,
+                          maximum, browserPreferences,
+                          current, replacement, error);
+                    };
+                return renameSavedList(L"pinned", L"count", L"client",
+                           MAX_PINNED_CLIENTS, false, committedPinned) &&
+                       renameSavedList(L"archived", L"count", L"client",
+                           MAX_ARCHIVED_CLIENTS, false, committedArchived) &&
+                       renameSavedList(L"restore_tabs", L"disabled_count",
+                           L"disabled_client", MAX_RESTORE_TAB_PREFERENCES,
+                           true, committedRestore);
+              }, &settingsError);
+      if (settingsSaved) {
+        g_pinnedClients = std::move(committedPinned);
+        g_archivedClients = std::move(committedArchived);
+        g_clientsWithoutTabRestore = std::move(committedRestore);
       }
-      appendClientList(L"restore_tabs", L"disabled_count",
-                       L"disabled_client", restorePreferences);
     }
-    if (archivedChanged)
-      appendClientList(L"archived", L"count", L"client", g_archivedClients);
-    if (!mutations.empty() &&
-        !SaveConfigMutations(L"renamed-client settings", mutations)) {
+    if (!settingsSaved) {
       restoreMemory();
       std::wstring rollbackDetails;
       const bool rolledBack = rollbackProfileMove(rollbackDetails);
@@ -11060,6 +12292,8 @@ static bool RenameClientProfile(const std::wstring &oldName,
                 L"folder could not be restored to its original name. Restart "
                 L"ctSpaces before using this client.\n\n" +
                     rollbackDetails;
+      if (!settingsError.empty())
+        errorMessage += L"\n\n" + settingsError;
       return false;
     }
   } catch (const std::exception &error) {
@@ -11117,8 +12351,8 @@ static bool RenameClientProfile(const std::wstring &oldName,
       const auto oldCanonicalPath = GetClientDesktopShortcutPath(oldName);
       if (oldCanonicalPath) {
         for (size_t index = 0; index < shortcutsToRename.size(); ++index) {
-          if (_wcsicmp(shortcutsToRename[index].path.c_str(),
-                       oldCanonicalPath->c_str()) == 0) {
+          if (client_name_comparison::EqualIgnoringCase(shortcutsToRename[index].path.native(),
+                                                        oldCanonicalPath->native())) {
             preferredIndex = index;
             preferredChosen = true;
             break;
@@ -11152,8 +12386,8 @@ static bool RenameClientProfile(const std::wstring &oldName,
         renameBrowserToRecord = browserToRecord;
         std::optional<size_t> collidingIndex;
         for (size_t index = 0; index < shortcutsToRename.size(); ++index) {
-          if (_wcsicmp(shortcutsToRename[index].path.c_str(),
-                       newShortcutPath->c_str()) == 0) {
+          if (client_name_comparison::EqualIgnoringCase(shortcutsToRename[index].path.native(),
+                                                        newShortcutPath->native())) {
             collidingIndex = index;
             break;
           }
@@ -11351,13 +12585,23 @@ static void GuiRenameClient() {
     return;
   }
 
+  fs::path originalRoot;
+  std::wstring errorMessage;
+  client_deletion_safety::BoundTree originalNamespace;
+  if (!TryGetSafeClientProfilePath(oldName, originalRoot) ||
+      !originalNamespace.CaptureNamespace(originalRoot, errorMessage)) {
+    MessageBoxW(g_hGui,
+                (L"The original client directory could not be pinned safely.\n\n" + errorMessage).c_str(),
+                L"Rename Client", MB_OK | MB_ICONWARNING);
+    return;
+  }
+
   const auto entered = InputBoxWindow::Show(
       g_hGui, L"Rename Client", L"Enter the new client name", oldName);
   if (!entered || *entered == oldName)
     return;
 
-  std::wstring errorMessage;
-  if (!RenameClientProfile(oldName, *entered, errorMessage)) {
+  if (!RenameClientProfile(oldName, *entered, errorMessage, &originalNamespace)) {
     MessageBoxW(g_hGui, errorMessage.c_str(), L"Rename Client",
                 MB_OK | MB_ICONWARNING);
     return;
@@ -11372,8 +12616,18 @@ static void GuiRenameClient() {
 }
 
 static bool ArchiveClientProfile(const std::wstring &clientName,
-                                 std::wstring &errorMessage) {
+                                 std::wstring &errorMessage,
+                                 client_deletion_safety::BoundTree *suppliedNamespace) {
   errorMessage.clear();
+  fs::path originalRoot;
+  client_deletion_safety::BoundTree capturedNamespace;
+  auto &originalNamespace = suppliedNamespace ? *suppliedNamespace : capturedNamespace;
+  if (!TryGetSafeClientProfilePath(clientName, originalRoot) ||
+      !(suppliedNamespace ? originalNamespace.IsAt(originalRoot) && originalNamespace.Verify(errorMessage)
+                          : originalNamespace.CaptureNamespace(originalRoot, errorMessage))) {
+    errorMessage = L"The original client directory could not be pinned safely.\n\n" + errorMessage;
+    return false;
+  }
   if (!PrepareNotesForClientChange(clientName)) { errorMessage = L"Save or recover the open notes before archiving this client."; return false; }
   if (!IsExistingClientProfile(clientName)) {
     errorMessage = L"Select an existing client first.";
@@ -11387,55 +12641,20 @@ static bool ArchiveClientProfile(const std::wstring &clientName,
         profileUseError;
     return false;
   }
-  if (IsClientArchived(clientName))
-    return true;
-  if (g_archivedClients.size() >= MAX_ARCHIVED_CLIENTS) {
-    errorMessage = L"The archived-client list is full.";
-    return false;
-  }
-
-  const std::vector<std::wstring> originalArchivedClients = g_archivedClients;
-  const std::vector<std::wstring> originalPinnedClients = g_pinnedClients;
-  const bool hadPinnedClients = !originalPinnedClients.empty();
+  const bool hadPinnedClients = !g_pinnedClients.empty();
   try {
-    g_archivedClients.push_back(clientName);
-    const auto pinned = FindPinnedClient(clientName);
-    if (pinned != g_pinnedClients.end())
-      g_pinnedClients.erase(pinned);
-
-    std::vector<config_persistence::IniMutation> mutations;
-    const auto appendClientList =
-        [&mutations](const wchar_t *section, const wchar_t *countKey,
-                     const std::vector<std::wstring> &clients) {
-          mutations.push_back({section, std::nullopt, std::nullopt});
-          mutations.push_back(
-              {section, std::wstring(countKey),
-               std::to_wstring(clients.size())});
-          for (size_t i = 0; i < clients.size(); ++i) {
-            mutations.push_back(
-                {section, std::format(L"client{}", i), clients[i]});
-          }
-        };
-    appendClientList(L"archived", L"count", g_archivedClients);
-    appendClientList(L"pinned", L"count", g_pinnedClients);
-    if (!SaveConfigMutations(L"archived and pinned client lists", mutations)) {
-      g_archivedClients = originalArchivedClients;
-      g_pinnedClients = originalPinnedClients;
+    if (!SaveClientPreferenceDelta(clientName, false, true)) {
       errorMessage =
           L"The client was not archived because its saved settings could not "
           L"be committed atomically.";
       return false;
     }
   } catch (const std::exception &error) {
-    g_archivedClients = originalArchivedClients;
-    g_pinnedClients = originalPinnedClients;
     errorMessage = L"The client could not be archived. Its saved state was "
                    L"restored.\n\n" +
                    AnsiToWide(error.what());
     return false;
   } catch (...) {
-    g_archivedClients = originalArchivedClients;
-    g_pinnedClients = originalPinnedClients;
     errorMessage = L"The client could not be archived safely. Its saved state "
                    L"was restored.";
     return false;
@@ -11481,6 +12700,17 @@ static void GuiArchiveClient() {
   if (IsClientArchived(clientName))
     return;
 
+  fs::path originalRoot;
+  std::wstring errorMessage;
+  client_deletion_safety::BoundTree originalNamespace;
+  if (!TryGetSafeClientProfilePath(clientName, originalRoot) ||
+      !originalNamespace.CaptureNamespace(originalRoot, errorMessage)) {
+    MessageBoxW(g_hGui,
+                (L"The original client directory could not be pinned safely.\n\n" + errorMessage).c_str(),
+                L"Archive Client", MB_OK | MB_ICONWARNING);
+    return;
+  }
+
   const std::wstring confirmation =
       L"Hide " + clientName +
       L" from the client list?\n\nIts complete browser profile will remain "
@@ -11490,8 +12720,7 @@ static void GuiArchiveClient() {
     return;
   }
 
-  std::wstring errorMessage;
-  if (!ArchiveClientProfile(clientName, errorMessage)) {
+  if (!ArchiveClientProfile(clientName, errorMessage, &originalNamespace)) {
     MessageBoxW(g_hGui, errorMessage.c_str(), L"Archive Client",
                 MB_OK | MB_ICONWARNING);
     return;
@@ -11510,12 +12739,15 @@ static void GuiArchiveClient() {
 
 static bool RestoreArchivedClient(const std::wstring &restoredName,
                                   std::wstring *statusMessage) {
+  // The QA dispatcher can pass an element of g_archivedClients directly.
+  // Erasing that element must not change or invalidate the requested identity.
+  const std::wstring restoredClientName = restoredName;
   if (statusMessage)
     statusMessage->clear();
   const auto archived = std::find_if(
       g_archivedClients.begin(), g_archivedClients.end(),
-      [&restoredName](const std::wstring &storedName) {
-        return _wcsicmp(storedName.c_str(), restoredName.c_str()) == 0;
+      [&restoredClientName](const std::wstring &storedName) {
+        return client_name_comparison::EqualIgnoringCase(storedName, restoredClientName);
       });
   if (archived == g_archivedClients.end()) {
     if (statusMessage)
@@ -11523,11 +12755,8 @@ static bool RestoreArchivedClient(const std::wstring &restoredName,
     return false;
   }
 
-  const std::vector<std::wstring> originalArchivedClients = g_archivedClients;
   try {
-    g_archivedClients.erase(archived);
-    if (!SaveArchivedClients()) {
-      g_archivedClients = originalArchivedClients;
+    if (!SaveClientPreferenceDelta(restoredClientName, std::nullopt, false)) {
       if (statusMessage) {
         *statusMessage =
             L"The client was not restored because the archived-client list "
@@ -11536,7 +12765,6 @@ static bool RestoreArchivedClient(const std::wstring &restoredName,
       return false;
     }
   } catch (const std::exception &error) {
-    g_archivedClients = originalArchivedClients;
     if (statusMessage) {
       *statusMessage =
           L"The client could not be restored. Its archived state was kept.\n\n" +
@@ -11544,7 +12772,6 @@ static bool RestoreArchivedClient(const std::wstring &restoredName,
     }
     return false;
   } catch (...) {
-    g_archivedClients = originalArchivedClients;
     if (statusMessage) {
       *statusMessage =
           L"The client could not be restored safely. Its archived state was "
@@ -11560,10 +12787,10 @@ static bool RestoreArchivedClient(const std::wstring &restoredName,
     SelectSessionTab(0, false);
     const LRESULT index = SendMessageW(g_hComboClient, CB_FINDSTRINGEXACT,
                                        (WPARAM)-1,
-                                       (LPARAM)restoredName.c_str());
+                                       (LPARAM)restoredClientName.c_str());
     if (index != CB_ERR)
       SendMessageW(g_hComboClient, CB_SETCURSEL, (WPARAM)index, 0);
-    SetClientInputText(restoredName);
+    SetClientInputText(restoredClientName);
     UpdateIconPreviewForSelection(true);
   } catch (const std::exception &error) {
     if (statusMessage) {
@@ -11770,7 +12997,8 @@ void SetUiState(bool enabled) {
   // finished.
   enabled = enabled && !g_bDefaultProfileUiBusy &&
             !g_isLaunchInFlight.load() && !g_bCleanupBusy.load() &&
-            !g_bClientNotesBusy.load() && !g_bCloseAllClientsPending;
+            !g_bClientNotesBusy.load() && !g_bCloseAllClientsPending &&
+            !g_bExitWhenProfilesClose;
   g_bUiEnabled = enabled;
   EnableWindow(g_hComboClient, enabled);
   EnableWindow(g_hClientEdit, enabled);
@@ -11779,9 +13007,11 @@ void SetUiState(bool enabled) {
   EnableWindow(g_hBtnGo, enabled);
   EnableWindow(g_hBtnPin, enabled);
   EnableWindow(g_hBtnTmpProf, enabled);
+  EnableWindow(g_hBtnNotes, enabled);
   EnableWindow(g_hBtnConfig, enabled);
   InvalidateSessionTabs(g_hGui);
-  InvalidateRect(g_hClientEditSurface, nullptr, TRUE);
+  if (g_hClientEditSurface)
+    InvalidateRect(g_hClientEditSurface, nullptr, TRUE);
   UpdatePinButtonState();
   UpdateRestoreTabsToggleState();
   UpdateCloseAllButtonState();
@@ -11790,7 +13020,8 @@ void SetUiState(bool enabled) {
     FocusClientEdit();
 }
 
-bool extDef(const fs::path &profileDataPath, const wchar_t *statusText) {
+bool extDef(const fs::path &profileDataPath, const wchar_t *statusText,
+            const std::shared_ptr<transient_profile::Identity> &reservation) {
   // Default archive lives in your data dir (still extracted from resource
   // once).
   const fs::path default7zPath = g_sDataDir / L"Default.7z";
@@ -11806,8 +13037,8 @@ bool extDef(const fs::path &profileDataPath, const wchar_t *statusText) {
   try {
     if (fs::exists(profileDataPath)) {
       if (!IsSafeExistingDirectory(profileDataPath) ||
-          fs::directory_iterator(profileDataPath) !=
-              fs::directory_iterator()) {
+          (fs::directory_iterator(profileDataPath) != fs::directory_iterator() &&
+           !(reservation && reservation->IsEmptyReservation(profileDataPath)))) {
         MessageBoxW(g_hGui,
                     L"ctSpaces refused to extract the starter over an "
                     L"existing nonempty or unsafe profile directory.",
@@ -11857,9 +13088,10 @@ bool extDef(const fs::path &profileDataPath, const wchar_t *statusText) {
 }
 
 bool SetBrowserStartupPreference(const fs::path &profilePath,
-                                 bool restoreTabs) {
+                                 bool restoreTabs,
+                                 std::wstring *errorDetails) {
   const auto result = browser_preferences::UpdateStartupPreferencesFile(
-      profilePath / L"Default" / L"Preferences", restoreTabs, true);
+      profilePath / L"Default" / L"Preferences", restoreTabs, true, errorDetails);
   return result == browser_preferences::FileUpdateResult::unchanged ||
          result == browser_preferences::FileUpdateResult::updated;
 }
@@ -12233,7 +13465,7 @@ static void RefreshOpenClientWindowIcon(const std::wstring &clientName,
   {
     std::lock_guard<std::mutex> lock(g_activeProfilesMutex);
     for (const auto &[key, active] : g_activeProfiles) {
-      if (_wcsicmp(key.clientName.c_str(), clientName.c_str()) == 0)
+      if (client_name_comparison::EqualIgnoringCase(key.clientName, clientName))
         sessions.emplace_back(key.browser, active.pid);
     }
   }
@@ -12935,7 +14167,100 @@ static bool ValidateSanitizedDefaultProfileTree(const fs::path &root,
   }
 }
 
-static void HandleClosedDefaultProfile() {
+static bool CopyDefaultRecoveryArchive(const fs::path &source,
+                                      const fs::path &backupDir,
+                                      std::wstring &errorDetails) {
+  struct File {
+    HANDLE value = INVALID_HANDLE_VALUE;
+    ~File() { if (value != INVALID_HANDLE_VALUE) CloseHandle(value); }
+  } input, output;
+  fs::path partial;
+  bool published = false;
+  errorDetails.clear();
+  try {
+    fs::create_directories(backupDir);
+    client_deletion_safety::BoundTree parent;
+    if (!parent.CaptureNamespace(backupDir, errorDetails) ||
+        !parent.PinAncestor(backupDir, false, errorDetails) ||
+        !parent.ProtectEmptyParent(backupDir, errorDetails))
+      throw std::runtime_error("The Default recovery folder could not be protected");
+    input.value = CreateFileW(source.c_str(), GENERIC_READ, FILE_SHARE_READ,
+        nullptr, OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
+    BY_HANDLE_FILE_INFORMATION information{};
+    if (input.value == INVALID_HANDLE_VALUE ||
+        !GetFileInformationByHandle(input.value, &information) ||
+        (information.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) ||
+        information.nNumberOfLinks != 1)
+      throw std::runtime_error("The sanitized recovery source could not be held safely");
+    GUID id{};
+    wchar_t idText[40]{};
+    if (FAILED(CoCreateGuid(&id)) || !StringFromGUID2(id, idText, 40))
+      throw std::runtime_error("A unique Default recovery filename could not be allocated");
+    partial = backupDir / (std::wstring(L"~D") + idText + L".part");
+    output.value = CreateFileW(partial.c_str(), GENERIC_READ | GENERIC_WRITE | DELETE,
+        FILE_SHARE_READ, nullptr, CREATE_NEW,
+        FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_WRITE_THROUGH | FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
+    if (output.value == INVALID_HANDLE_VALUE)
+      throw std::runtime_error("The Default recovery staging file could not be created exclusively");
+    std::array<BYTE, 64 * 1024> buffer{};
+    for (;;) {
+      DWORD count = 0;
+      if (!ReadFile(input.value, buffer.data(), static_cast<DWORD>(buffer.size()), &count, nullptr))
+        throw std::runtime_error("The sanitized recovery source could not be read completely");
+      if (!count)
+        break;
+      DWORD written = 0;
+      if (!WriteFile(output.value, buffer.data(), count, &written, nullptr) || written != count)
+        throw std::runtime_error("The Default recovery copy could not be written completely");
+    }
+    _7zArchiveInfo archiveInfo{};
+    if (!FlushFileBuffers(output.value) ||
+        FAILED(_7zInspectAndTest7zHandle(output.value, &archiveInfo, nullptr, nullptr)))
+      throw std::runtime_error("The Default recovery copy failed its flush or integrity check");
+    const std::wstring stamp = GetBackupTimestamp();
+    for (unsigned attempt = 0; attempt < 256; ++attempt) {
+      const fs::path destination = backupDir /
+          (stamp + L"-Sanitized-Default" +
+           (attempt ? L"-" + std::to_wstring(attempt) : std::wstring{}) + L".7z");
+      if (!parent.Verify(errorDetails))
+        throw std::runtime_error("The Default recovery folder changed before publication");
+      const auto name = fs::absolute(destination).lexically_normal().wstring();
+      std::vector<BYTE> storage(offsetof(FILE_RENAME_INFO, FileName) +
+                                (name.size() + 1) * sizeof(wchar_t), 0);
+      auto *rename = reinterpret_cast<FILE_RENAME_INFO *>(storage.data());
+      rename->ReplaceIfExists = FALSE;
+      rename->FileNameLength = static_cast<DWORD>(name.size() * sizeof(wchar_t));
+      std::memcpy(rename->FileName, name.data(), rename->FileNameLength);
+      if (SetFileInformationByHandle(output.value, FileRenameInfo, rename,
+                                     static_cast<DWORD>(storage.size()))) {
+        published = true;
+        return true;
+      }
+      const DWORD code = GetLastError();
+      if (code == ERROR_FILE_EXISTS || code == ERROR_ALREADY_EXISTS ||
+          GetFileAttributesW(destination.c_str()) != INVALID_FILE_ATTRIBUTES)
+        continue;
+      throw std::system_error(static_cast<int>(code), std::system_category(),
+                              "The verified Default recovery copy could not be published");
+    }
+    throw std::runtime_error("All bounded Default recovery history names are occupied");
+  } catch (const std::exception &error) {
+    if (errorDetails.empty())
+      errorDetails = AnsiToWide(error.what());
+  } catch (...) {
+    errorDetails = L"The Default recovery archive could not be created safely.";
+  }
+  if (output.value != INVALID_HANDLE_VALUE && !published) {
+    FILE_DISPOSITION_INFO disposition{TRUE};
+    if (!SetFileInformationByHandle(output.value, FileDispositionInfo,
+                                    &disposition, sizeof(disposition)))
+      errorDetails += L" The owned incomplete recovery copy was retained at " + partial.wstring();
+  }
+  return false;
+}
+
+static void HandleClosedDefaultProfile(
+    const std::shared_ptr<transient_profile::Identity> &directory) {
   const fs::path profilePath = g_sDataDir / L"Default";
   const fs::path archivePath = g_sDataDir / L"Default.7z";
 
@@ -12947,6 +14272,24 @@ static void HandleClosedDefaultProfile() {
     }
   } uiBusyScope;
   SetUiState(false);
+  // Keep the original editor namespace fixed through confirmation and packing.
+  // The launch observer permits SDK extraction; this stronger guard begins only
+  // after the tracked editor exits and is released before bounded raw cleanup.
+  std::unique_ptr<client_deletion_safety::BoundTree> profileNamespace;
+  if (directory) {
+    profileNamespace = std::make_unique<client_deletion_safety::BoundTree>();
+    std::wstring namespaceError;
+    if (!profileNamespace->CaptureNamespace(profilePath, namespaceError) ||
+        !directory->MatchesPath(profilePath)) {
+      const std::wstring message =
+          L"The Default editor folder changed or could not be protected. "
+          L"The previous starter and the current folder were left unchanged." +
+          (namespaceError.empty() ? std::wstring{} : L"\n\n" + namespaceError);
+      MessageBoxW(g_hGui, message.c_str(), L"Default Profile",
+                  MB_OK | MB_ICONWARNING);
+      return;
+    }
+  }
   std::wstring profileUseError;
   if (ProbeExactBrowserProfileInUse(profilePath, profileUseError) !=
       ProfileUseState::NotInUse) {
@@ -12969,8 +14312,9 @@ static void HandleClosedDefaultProfile() {
 
   if (saveChoice != IDYES) {
     std::wstring cleanupDetails;
+    profileNamespace.reset();
     const bool removed =
-        RemoveTransientProfileIfIdleAndVerify(profilePath, cleanupDetails);
+        RemoveTransientProfileIfIdleAndVerify(profilePath, cleanupDetails, directory);
     SetUiState(true);
     if (!removed) {
       std::wstring message =
@@ -13010,6 +14354,17 @@ static void HandleClosedDefaultProfile() {
   const fs::path sanitizerScript =
       workRoot / L"Sanitize-DefaultProfileDirectory.ps1";
   const fs::path stagedArchive = workRoot / L"Default.7z.staged";
+  std::unique_ptr<client_deletion_safety::BoundTree> workNamespace;
+  struct DefaultWorkProtection {
+    HANDLE directory = INVALID_HANDLE_VALUE;
+    void Release() {
+      if (directory != INVALID_HANDLE_VALUE) {
+        CloseHandle(directory);
+        directory = INVALID_HANDLE_VALUE;
+      }
+    }
+    ~DefaultWorkProtection() { Release(); }
+  } workProtection;
 
   try {
     fs::create_directories(workBase);
@@ -13024,6 +14379,19 @@ static void HandleClosedDefaultProfile() {
       throw std::system_error((int)GetLastError(), std::system_category(),
                               "A unique Default-save work folder could not be "
                               "created");
+    }
+    // Retain this original work namespace while the sanitizer runs. Failure
+    // cleanup must never acquire recursive deletion authority from its name
+    // after an independent directory has been substituted there.
+    workProtection.directory = CreateFileW(
+        workRoot.c_str(), FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES,
+        FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+        FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
+    workNamespace = std::make_unique<client_deletion_safety::BoundTree>();
+    if (workProtection.directory == INVALID_HANDLE_VALUE ||
+        !workNamespace->CaptureNamespace(workRoot, errorDetails)) {
+      workNamespace.reset();
+      throw std::runtime_error("The Default-save staging namespace could not be protected");
     }
     if (!ExtractResourceToFile(IDR_DEFAULT_PROFILE_SANITIZER, sanitizerScript,
                                true) ||
@@ -13121,11 +14489,8 @@ static void HandleClosedDefaultProfile() {
     }
 
     const fs::path backupDir = g_sDataDir / L"_DefBak";
-    fs::create_directories(backupDir);
-    const fs::path backupPath =
-        backupDir / (GetBackupTimestamp() + L"-Sanitized-Default.7z");
-    fs::copy_file(stagedArchive, backupPath,
-                  fs::copy_options::overwrite_existing);
+    if (!CopyDefaultRecoveryArchive(stagedArchive, backupDir, errorDetails))
+      throw std::runtime_error("The sanitized Default recovery archive could not be saved");
 
     if (!MoveFileExW(stagedArchive.c_str(), archivePath.c_str(),
                      MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
@@ -13135,24 +14500,30 @@ static void HandleClosedDefaultProfile() {
 
     saved = true;
   } catch (const std::exception &e) {
-    errorDetails = AnsiToWide(e.what());
+    if (errorDetails.empty())
+      errorDetails = AnsiToWide(e.what());
   } catch (...) {
     errorDetails = L"Unknown error.";
   }
 
   ProgressUI_Hide();
-  std::error_code cleanupError;
-  fs::remove(stagedArchive, cleanupError);
-  cleanupError.clear();
-  fs::remove_all(workRoot, cleanupError);
-  cleanupError.clear();
-  if (fs::is_directory(workBase, cleanupError) &&
-      fs::is_empty(workBase, cleanupError)) {
-    fs::remove(workBase, cleanupError);
+  workProtection.Release();
+  std::wstring workCleanupDetails;
+  if (workNamespace && workNamespace->Verify(workCleanupDetails) &&
+      workNamespace->CaptureContents(workCleanupDetails) &&
+      workNamespace->RemoveRemaining(workCleanupDetails)) {
+    workNamespace->RemoveEmptyPinnedAncestor(workBase);
+  } else {
+    errorDetails += L" The Default-save work folder was retained because its "
+                    L"original contents could not be removed safely: " +
+                    workRoot.wstring();
+    if (!workCleanupDetails.empty())
+      errorDetails += L". " + workCleanupDetails;
   }
   std::wstring profileCleanupDetails;
+  profileNamespace.reset();
   const bool profileRemoved =
-      RemoveTransientProfileIfIdleAndVerify(profilePath, profileCleanupDetails);
+      RemoveTransientProfileIfIdleAndVerify(profilePath, profileCleanupDetails, directory);
   if (saved && profileRemoved) {
     MessageBoxW(g_hGui,
                 L"The Default profile was saved. Future new clients will use "
@@ -13189,6 +14560,7 @@ static void HandleClosedDefaultProfile() {
 
 static bool HandleProfileExitOnUiThread(const ProfileExitPayload &payload) {
   bool claimed = false;
+  std::shared_ptr<transient_profile::Identity> directory;
   {
     std::lock_guard<std::mutex> lock(g_activeProfilesMutex);
     const auto active =
@@ -13198,6 +14570,7 @@ static bool HandleProfileExitOnUiThread(const ProfileExitPayload &payload) {
         active->second.type != payload.type) {
       return false;
     }
+    directory = active->second.directory;
     g_activeProfiles.erase(active);
     claimed = true;
   }
@@ -13212,7 +14585,7 @@ static bool HandleProfileExitOnUiThread(const ProfileExitPayload &payload) {
           g_sDataDir / (payload.type == ProfileType::Default ? L"Default"
                                                              : L"Temp");
       if (!RemoveTransientProfileIfIdleAndVerify(transientPath,
-                                                  cleanupDetails)) {
+                                                  cleanupDetails, directory)) {
         std::wstring message =
             L"The browser launch was rolled back, but its disposable "
             L"profile could not be removed.";
@@ -13225,7 +14598,7 @@ static bool HandleProfileExitOnUiThread(const ProfileExitPayload &payload) {
   } else if (payload.type == ProfileType::Temporary) {
     std::wstring cleanupDetails;
     if (!RemoveTransientProfileIfIdleAndVerify(g_sDataDir / L"Temp",
-                                                cleanupDetails)) {
+                                                cleanupDetails, directory)) {
       std::wstring message =
           L"The temporary browser closed, but its disposable profile could "
           L"not be removed.";
@@ -13235,7 +14608,7 @@ static bool HandleProfileExitOnUiThread(const ProfileExitPayload &payload) {
                   MB_OK | MB_ICONWARNING);
     }
   } else if (payload.type == ProfileType::Default) {
-    HandleClosedDefaultProfile();
+    HandleClosedDefaultProfile(directory);
   }
 
   if (payload.sessionAnnounced)
@@ -13394,11 +14767,58 @@ static void StopWatcher() {
 
 static std::optional<std::wstring>
 GetBrowserPageTitle(const std::wstring &currentTitle,
-                    const std::wstring &clientName, BrowserKind browser) {
+                    const std::wstring &clientName, BrowserKind browser,
+                    const browser_title::AppliedTitleState *applied = nullptr) {
   const std::wstring sessionLabel =
       std::format(L"{} [{}]", clientName, GetBrowserDisplayName(browser));
+  if (applied)
+    return applied->Resolve(currentTitle, sessionLabel, APP_ALIAS,
+                            browser == BrowserKind::Edge);
   return browser_title::GetPageTitle(
       currentTitle, sessionLabel, APP_ALIAS, browser == BrowserKind::Edge);
+}
+
+struct AppliedWindowTitle {
+  DWORD pid = 0;
+  browser_title::AppliedTitleState state;
+};
+
+static void UpdateBrowserWindowTitle(HWND window, DWORD pid,
+    const std::wstring &clientName, BrowserKind browser,
+    AppliedWindowTitle &appliedTitle) {
+  DWORD currentPid = 0;
+  if (!GetWindowThreadProcessId(window, &currentPid) || currentPid != pid) {
+    appliedTitle = {};
+    return;
+  }
+  if (appliedTitle.pid != pid) {
+    appliedTitle = {};
+    appliedTitle.pid = pid;
+  }
+  const int length = GetWindowTextLengthW(window);
+  if (length <= 0 || length >= 4096)
+    return;
+  std::wstring current(static_cast<size_t>(length) + 1, L'\0');
+  const int read = GetWindowTextW(window, current.data(), length + 1);
+  if (read <= 0)
+    return;
+  current.resize(static_cast<size_t>(read));
+  const auto page = GetBrowserPageTitle(current, clientName, browser,
+                                       &appliedTitle.state);
+  if (!page || page->empty())
+    return;
+  const std::wstring label = std::format(
+      L"{} [{}]", clientName, GetBrowserDisplayName(browser));
+  const std::wstring formatted = browser_title::Format(
+      *page, label, APP_ALIAS, g_bClientTitleFirst.load());
+  if (formatted == current)
+    return;
+  DWORD_PTR accepted = 0;
+  if (SendMessageTimeoutW(window, WM_SETTEXT, 0,
+      reinterpret_cast<LPARAM>(formatted.c_str()),
+      SMTO_ABORTIFHUNG | SMTO_BLOCK, 350, &accepted) && accepted)
+    appliedTitle.state.RememberApplied(*page, formatted, label, APP_ALIAS,
+                                       browser == BrowserKind::Edge);
 }
 
 void WatcherThread(std::stop_token stopToken) {
@@ -13419,6 +14839,7 @@ void WatcherThread(std::stop_token stopToken) {
     std::wstring signature;
   };
   std::map<HWND, AssignedWindowIdentity> assignedWindowIdentities;
+  std::map<HWND, AppliedWindowTitle> appliedWindowTitles;
   while (!stopToken.stop_requested()) {
     std::this_thread::sleep_for(std::chrono::milliseconds(500));
     if (stopToken.stop_requested())
@@ -13462,8 +14883,8 @@ void WatcherThread(std::stop_token stopToken) {
       for (auto it = g_iconCache.begin(); it != g_iconCache.end();) {
         const bool clientStillActive =
             std::ranges::any_of(profiles_copy, [&](const auto &active) {
-              return _wcsicmp(active.first.clientName.c_str(),
-                              it->first.c_str()) == 0;
+              return client_name_comparison::EqualIgnoringCase(
+                  active.first.clientName, it->first);
             });
         if (!clientStillActive) {
           RetireCachedIcons(it->first, it->second);
@@ -13565,28 +14986,21 @@ void WatcherThread(std::stop_token stopToken) {
           clientIconAssignmentsCurrent[clientName] = false;
         }
 
-        const int titleLength = GetWindowTextLengthW(ew);
-        if (titleLength > 0 && titleLength < 4096) {
-          std::wstring titleStr((size_t)titleLength + 1, L'\0');
-          GetWindowTextW(ew, titleStr.data(), titleLength + 1);
-          titleStr.resize((size_t)titleLength);
-          const auto pageTitle =
-              GetBrowserPageTitle(titleStr, clientName, browser);
-          if (!pageTitle || pageTitle->empty())
-            continue;
-
-          const std::wstring sessionLabel = std::format(
-              L"{} [{}]", clientName, GetBrowserDisplayName(browser));
-          const std::wstring newTitle = browser_title::Format(
-              *pageTitle, sessionLabel, APP_ALIAS,
-              g_bClientTitleFirst.load());
-          if (newTitle == titleStr)
-            continue;
-          DWORD_PTR ignored = 0;
-          SendMessageTimeoutW(ew, WM_SETTEXT, 0, (LPARAM)newTitle.c_str(),
-                              SMTO_ABORTIFHUNG | SMTO_BLOCK, 350, &ignored);
-        }
+        UpdateBrowserWindowTitle(ew, pid, clientName, browser,
+                                  appliedWindowTitles[ew]);
       }
+    }
+
+    for (auto it = appliedWindowTitles.begin();
+         it != appliedWindowTitles.end();) {
+      DWORD currentPid = 0;
+      if (!observedWindowIdentities.contains(it->first) ||
+          !IsWindow(it->first) ||
+          !GetWindowThreadProcessId(it->first, &currentPid) ||
+          currentPid != it->second.pid)
+        it = appliedWindowTitles.erase(it);
+      else
+        ++it;
     }
 
     for (auto it = assignedWindowIdentities.begin();
@@ -13751,7 +15165,7 @@ constexpr DWORD kBrowserShutdownGraceMs = 8000;
 
 struct CoordinatedShutdownTarget {
   DWORD pid = 0;
-  HANDLE processHandle = nullptr;
+  std::shared_ptr<void> process;
 };
 
 struct CoordinatedShutdownState {
@@ -13769,10 +15183,6 @@ static bool IsProfileProcessTracked(DWORD pid) {
 
 static void CloseCoordinatedShutdownHandles(
     const std::shared_ptr<CoordinatedShutdownState> &state) {
-  for (const auto &target : state->targets) {
-    if (target.processHandle)
-      CloseHandle(target.processHandle);
-  }
   state->targets.clear();
 }
 
@@ -13797,27 +15207,16 @@ static bool FinishCoordinatedShutdown(
     const std::shared_ptr<CoordinatedShutdownState> &state) {
   bool allHandled = true;
   for (const auto &target : state->targets) {
-    const bool handled = TryTerminateProcessHandle(target.processHandle);
-    CloseHandle(target.processHandle);
+    const bool handled = TryTerminateProcessHandle(target.process.get());
     if (!handled && IsProfileProcessTracked(target.pid))
       allHandled = false;
   }
   state->targets.clear();
 
   for (DWORD pid : state->retryProcessIds) {
-    if (!IsProfileProcessTracked(pid))
-      continue;
-
-    HANDLE processHandle =
-        OpenProcess(SYNCHRONIZE | PROCESS_TERMINATE, FALSE, pid);
-    if (!processHandle) {
-      allHandled = false;
-      continue;
-    }
-
-    const bool handled = TryTerminateProcessHandle(processHandle);
-    CloseHandle(processHandle);
-    if (!handled && IsProfileProcessTracked(pid))
+    // Missing launch ownership is not permission to adopt whichever process
+    // later receives this PID. Leave it running and report the failed close.
+    if (IsProfileProcessTracked(pid))
       allHandled = false;
   }
   state->retryProcessIds.clear();
@@ -13834,29 +15233,24 @@ static void StopShutdownWorker() {
 void RequestCloseAllProfiles() {
   StopShutdownWorker();
 
-  std::vector<DWORD> processIds;
-  {
-    std::lock_guard<std::mutex> lock(g_activeProfilesMutex);
-    processIds.reserve(g_activeProfiles.size());
-    for (const auto &[key, active] : g_activeProfiles)
-      processIds.push_back(active.pid);
-  }
-  if (processIds.empty())
-    return;
-
   auto state = std::make_shared<CoordinatedShutdownState>();
   state->notifyWindow = g_hGui;
-  state->targets.reserve(processIds.size());
-  state->retryProcessIds.reserve(processIds.size());
-  for (DWORD pid : processIds) {
-    HANDLE processHandle =
-        OpenProcess(SYNCHRONIZE | PROCESS_TERMINATE, FALSE, pid);
-    if (processHandle)
-      state->targets.push_back({pid, processHandle});
-    else
-      state->retryProcessIds.push_back(pid);
-    RequestSessionShutdown(pid);
+  {
+    std::lock_guard<std::mutex> lock(g_activeProfilesMutex);
+    state->targets.reserve(g_activeProfiles.size());
+    state->retryProcessIds.reserve(g_activeProfiles.size());
+    for (const auto &[key, active] : g_activeProfiles) {
+      if (active.process && GetProcessId(active.process.get()) == active.pid)
+        state->targets.push_back({active.pid, active.process});
+      else
+        state->retryProcessIds.push_back(active.pid);
+    }
   }
+  if (state->targets.empty() && state->retryProcessIds.empty())
+    return;
+
+  for (const auto &target : state->targets)
+    RequestSessionShutdown(target.pid);
 
   try {
     g_shutdownThread = std::jthread([state](std::stop_token stopToken) {
@@ -14137,47 +15531,64 @@ static void RemoveSafeStagingFile(const fs::path &stagingPath) {
   }
 }
 
-static bool CopyExecutableToNewStage(const fs::path &sourcePath,
+class InstallerStageLease {
+public:
+  ~InstallerStageLease() {
+    if (file != INVALID_HANDLE_VALUE) {
+      if (!published) {
+        FILE_DISPOSITION_INFO disposition{TRUE};
+        SetFileInformationByHandle(file, FileDispositionInfo, &disposition,
+                                   sizeof(disposition));
+      }
+      CloseHandle(file);
+    }
+  }
+  InstallerStageLease() = default;
+  InstallerStageLease(const InstallerStageLease &) = delete;
+  InstallerStageLease &operator=(const InstallerStageLease &) = delete;
+
+  void Discard(std::wstring &errorDetails) {
+    if (file == INVALID_HANDLE_VALUE || published)
+      return;
+    FILE_DISPOSITION_INFO disposition{TRUE};
+    const bool removed = SetFileInformationByHandle(
+        file, FileDispositionInfo, &disposition, sizeof(disposition)) != FALSE;
+    const DWORD removeError = removed ? ERROR_SUCCESS : GetLastError();
+    CloseHandle(file);
+    file = INVALID_HANDLE_VALUE;
+    if (!removed) {
+      errorDetails += std::format(
+          L" The owned update staging file was retained at {} (Windows error {}).",
+          path.wstring(), removeError);
+    }
+  }
+
+  HANDLE file = INVALID_HANDLE_VALUE;
+  fs::path path;
+  bool published = false;
+};
+
+static bool CopyExecutableToNewStage(HANDLE source,
                                      const fs::path &stagingPath,
+                                     InstallerStageLease &ownedStage,
                                      std::wstring &errorDetails) {
-  HANDLE source = CreateFileW(
-      sourcePath.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_DELETE,
-      nullptr, OPEN_EXISTING,
+  // The caller keeps the immutable source handle alive throughout copying,
+  // verification and publication. Only a successful CREATE_NEW grants cleanup
+  // ownership; a name collision is never removed by pathname.
+  ownedStage.path = stagingPath;
+  ownedStage.file = CreateFileW(
+      stagingPath.c_str(), GENERIC_READ | GENERIC_WRITE | DELETE,
+      FILE_SHARE_READ, nullptr, CREATE_NEW,
       FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT |
-          FILE_FLAG_SEQUENTIAL_SCAN,
+          FILE_FLAG_WRITE_THROUGH | FILE_FLAG_SEQUENTIAL_SCAN,
       nullptr);
-  if (source == INVALID_HANDLE_VALUE) {
-    errorDetails = std::format(L"The update source could not be opened (Windows "
-                               L"error {}).",
-                               GetLastError());
-    return false;
-  }
-
-  BY_HANDLE_FILE_INFORMATION sourceInfo{};
-  if (!GetFileInformationByHandle(source, &sourceInfo) ||
-      (sourceInfo.dwFileAttributes &
-       (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) != 0) {
-    const DWORD error = GetLastError();
-    CloseHandle(source);
-    errorDetails = std::format(
-        L"The update source is not a safe regular file (Windows error {}).",
-        error);
-    return false;
-  }
-
-  HANDLE staging =
-      CreateFileW(stagingPath.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW,
-                  FILE_ATTRIBUTE_NORMAL | FILE_FLAG_WRITE_THROUGH |
-                      FILE_FLAG_SEQUENTIAL_SCAN,
-                  nullptr);
-  if (staging == INVALID_HANDLE_VALUE) {
-    const DWORD error = GetLastError();
-    CloseHandle(source);
+  if (ownedStage.file == INVALID_HANDLE_VALUE) {
     errorDetails = std::format(
         L"The update staging file could not be created (Windows error {}).",
-        error);
+        GetLastError());
     return false;
   }
+  const HANDLE staging = ownedStage.file;
 
   bool copied = true;
   DWORD copyError = ERROR_SUCCESS;
@@ -14210,12 +15621,6 @@ static bool CopyExecutableToNewStage(const fs::path &sourcePath,
     copied = false;
     copyError = GetLastError();
   }
-  const bool stagingClosed = CloseHandle(staging) != FALSE;
-  CloseHandle(source);
-  if (!stagingClosed && copied) {
-    copied = false;
-    copyError = GetLastError();
-  }
   if (!copied) {
     errorDetails = std::format(
         L"The update staging copy failed (Windows error {}).", copyError);
@@ -14224,37 +15629,24 @@ static bool CopyExecutableToNewStage(const fs::path &sourcePath,
   return true;
 }
 
-static bool FilesMatchExactly(const fs::path &leftPath,
-                              const fs::path &rightPath,
+static bool FilesMatchExactly(HANDLE left, HANDLE right,
                               std::wstring &errorDetails) {
-  if (!IsSafeExistingRegularFile(leftPath) ||
-      !IsSafeExistingRegularFile(rightPath)) {
+  BY_HANDLE_FILE_INFORMATION leftInfo{}, rightInfo{};
+  if (!GetFileInformationByHandle(left, &leftInfo) ||
+      !GetFileInformationByHandle(right, &rightInfo) ||
+      ((leftInfo.dwFileAttributes | rightInfo.dwFileAttributes) &
+       (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) != 0 ||
+      rightInfo.nNumberOfLinks != 1) {
     errorDetails =
-        L"A file could not be verified because it is missing or unsafe.";
+        L"An update file could not be verified because its owned handle is unsafe.";
     return false;
   }
-
-  HANDLE left = CreateFileW(leftPath.c_str(), GENERIC_READ,
-                            FILE_SHARE_READ | FILE_SHARE_DELETE, nullptr,
-                            OPEN_EXISTING,
-                            FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT |
-                                FILE_FLAG_SEQUENTIAL_SCAN,
-                            nullptr);
-  HANDLE right = CreateFileW(rightPath.c_str(), GENERIC_READ,
-                             FILE_SHARE_READ | FILE_SHARE_DELETE, nullptr,
-                             OPEN_EXISTING,
-                             FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT |
-                                 FILE_FLAG_SEQUENTIAL_SCAN,
-                             nullptr);
-  if (left == INVALID_HANDLE_VALUE || right == INVALID_HANDLE_VALUE) {
-    const DWORD error = GetLastError();
-    if (left != INVALID_HANDLE_VALUE)
-      CloseHandle(left);
-    if (right != INVALID_HANDLE_VALUE)
-      CloseHandle(right);
+  const LARGE_INTEGER beginning{};
+  if (!SetFilePointerEx(left, beginning, nullptr, FILE_BEGIN) ||
+      !SetFilePointerEx(right, beginning, nullptr, FILE_BEGIN)) {
     errorDetails =
         std::format(L"The staged update could not be verified (Windows error {}).",
-                    error);
+                    GetLastError());
     return false;
   }
 
@@ -14284,13 +15676,59 @@ static bool FilesMatchExactly(const fs::path &leftPath,
     if (leftRead == 0)
       break;
   }
-  CloseHandle(right);
-  CloseHandle(left);
   if (!matched) {
     errorDetails =
         L"The staged update is not byte-for-byte identical to the source.";
   }
   return matched;
+}
+
+static bool PublishOwnedInstallerStage(InstallerStageLease &stage,
+                                       const fs::path &destination,
+                                       DWORD &error) {
+  const std::wstring destinationName = fs::absolute(destination).native();
+  const size_t nameBytes = destinationName.size() * sizeof(wchar_t);
+  const size_t requestBytes = offsetof(FILE_RENAME_INFO, FileName) + nameBytes +
+                              sizeof(wchar_t);
+  if (requestBytes > (std::numeric_limits<DWORD>::max)()) {
+    error = ERROR_FILENAME_EXCED_RANGE;
+    return false;
+  }
+  std::vector<BYTE> request(requestBytes, 0);
+  auto *rename = reinterpret_cast<FILE_RENAME_INFO *>(request.data());
+  rename->ReplaceIfExists = TRUE;
+  rename->RootDirectory = nullptr;
+  rename->FileNameLength = static_cast<DWORD>(nameBytes);
+  std::memcpy(rename->FileName, destinationName.data(), nameBytes);
+  // Preserve ordinary same-volume atomic replacement, but bind the source to
+  // the continuously held CREATE_NEW object rather than a reusable filename.
+  const bool renamed = SetFileInformationByHandle(
+      stage.file, FileRenameInfo, rename, static_cast<DWORD>(requestBytes)) != FALSE;
+  error = renamed ? ERROR_SUCCESS : GetLastError();
+  if (renamed)
+    stage.published = true; // Never let later verification delete the installed file.
+  return renamed;
+}
+
+static bool VerifyPublishedInstallerStage(const InstallerStageLease &stage,
+                                          const fs::path &destination,
+                                          std::wstring &errorDetails) {
+  SafeRegularFileSignature owned{}, installed{};
+  // A new observer must share WRITE/DELETE because the owned lease has both
+  // accesses. That lease itself denies writers and pathname replacement.
+  ScopedKernelHandle observer(CreateFileW(
+      destination.c_str(), FILE_READ_ATTRIBUTES,
+      FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+      OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT, nullptr));
+  if (!observer ||
+      !ReadSafeRegularFileSignature(stage.file, owned, &errorDetails) ||
+      !ReadSafeRegularFileSignature(observer.get(), installed, &errorDetails) ||
+      !SameSafeRegularFileSignature(owned, installed)) {
+    if (errorDetails.empty())
+      errorDetails = L"The installed update does not match its owned staging object.";
+    return false;
+  }
+  return true;
 }
 
 static bool CopyFileWithRetry(const fs::path &sourcePath,
@@ -14303,12 +15741,29 @@ static bool CopyFileWithRetry(const fs::path &sourcePath,
     return false;
   }
 
+  ScopedKernelHandle source(CreateFileW(
+      sourcePath.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+      FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT |
+          FILE_FLAG_SEQUENTIAL_SCAN,
+      nullptr));
+  SafeRegularFileSignature sourceSignature{};
+  if (!source ||
+      !ReadSafeRegularFileSignature(source.get(), sourceSignature, &lastError)) {
+    if (lastError.empty())
+      lastError = std::format(L"The update source could not be opened (Windows error {}).",
+                              GetLastError());
+    if (errorDetails)
+      *errorDetails = lastError;
+    return false;
+  }
+
   fs::path stagingPath;
+  InstallerStageLease stage;
   if (!TryMakeUniqueSiblingStagePath(destPath, L"stage",
                                      stagingPath, lastError) ||
-      !CopyExecutableToNewStage(sourcePath, stagingPath, lastError) ||
-      !FilesMatchExactly(sourcePath, stagingPath, lastError)) {
-    RemoveSafeStagingFile(stagingPath);
+      !CopyExecutableToNewStage(source.get(), stagingPath, stage, lastError) ||
+      !FilesMatchExactly(source.get(), stage.file, lastError)) {
+    stage.Discard(lastError);
     if (errorDetails)
       *errorDetails = lastError;
     return false;
@@ -14316,20 +15771,20 @@ static bool CopyFileWithRetry(const fs::path &sourcePath,
 
   for (int attempt = 0; attempt < 20; ++attempt) {
     if (!ValidateInstallCopyPaths(sourcePath, destPath, lastError) ||
-        !FilesMatchExactly(sourcePath, stagingPath, lastError)) {
+        !FilesMatchExactly(source.get(), stage.file, lastError)) {
       break;
     }
 
-    if (MoveFileExW(stagingPath.c_str(), destPath.c_str(),
-                    MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+    DWORD moveError = ERROR_SUCCESS;
+    if (PublishOwnedInstallerStage(stage, destPath, moveError)) {
       if (ValidateInstalledExecutablePath(destPath, false, lastError) &&
-          FilesMatchExactly(sourcePath, destPath, lastError)) {
+          VerifyPublishedInstallerStage(stage, destPath, lastError) &&
+          FilesMatchExactly(source.get(), stage.file, lastError)) {
         return true;
       }
       break;
     }
 
-    const DWORD moveError = GetLastError();
     lastError =
         std::format(L"Atomic replacement failed: Windows error {}.", moveError);
     if (moveError != ERROR_ACCESS_DENIED && moveError != ERROR_SHARING_VIOLATION &&
@@ -14339,7 +15794,7 @@ static bool CopyFileWithRetry(const fs::path &sourcePath,
     Sleep(250);
   }
 
-  RemoveSafeStagingFile(stagingPath);
+  stage.Discard(lastError);
   if (errorDetails)
     *errorDetails = lastError;
   return false;
@@ -15159,6 +16614,7 @@ static void LaunchProfileAsync(const std::wstring &name, bool isTemp,
           bool sessionAnnounced = false;
           bool launchFailed = false;
           bool freshTransientProfile = false;
+          std::shared_ptr<transient_profile::Identity> transientDirectory;
           std::wstring failureMessage;
           std::wstring launchError;
           const ProfileType profileType =
@@ -15169,13 +16625,19 @@ static void LaunchProfileAsync(const std::wstring &name, bool isTemp,
           try {
             pid = LaunchProfile(name, isTemp, isDefault, browser, startupUrl,
                                 &processHandle, &profilePath, &executablePath,
-                                &launchError, &freshTransientProfile);
+                                &launchError, &freshTransientProfile,
+                                &transientDirectory);
             if (pid > 0) {
+              auto processLifetime = RetainLaunchedProcess(processHandle, pid);
+              if (!processLifetime)
+                throw std::runtime_error(
+                    "The launched browser process identity could not be retained.");
               {
                 std::lock_guard<std::mutex> lock(g_activeProfilesMutex);
                 g_activeProfiles[ClientBrowserKey{name, browser}] =
                     ActiveProfileInfo{pid, executablePath, profilePath,
-                                      profileType};
+                                      profileType, std::move(processLifetime),
+                                      std::move(transientDirectory)};
                 activeRegistered = true;
               }
 
@@ -15245,7 +16707,7 @@ static void LaunchProfileAsync(const std::wstring &name, bool isTemp,
                   g_sDataDir / (profileType == ProfileType::Default ? L"Default"
                                                                     : L"Temp");
               transientProfileRemoved = RemoveTransientProfileIfIdleAndVerify(
-                  transientPath, cleanupDetails);
+                  transientPath, cleanupDetails, transientDirectory);
             }
             if (!processStopped) {
               failureMessage +=
@@ -15281,9 +16743,10 @@ static void LaunchProfileAsync(const std::wstring &name, bool isTemp,
 }
 
 static bool PreflightValidatedClientTreeDelete(const fs::path &root,
-                                               std::wstring &errorDetails) {
+                                               std::wstring &errorDetails,
+                                               bool directoriesAlreadyBound = false) {
   errorDetails.clear();
-  const auto canOpenForDelete = [&errorDetails](const fs::path &path) {
+  const auto canOpenForDelete = [&errorDetails, directoriesAlreadyBound](const fs::path &path) {
     const DWORD attributes = GetFileAttributesW(path.c_str());
     if (attributes == INVALID_FILE_ATTRIBUTES ||
         (attributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0) {
@@ -15293,6 +16756,10 @@ static bool PreflightValidatedClientTreeDelete(const fs::path &root,
     }
     const bool isDirectory =
         (attributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+    // BoundTree already holds DELETE access on every captured directory with
+    // no delete sharing. A second DELETE open would conflict with our guard.
+    if (isDirectory && directoriesAlreadyBound)
+      return true;
     if (!isDirectory && (attributes & FILE_ATTRIBUTE_READONLY) != 0) {
       errorDetails = L"A client file is read-only: " +
                      path.filename().wstring();
@@ -15352,7 +16819,8 @@ static bool SameDeleteAuthorityPath(const fs::path &left,
 
 static bool CollectClientDeleteAuthority(
     const fs::path &root, std::vector<fs::path> &authority,
-    std::wstring &errorDetails) {
+    std::wstring &errorDetails,
+    client_deletion_safety::BoundTree *namespaceAuthority = nullptr) {
   authority.clear();
   errorDetails.clear();
   const auto add = [&authority](const fs::path &relative) {
@@ -15423,6 +16891,20 @@ static bool CollectClientDeleteAuthority(
         return false;
       }
     }
+    const fs::path layout = root / client_tab_layout::kFileName;
+    const DWORD layoutAttributes = GetFileAttributesW(layout.c_str());
+    if (layoutAttributes != INVALID_FILE_ATTRIBUTES) {
+      if (!client_tab_layout::ValidateFile(layout, &errorDetails,
+                                           namespaceAuthority))
+        return false;
+      add(client_tab_layout::kFileName);
+    } else {
+      const DWORD error = GetLastError();
+      if (error != ERROR_FILE_NOT_FOUND && error != ERROR_PATH_NOT_FOUND) {
+        errorDetails = L"The client tab-layout record could not be inspected.";
+        return false;
+      }
+    }
     return true;
   } catch (const std::exception &error) {
     errorDetails = AnsiToWide(error.what());
@@ -15432,7 +16914,8 @@ static bool CollectClientDeleteAuthority(
 
 static bool ValidateClientDeleteAuthorityEntry(const fs::path &root,
                                                const fs::path &relative,
-                                               std::wstring &errorDetails) {
+                                               std::wstring &errorDetails,
+    client_deletion_safety::BoundTree *namespaceAuthority = nullptr) {
   const fs::path path = root / relative;
   const DWORD attributes = GetFileAttributesW(path.c_str());
   if (attributes == INVALID_FILE_ATTRIBUTES ||
@@ -15448,6 +16931,7 @@ static bool ValidateClientDeleteAuthorityEntry(const fs::path &root,
       _wcsicmp(filename.c_str(), kBrowserSchemaMarkerName) == 0 ||
       _wcsicmp(filename.c_str(), kLegacyBrowserBindingMarkerName) == 0 ||
       _wcsicmp(filename.c_str(), client_activity::kFileName) == 0 ||
+      _wcsicmp(filename.c_str(), client_tab_layout::kFileName) == 0 ||
       _wcsicmp(filename.c_str(), L"ctSpaces") == 0;
   if (expectedFile == ((attributes & FILE_ATTRIBUTE_DIRECTORY) != 0)) {
     errorDetails = L"Deletion metadata changed type: " + filename;
@@ -15482,6 +16966,9 @@ static bool ValidateClientDeleteAuthorityEntry(const fs::path &root,
     errorDetails = L"The legacy browser binding marker changed.";
     return false;
   }
+  if (_wcsicmp(filename.c_str(), client_tab_layout::kFileName) == 0)
+    return client_tab_layout::ValidateFile(path, &errorDetails,
+                                           namespaceAuthority);
   // The activity record is retry authority even when an older/corrupt record
   // cannot be decoded. It must remain a bounded safe regular file.
   WIN32_FILE_ATTRIBUTE_DATA data{};
@@ -15504,12 +16991,13 @@ static bool IsClientDeleteAuthority(
 
 static bool ClientTreeContainsOnlyDeleteAuthority(
     const fs::path &root, const std::vector<fs::path> &authority,
-    std::wstring &errorDetails, bool requireEveryAuthority = true) {
+    std::wstring &errorDetails, bool requireEveryAuthority = true,
+    client_deletion_safety::BoundTree *namespaceAuthority = nullptr) {
   try {
     if (requireEveryAuthority) {
       for (const auto &relative : authority) {
         if (!ValidateClientDeleteAuthorityEntry(root, relative,
-                                                errorDetails)) {
+                                                errorDetails, namespaceAuthority)) {
           return false;
         }
       }
@@ -15529,7 +17017,8 @@ static bool ClientTreeContainsOnlyDeleteAuthority(
                        entry.path().filename().wstring();
         return false;
       }
-      if (!ValidateClientDeleteAuthorityEntry(root, relative, errorDetails))
+      if (!ValidateClientDeleteAuthorityEntry(root, relative, errorDetails,
+                                               namespaceAuthority))
         return false;
     }
     return true;
@@ -15541,7 +17030,8 @@ static bool ClientTreeContainsOnlyDeleteAuthority(
 
 static bool RemoveClientPayloadPreservingDeleteAuthority(
     const fs::path &root, const std::vector<fs::path> &authority,
-    std::wstring &errorDetails) {
+    std::wstring &errorDetails,
+    client_deletion_safety::BoundTree &boundTree) {
   std::vector<fs::path> payload;
   try {
     for (const auto &entry : fs::recursive_directory_iterator(root)) {
@@ -15557,40 +17047,18 @@ static bool RemoveClientPayloadPreservingDeleteAuthority(
     return left.native().size() > right.native().size();
   });
   for (const auto &path : payload) {
-    std::error_code removeError;
-    const bool removed = fs::remove(path, removeError);
-    if (removeError) {
-      errorDetails = L"The client payload could not be removed: " +
-                     path.filename().wstring() + L". " +
-                     AnsiToWide(removeError.message());
+    if (!boundTree.Remove(path, errorDetails))
       return false;
-    }
-    if (!removed) {
-      const DWORD attributes = GetFileAttributesW(path.c_str());
-      if (attributes != INVALID_FILE_ATTRIBUTES) {
-        errorDetails = L"A client payload item remained after deletion: " +
-                       path.filename().wstring();
-        return false;
-      }
-      const DWORD absenceError = GetLastError();
-      if (absenceError != ERROR_FILE_NOT_FOUND &&
-          absenceError != ERROR_PATH_NOT_FOUND) {
-        errorDetails = std::format(
-            L"A client payload item could not be verified absent (Windows "
-            L"error {}).",
-            absenceError);
-        return false;
-      }
-    }
   }
-  return ClientTreeContainsOnlyDeleteAuthority(root, authority, errorDetails);
+  return ClientTreeContainsOnlyDeleteAuthority(root, authority, errorDetails,
+                                                true, &boundTree);
 }
 
 static bool DeleteEntireClient(
     const std::wstring &clientName, bool preconfirmed,
     const std::optional<client_activity::Record> &expectedActivity,
-    std::wstring &outcome) {
-  if (!PrepareNotesForClientChange(clientName)) { outcome = L"Open notes could not be saved."; return false; }
+    std::wstring &outcome,
+    const std::shared_ptr<transient_profile::Identity> &expectedDirectory = {}) {
   const auto report = [&](HWND owner, const wchar_t *text,
                            const wchar_t *title, UINT flags) {
     outcome = text;
@@ -15626,6 +17094,33 @@ static bool DeleteEntireClient(
   }
   fs::path validatedRoot;
   std::wstring validationError;
+  client_deletion_safety::BoundTree boundTree;
+  if (!boundTree.CaptureNamespace(initialRoot, validationError)) {
+    const std::wstring message =
+        L"The original client folder and its contents could not be pinned "
+        L"safely. Nothing was deleted.\n\n" + validationError;
+    report(g_hGui, message.c_str(), L"Delete Blocked", MB_OK | MB_ICONWARNING);
+    return false;
+  }
+  if (expectedDirectory && !expectedDirectory->MatchesPath(initialRoot)) {
+    outcome = L"The client folder changed after the cleanup preview. Nothing was deleted; rescan before retrying.";
+    return false;
+  }
+  if (!PrepareNotesForClientChange(clientName)) {
+    outcome = L"Open notes could not be saved.";
+    return false;
+  }
+  // The namespace guard now retains the verified preview object. Release its
+  // shared observer so successful directory disposition can finish normally.
+  if (expectedDirectory)
+    expectedDirectory->Release();
+  if (!boundTree.CaptureContents(validationError)) {
+    const std::wstring message =
+        L"The original client directory or its contents changed before "
+        L"deletion. Nothing was deleted.\n\n" + validationError;
+    report(g_hGui, message.c_str(), L"Delete Blocked", MB_OK | MB_ICONWARNING);
+    return false;
+  }
   if (!ValidateWholeClientDeleteTarget(clientName, initialRoot, validatedRoot,
                                        validationError)) {
     std::wstring message =
@@ -15686,7 +17181,7 @@ static bool DeleteEntireClient(
 
   std::wstring deleteReadinessError;
   if (!PreflightValidatedClientTreeDelete(deleteRoot,
-                                          deleteReadinessError)) {
+                                          deleteReadinessError, true)) {
     std::wstring message =
         L"The client could not be prepared for deletion, so no files were "
         L"removed. Close programs using this client and try again.";
@@ -15700,10 +17195,19 @@ static bool DeleteEntireClient(
   CtSpacesInstallerTestAfterClientDeletePreflight(deleteRoot);
 #endif
 
+  if (!boundTree.Verify(deleteReadinessError)) {
+    const std::wstring message =
+        L"The client changed after confirmation. Its original files and "
+        L"ownership metadata were retained; no files were removed.\n\n" +
+        deleteReadinessError;
+    report(g_hGui, message.c_str(), L"Delete Cancelled", MB_OK | MB_ICONWARNING);
+    return false;
+  }
+
   std::vector<fs::path> deleteAuthority;
   std::wstring deleteDetails;
   if (!CollectClientDeleteAuthority(deleteRoot, deleteAuthority,
-                                    deleteDetails)) {
+                                    deleteDetails, &boundTree)) {
     std::wstring message =
         L"The client deletion authority could not be captured safely. No "
         L"files were removed.";
@@ -15728,7 +17232,9 @@ static bool DeleteEntireClient(
     }
   }
   if (!IsSafeExistingDirectory(quarantineBase) ||
-      !IsDirectChildPath(quarantineBase, g_sDataDir)) {
+      !IsDirectChildPath(quarantineBase, g_sDataDir) ||
+      !boundTree.PinAncestor(quarantineBase, false, deleteDetails) ||
+      !boundTree.ProtectEmptyParent(quarantineBase, deleteDetails)) {
     report(g_hGui,
            L"The deletion staging folder is not a safe local directory. No "
            L"files were removed.",
@@ -15750,7 +17256,7 @@ static bool DeleteEntireClient(
   }
 
   if (!RemoveClientPayloadPreservingDeleteAuthority(
-          deleteRoot, deleteAuthority, deleteDetails)) {
+          deleteRoot, deleteAuthority, deleteDetails, boundTree)) {
     std::wstring message =
         L"The client payload could not be completely removed. The ctSpaces "
         L"ownership metadata was retained so the same client can be retried.";
@@ -15770,7 +17276,7 @@ static bool DeleteEntireClient(
       ProbeClientProfilesInUse(clientName, finalProfileUseError) !=
           ProfileUseState::NotInUse ||
       !ClientTreeContainsOnlyDeleteAuthority(
-          deleteRoot, deleteAuthority, deleteDetails)) {
+          deleteRoot, deleteAuthority, deleteDetails, true, &boundTree)) {
     std::wstring message =
         L"The client changed before the final deletion commit. Its ctSpaces "
         L"ownership metadata remains in place so deletion can be retried.";
@@ -15783,14 +17289,10 @@ static bool DeleteEntireClient(
     return false;
   }
 
-  if (!MoveFileExW(deleteRoot.c_str(), quarantineRoot.c_str(),
-                   MOVEFILE_WRITE_THROUGH)) {
-    const DWORD error = GetLastError();
+  if (!boundTree.MoveRoot(quarantineRoot, deleteDetails)) {
     report(g_hGui,
-           std::format(
-               L"The final deletion commit could not be staged (Windows "
-               L"error {}). The retryable ctSpaces metadata remains in place.",
-               error)
+           (L"The final deletion commit could not be staged. The retryable "
+            L"ctSpaces metadata remains in place.\n\n" + deleteDetails)
                .c_str(),
            L"Delete Cancelled", MB_OK | MB_ICONERROR);
     return false;
@@ -15807,7 +17309,7 @@ static bool DeleteEntireClient(
        liveRootAbsenceError == ERROR_PATH_NOT_FOUND);
   if (!liveRootVerifiedAbsent || !IsSafeExistingDirectory(quarantineRoot) ||
       !ClientTreeContainsOnlyDeleteAuthority(
-          quarantineRoot, deleteAuthority, deleteDetails)) {
+          quarantineRoot, deleteAuthority, deleteDetails, true, &boundTree)) {
     std::wstring rollbackDetails;
     const DWORD originalAttributes = GetFileAttributesW(deleteRoot.c_str());
     const DWORD originalError = originalAttributes == INVALID_FILE_ATTRIBUTES
@@ -15819,8 +17321,7 @@ static bool DeleteEntireClient(
          originalError == ERROR_PATH_NOT_FOUND);
     const bool restored =
         originalAbsent &&
-        MoveFileExW(quarantineRoot.c_str(), deleteRoot.c_str(),
-                    MOVEFILE_WRITE_THROUGH) &&
+        boundTree.MoveRoot(deleteRoot, rollbackDetails) &&
         ValidateWholeClientDeleteTarget(clientName, deleteRoot,
                                         finalValidatedRoot, rollbackDetails);
     std::wstring message =
@@ -15841,8 +17342,7 @@ static bool DeleteEntireClient(
   }
 
   std::wstring metadataCleanupWarning;
-  std::error_code deleteError;
-  fs::remove_all(quarantineRoot, deleteError);
+  const bool metadataRemoved = boundTree.RemoveRemaining(deleteDetails);
   const DWORD remainingAttributes = GetFileAttributesW(quarantineRoot.c_str());
   const DWORD quarantineAbsenceError =
       remainingAttributes == INVALID_FILE_ATTRIBUTES ? GetLastError()
@@ -15851,13 +17351,13 @@ static bool DeleteEntireClient(
       remainingAttributes == INVALID_FILE_ATTRIBUTES &&
       (quarantineAbsenceError == ERROR_FILE_NOT_FOUND ||
        quarantineAbsenceError == ERROR_PATH_NOT_FOUND);
-  if (deleteError || !quarantineVerifiedAbsent) {
+  if (!metadataRemoved || !quarantineVerifiedAbsent) {
     std::wstring remainingDetails;
     const bool metadataOnly =
         remainingAttributes != INVALID_FILE_ATTRIBUTES &&
         IsSafeExistingDirectory(quarantineRoot) &&
         ClientTreeContainsOnlyDeleteAuthority(
-            quarantineRoot, deleteAuthority, remainingDetails, false);
+            quarantineRoot, deleteAuthority, remainingDetails, false, &boundTree);
     if (!metadataOnly) {
       std::wstring message =
           L"The client was removed from the live collection, but ctSpaces "
@@ -15865,11 +17365,10 @@ static bool DeleteEntireClient(
           L"complete deletion was recorded. Inspect this exact staging "
           L"folder:\n\n" +
           quarantineRoot.wstring();
-      if (deleteError)
-        message += L"\n\nWindows reported: " +
-                   AnsiToWide(deleteError.message());
       if (!remainingDetails.empty())
         message += L"\n\nDetails: " + remainingDetails;
+      if (!deleteDetails.empty())
+        message += L"\n\nBound cleanup details: " + deleteDetails;
       report(g_hGui, message.c_str(), L"Delete Incomplete",
              MB_OK | MB_ICONERROR);
       return false;
@@ -15879,11 +17378,9 @@ static bool DeleteEntireClient(
         L"staging folder could not be removed:\n\n" +
         quarantineRoot.wstring();
   }
-  std::error_code baseCleanupError;
-  if (fs::is_directory(quarantineBase, baseCleanupError) &&
-      fs::is_empty(quarantineBase, baseCleanupError)) {
-    fs::remove(quarantineBase, baseCleanupError);
-  }
+  // An empty base can be removed only through the same pinned object. Never
+  // delete a pathname that another process could replace after our checks.
+  boundTree.RemoveEmptyPinnedAncestor(quarantineBase);
 
   std::vector<std::wstring> shortcutFailures;
   const auto removeManagedShortcut =
@@ -15956,6 +17453,7 @@ void GuiProfDel() {
 struct InactiveClientCandidate {
   std::wstring name;
   client_activity::Record activity;
+  std::shared_ptr<transient_profile::Identity> directory;
 };
 
 struct ClientDeletionDialogState {
@@ -15964,6 +17462,17 @@ struct ClientDeletionDialogState {
   std::vector<int> selected;
 };
 
+// These controls have client-owned, theme-colored outlines. Keep the native
+// frame removal and replacement-frame painting registered in one place.
+static constexpr int kCleanupThemedControlIds[] = {
+    IDC_INACTIVE_LIST, IDC_CLEANUP_RESULT_TEXT, IDC_GUIDE_TOPICS, IDC_GUIDE_BODY,
+    IDC_CLIENT_NOTES_TEXT, IDC_NOTES_RESULTS, IDC_NOTES_PREVIEW, IDC_NOTES_QUERY,
+    IDC_NOTES_INPUT1, IDC_NOTES_INPUT2, IDC_NOTES_TAG_FILTER, IDC_NOTES_TAGS_EDIT,
+    IDC_NOTES_QUICK_TEXT, IDC_NOTES_QUICK_TITLE, IDC_NOTES_CODE_SOURCE,
+    IDC_NOTES_TEMPLATE_NAME, IDC_NOTES_TEMPLATE_HINT, IDC_NOTES_CLIENT_SEARCH,
+    IDC_NOTES_CLIENT_MATCHES, IDC_BACKUP_QUERY, IDC_BACKUP_CLIENTS,
+    IDC_NOTES_FIND, IDC_NOTES_REPLACE_TEXT, IDC_NOTES_SPELL_WORD};
+
 static void ApplyCleanupDialogTheme(HWND dialog) {
   ApplyThemeToWindow(dialog);
   {
@@ -15971,11 +17480,7 @@ static void ApplyCleanupDialogTheme(HWND dialog) {
     if (std::find(g_themedPopups.begin(), g_themedPopups.end(), dialog) == g_themedPopups.end())
       g_themedPopups.push_back(dialog);
   }
-  for (const int id : {IDC_INACTIVE_LIST, IDC_CLEANUP_RESULT_TEXT,
-                       IDC_GUIDE_TOPICS, IDC_GUIDE_BODY,
-                       IDC_CLIENT_NOTES_TEXT, IDC_NOTES_RESULTS, IDC_NOTES_PREVIEW, IDC_NOTES_QUERY,
-                       IDC_NOTES_INPUT1, IDC_NOTES_INPUT2, IDC_NOTES_TAG_FILTER, IDC_NOTES_TAGS_EDIT, IDC_NOTES_QUICK_TEXT, IDC_NOTES_QUICK_TITLE, IDC_NOTES_CODE_SOURCE,
-                       IDC_NOTES_TEMPLATE_NAME,IDC_NOTES_TEMPLATE_HINT,IDC_NOTES_CLIENT_SEARCH,IDC_NOTES_CLIENT_MATCHES}) {
+  for (const int id : kCleanupThemedControlIds) {
     HWND control = GetDlgItem(dialog, id);
     if (!control)
       continue;
@@ -16033,11 +17538,7 @@ static std::optional<INT_PTR> HandleCleanupDialogTheme(
     RECT rect{};
     GetClientRect(dialog, &rect);
     FillRect(reinterpret_cast<HDC>(wParam), &rect, g_hbrThemeWindow);
-    for (const int id : {IDC_INACTIVE_LIST, IDC_CLEANUP_RESULT_TEXT,
-                         IDC_GUIDE_TOPICS, IDC_GUIDE_BODY,
-                         IDC_CLIENT_NOTES_TEXT, IDC_NOTES_RESULTS, IDC_NOTES_PREVIEW, IDC_NOTES_QUERY,
-                       IDC_NOTES_INPUT1, IDC_NOTES_INPUT2, IDC_NOTES_TAG_FILTER, IDC_NOTES_TAGS_EDIT, IDC_NOTES_QUICK_TEXT, IDC_NOTES_QUICK_TITLE, IDC_NOTES_CODE_SOURCE,
-                       IDC_NOTES_TEMPLATE_NAME,IDC_NOTES_TEMPLATE_HINT,IDC_NOTES_CLIENT_SEARCH,IDC_NOTES_CLIENT_MATCHES}) {
+    for (const int id : kCleanupThemedControlIds) {
       HWND control = GetDlgItem(dialog, id);
       RECT border{};
       if (!control || !(GetWindowLongPtrW(control, GWL_STYLE) & WS_VISIBLE) || !GetWindowRect(control, &border))
@@ -16157,7 +17658,9 @@ static std::optional<INT_PTR> HandleCleanupDialogTheme(
   return std::nullopt;
 }
 
-// Notes keeps the selected theme; only its surface treatment is specialized.
+#include "BackupSelectionUi.inl"
+
+// Notes shares the launcher's palette and rounded controls.
 static COLORREF NotesWindowColor() {
   // System Dark supplies the same color for every surface. Give it the same
   // document/chrome separation as named palettes, without changing its hue.
@@ -16166,8 +17669,8 @@ static COLORREF NotesWindowColor() {
 }
 
 static COLORREF NotesControlColor() {
-  return g_bThemeIsDark && g_themeColors.crButtonFace == g_themeColors.crWindow ?
-      BlendColor(g_themeColors.crButtonFace, g_themeColors.crControlText, 4) : g_themeColors.crButtonFace;
+  return TintColor(AdjustButtonFaceForContrast(g_themeColors.crButtonFace,g_themeColors.crWindow),
+      g_bThemeIsDark ? 10 : -10);
 }
 
 static COLORREF NotesBorder() {
@@ -16181,16 +17684,12 @@ static void PaintNotesChrome(HDC dc, HWND window) {
   HWND dialog = GetAncestor(window, GA_ROOT);
   RECT area{}; GetClientRect(dialog, &area);
   MapWindowPoints(dialog, window, reinterpret_cast<POINT *>(&area), 2);
-  const COLORREF top = BlendColor(NotesWindowColor(), g_themeColors.crControlText, 3);
-  notes_editor_ui::DrawSurface(dc, area, top, NotesWindowColor(),
-      g_themeColors.crControlBorder, static_cast<float>(ScaleByDpi(9, GetDpiForWindow(dialog))));
+  DrawRoundedRect(dc,area,NotesWindowColor(),g_themeColors.crControlBorder,ScaleByDpi(9,GetDpiForWindow(dialog)));
 }
 
 static void DrawNotesSurface(HDC dc, const RECT &area, COLORREF base,
-                             COLORREF border, UINT dpi, int radius = 4) {
-  notes_editor_ui::DrawSurface(dc, area,
-      BlendColor(base, g_themeColors.crControlText, g_bThemeIsDark ? 5 : 2),
-      base, border, static_cast<float>(ScaleByDpi(radius, dpi)));
+                             COLORREF border, UINT dpi, int radius = 7) {
+  DrawRoundedRect(dc,area,base,border,ScaleByDpi(radius,dpi));
 }
 
 // Buffer only our painted surfaces. Compositing the entire RichEdit hierarchy
@@ -16198,24 +17697,60 @@ static void DrawNotesSurface(HDC dc, const RECT &area, COLORREF base,
 class NotesPaintBuffer {
 public:
   NotesPaintBuffer(HDC target, const RECT &area) : target_(target), area_(area) {
-    memory_ = CreateCompatibleDC(target);
-    if (memory_) bitmap_ = CreateCompatibleBitmap(target, area.right, area.bottom);
-    if (bitmap_) old_ = SelectObject(memory_, bitmap_);
+    const int64_t width=static_cast<int64_t>(area.right)-area.left;
+    const int64_t height=static_cast<int64_t>(area.bottom)-area.top;
+    if(target && width>0 && height>0 && width<=INT_MAX && height<=INT_MAX) {
+      memory_=CreateCompatibleDC(target);
+      if(memory_) bitmap_=CreateCompatibleBitmap(target,static_cast<int>(width),static_cast<int>(height));
+      if(bitmap_) {
+        old_=SelectObject(memory_,bitmap_);
+        if(!old_ || old_==HGDI_ERROR) {old_=nullptr;DeleteObject(bitmap_);bitmap_=nullptr;}
+        else if(!SetViewportOrgEx(memory_,-area.left,-area.top,nullptr)) {
+          SelectObject(memory_,old_);old_=nullptr;DeleteObject(bitmap_);bitmap_=nullptr;
+        }
+      }
+    }
+    if(!bitmap_ && target_) {
+      saved_=SaveDC(target_);
+      if(saved_) IntersectClipRect(target_,area.left,area.top,area.right,area.bottom);
+    }
   }
   HDC dc() const { return bitmap_ ? memory_ : target_; }
+  void Cancel() { publish_=false; }
   ~NotesPaintBuffer() {
     if (bitmap_) {
-      BitBlt(target_, 0, 0, area_.right, area_.bottom, memory_, 0, 0, SRCCOPY);
+      if(publish_) BitBlt(target_,area_.left,area_.top,area_.right-area_.left,area_.bottom-area_.top,
+                         memory_,area_.left,area_.top,SRCCOPY);
       SelectObject(memory_, old_); DeleteObject(bitmap_);
     }
     if (memory_) DeleteDC(memory_);
+    if(saved_) RestoreDC(target_,saved_);
   }
 private:
   HDC target_, memory_ = nullptr;
   RECT area_;
   HBITMAP bitmap_ = nullptr;
   HGDIOBJ old_ = nullptr;
+  int saved_=0;
+  bool publish_=true;
 };
+
+template<class Renderer> static bool DrawNotesBufferedItem(const DRAWITEMSTRUCT &draw,Renderer render) {
+  NotesPaintBuffer buffer(draw.hDC,draw.rcItem);
+  DRAWITEMSTRUCT finished=draw;finished.hDC=buffer.dc();
+  const bool handled=render(finished);
+  if(!handled) buffer.Cancel();
+  return handled;
+}
+
+// These child controls paint an opaque finished image of their own. A native
+// background erase before WM_DRAWITEM would still expose a cleared surface,
+// even though the completed owner drawing is buffered.
+static LRESULT CALLBACK NotesOpaqueSurfaceSubclass(HWND control,UINT message,WPARAM w,LPARAM l,UINT_PTR id,DWORD_PTR) {
+  if(message==WM_ERASEBKGND) return 1;
+  if(message==WM_NCDESTROY) RemoveWindowSubclass(control,NotesOpaqueSurfaceSubclass,id);
+  return DefSubclassProc(control,message,w,l);
+}
 
 static LRESULT CALLBACK NotesOverflowSubclass(HWND arrows, UINT message,
     WPARAM wParam, LPARAM lParam, UINT_PTR id, DWORD_PTR) {
@@ -16287,6 +17822,7 @@ static void ThemeNotesOverflow(HWND tabs) {
   }
 }
 
+struct NotesAppTransactionRecovery;
 struct ClientNotesDialogState {
   std::wstring clientName;
   fs::path clientRoot;
@@ -16297,10 +17833,25 @@ struct ClientNotesDialogState {
   size_t activePage = 0;
   uint64_t preferredNextPage=0;
   bool metadataChanged = false, findVisible = false, topmost = false, showProgress = false;
+  bool wordWrap = true;
+  bool findMatchCase = false, findWholeWord = false, findWrap = true, replaceVisible = false;
+  std::wstring findNotice;
   std::vector<size_t> visiblePages;
   std::vector<uint64_t> closedPages;
   std::map<uint64_t, HWND> editors;
-    HMODULE richEditModule = nullptr;
+  uint64_t attachedPageId = 0, editorUseCounter = 0;
+  std::map<uint64_t,uint64_t> editorUse;
+  struct EditorView { CHARRANGE selection{}; POINT scroll{}; };
+  std::map<uint64_t,EditorView> editorViews;
+  struct LinkRegistry {
+    LONG nextCookie=1;
+    uint64_t useCounter=0;
+    std::map<LONG,std::wstring> urls;
+    std::map<LONG,uint64_t> lastUse;
+  };
+  std::map<uint64_t,LinkRegistry> editorLinks;
+  std::shared_ptr<NotesAppTransactionRecovery> pendingTransactionRecovery;
+  HMODULE richEditModule = nullptr;
   HWND attachedEditor = nullptr;
   int dragTab = -1, dragTarget = -1;
   POINT dragStart{};
@@ -16308,17 +17859,28 @@ struct ClientNotesDialogState {
   bool dragging = false, highlightPalette = false;
   std::wstring findText;
   std::wstring draftName;
+  client_notes::DirectoryIdentity draftIdentity;
   bool loading = false;
   bool formattingChanged = false;
   bool updatingToolbar = false;
   bool saveFailed = false;
+  std::wstring saveProblemDetail;
+  bool editorLoadFailed = false;
   COLORREF highlightColor = RGB(249, 211, 66);
   UINT fontDpi = 0;
   HFONT uiFont = nullptr;
   HFONT tabFont = nullptr;
+  HICON clientIcon = nullptr;
+  std::wstring clientIconName;
+  UINT clientIconDpi = 0;
   HWND toolbarTooltip = nullptr;
   HWND panel = nullptr;
-  HFONT titleFont = nullptr;
+  HWND formatSurface = nullptr;
+  bool formatVisible = false, formatExplicit = false, formatDismissed = false;
+  bool problemVisible = false;
+  CHARRANGE dismissedFormatRange{};
+  DWORD formatEffects = 0;
+  std::wstring headerContextKey, ticketTooltip, workStatusTooltip;
   std::map<uint64_t,std::array<std::wstring,4>> detailsDrafts;
   void SwapNotebook(ClientNotesDialogState &other) {
     using std::swap;
@@ -16326,37 +17888,232 @@ struct ClientNotesDialogState {
     swap(browser,other.browser);swap(pages,other.pages);swap(baselines,other.baselines);
     swap(activePage,other.activePage);swap(preferredNextPage,other.preferredNextPage);
     swap(metadataChanged,other.metadataChanged);swap(findVisible,other.findVisible);
+    swap(findMatchCase,other.findMatchCase);swap(findWholeWord,other.findWholeWord);
+    swap(findWrap,other.findWrap);swap(replaceVisible,other.replaceVisible);swap(findNotice,other.findNotice);
     swap(visiblePages,other.visiblePages);swap(closedPages,other.closedPages);
     swap(editors,other.editors);swap(attachedEditor,other.attachedEditor);
+    swap(attachedPageId,other.attachedPageId);swap(editorUseCounter,other.editorUseCounter);
+    swap(editorUse,other.editorUse);swap(editorViews,other.editorViews);
+    swap(editorLinks,other.editorLinks);
+    swap(pendingTransactionRecovery,other.pendingTransactionRecovery);
     swap(dragTab,other.dragTab);swap(dragTarget,other.dragTarget);swap(dragStart,other.dragStart);
     swap(tabTooltip,other.tabTooltip);swap(dragging,other.dragging);swap(highlightPalette,other.highlightPalette);
     swap(findText,other.findText);swap(draftName,other.draftName);
+    swap(draftIdentity,other.draftIdentity);
     swap(formattingChanged,other.formattingChanged);swap(saveFailed,other.saveFailed);
+    swap(saveProblemDetail,other.saveProblemDetail);
+    swap(editorLoadFailed,other.editorLoadFailed);
     swap(detailsDrafts,other.detailsDrafts);
   }
   ~ClientNotesDialogState() {
+    if (clientIcon) DestroyIcon(clientIcon);
     if (toolbarTooltip && IsWindow(toolbarTooltip))
       DestroyWindow(toolbarTooltip);
     if (richEditModule) FreeLibrary(richEditModule);
-    for (HFONT font : {uiFont, tabFont, titleFont})
+    for (HFONT font : {uiFont, tabFont})
       if (font) DeleteObject(font);
   }
 };
+
+static HICON GetClientIconForUi(const std::wstring &clientName,int px);
+static void RefreshNotesClientIcon(HWND dialog,ClientNotesDialogState &state,UINT dpi) {
+  if (state.clientIconName==state.clientName && state.clientIconDpi==dpi) return;
+  // Copy the launcher's cached icon once per client/DPI change. Paint and resize
+  // never read an icon file, and the Notes window owns this handle's lifetime.
+  HICON source=GetClientIconForUi(state.clientName,ScaleByDpi(18,dpi));
+  if (!source) source=LoadIconW(g_hInst,MAKEINTRESOURCEW(IDI_CTSPACES));
+  HICON icon=source ? CopyIcon(source) : nullptr;
+  if (state.clientIcon) DestroyIcon(state.clientIcon);
+  state.clientIcon=icon;state.clientIconName=state.clientName;state.clientIconDpi=dpi;
+  InvalidateRect(GetDlgItem(dialog,IDC_NOTES_SWITCH_CLIENT),nullptr,FALSE);
+}
 
 static bool HasActiveNote(const ClientNotesDialogState &s) {
   return s.activePage < s.pages.size() && s.pages[s.activePage].open &&
       !s.pages[s.activePage].archived && !s.pages[s.activePage].deleted;
 }
+static bool NotesEditorMatchesActive(const ClientNotesDialogState &state) {
+  return !state.pendingTransactionRecovery && HasActiveNote(state) && state.attachedEditor && IsWindow(state.attachedEditor) &&
+      state.attachedPageId == state.pages[state.activePage].id;
+}
 static bool NotesWorkspaceCommand(HWND dialog, ClientNotesDialogState &state, UINT command);
 static void NotesCharacterFormat(HWND dialog, ClientNotesDialogState &state, DWORD mask,
-    DWORD effect, COLORREF color = 0, LONG height = 0);
+    DWORD effect, COLORREF color = 0, LONG height = 0,bool collectLinkEdit=true);
 static bool NotesListKey(HWND edit, UINT message, WPARAM key);
 static void RefreshNotesTabs(HWND dialog, ClientNotesDialogState &state);
 static bool LoadNotesPage(HWND dialog, ClientNotesDialogState &state);
 static void LayoutClientNotes(HWND dialog, UINT dpi);
+static int NotesFindHeight(const ClientNotesDialogState &state);
+static void NotesFindChanged(HWND dialog, ClientNotesDialogState &state);
+static void NotesApplyWordWrap(HWND edit, bool enabled);
+static void NotesCheckSpelling(HWND dialog, ClientNotesDialogState &state);
 static void NotesRememberView(HWND dialog, ClientNotesDialogState &state);
 static void NotesWriteRecovery(HWND dialog, ClientNotesDialogState &state);
 static void CloseNotesPanel(ClientNotesDialogState &state);
+static std::wstring NotesInvalidDetailsSummary(const ClientNotesDialogState &state);
+static void NotesReviewInvalidDetails(HWND dialog,ClientNotesDialogState &state);
+static void NotesRestoreCookieLinks(HWND edit,ClientNotesDialogState &state);
+static void NotesPrepareLinkTyping(HWND edit,ClientNotesDialogState &state);
+static std::wstring NotesContextLinkAddress(HWND edit,const ClientNotesDialogState &state,const POINT *point);
+static void NotesCopyText(HWND owner,const std::wstring &text);
+static void NotesTouchRangeCookies(HWND edit,ClientNotesDialogState &state,const CHARRANGE &selection);
+static bool NotesNavigateTableCell(HWND edit,bool previous);
+static constexpr const wchar_t *kNotesHandledTableTab=L"ctSpaces.notes.handled-table-tab";
+
+// Formatting controls stay direct children of Notes, so their existing command,
+// tooltip and accessibility paths remain intact. A sibling surface sits above
+// RichEdit only while the user needs formatting; it never changes document size.
+static constexpr UINT_PTR kNotesFormatTimer = 3;
+static bool IsNotesFormatControl(int id) {
+  return (id >= IDC_NOTES_STYLE && id <= IDC_NOTES_CLEAR) || id == IDC_NOTES_HIGHLIGHT_COLOR;
+}
+static bool NotesFormatOwnsFocus(HWND dialog, HWND focus) {
+  for (int id = IDC_NOTES_STYLE; id <= IDC_NOTES_CLEAR; ++id) {
+    const HWND control = GetDlgItem(dialog,id);
+    if (control && (focus == control || IsChild(control,focus))) return true;
+  }
+  return focus && focus == GetDlgItem(dialog,IDC_NOTES_HIGHLIGHT_COLOR);
+}
+static void HideNotesFormat(HWND dialog, ClientNotesDialogState &state, bool dismiss = true) {
+  KillTimer(dialog,kNotesFormatTimer);
+  if (dismiss && HasActiveNote(state)) {
+    SendDlgItemMessageW(dialog,IDC_CLIENT_NOTES_TEXT,EM_EXGETSEL,0,
+        reinterpret_cast<LPARAM>(&state.dismissedFormatRange));
+    state.formatDismissed = true;
+  }
+  state.formatVisible = state.formatExplicit = false;
+  InvalidateRect(GetDlgItem(dialog,IDC_NOTES_FORMAT),nullptr,FALSE);
+  for (int id = IDC_NOTES_STYLE; id <= IDC_NOTES_CLEAR; ++id)
+    ShowWindow(GetDlgItem(dialog,id),SW_HIDE);
+  ShowWindow(GetDlgItem(dialog,IDC_NOTES_HIGHLIGHT_COLOR),SW_HIDE);
+  if (state.formatSurface) ShowWindow(state.formatSurface,SW_HIDE);
+}
+static LRESULT CALLBACK NotesFormatSurfaceSubclass(HWND surface, UINT message,
+    WPARAM wParam, LPARAM lParam, UINT_PTR id, DWORD_PTR) {
+  if (message == WM_NCDESTROY) RemoveWindowSubclass(surface,NotesFormatSurfaceSubclass,id);
+  if (message == WM_ERASEBKGND) return 1;
+  if (message == WM_PAINT || message == WM_PRINTCLIENT) {
+    PAINTSTRUCT paint{};
+    HDC target = message == WM_PAINT ? BeginPaint(surface,&paint) : reinterpret_cast<HDC>(wParam);
+    RECT area{}; GetClientRect(surface,&area);
+    {
+      NotesPaintBuffer buffer(target,area); HDC dc=buffer.dc();
+      SetDCBrushColor(dc,g_themeColors.crControl);
+      FillRect(dc,&area,reinterpret_cast<HBRUSH>(GetStockObject(DC_BRUSH)));
+      const UINT dpi=GetDpiForWindow(surface);
+      DrawNotesSurface(dc,area,NotesControlColor(),NotesBorder(),dpi,5);
+      SetDCBrushColor(dc,NotesBorder());
+      for (int control : {IDC_NOTES_BOLD,IDC_NOTES_BULLETS,IDC_NOTES_LINK,IDC_NOTES_UNDO,IDC_NOTES_CLEAR}) {
+        RECT bounds{};GetWindowRect(GetDlgItem(GetParent(surface),control),&bounds);
+        MapWindowPoints(nullptr,surface,reinterpret_cast<POINT *>(&bounds),2);
+        RECT divider{bounds.left-ScaleByDpi(6,dpi),bounds.top+ScaleByDpi(4,dpi),
+            bounds.left-ScaleByDpi(6,dpi)+1,bounds.bottom-ScaleByDpi(4,dpi)};
+        FillRect(dc,&divider,reinterpret_cast<HBRUSH>(GetStockObject(DC_BRUSH)));
+      }
+    }
+    if (message == WM_PAINT) EndPaint(surface,&paint);
+    return 0;
+  }
+  if (message == WM_MOUSEACTIVATE) return MA_NOACTIVATE;
+  return DefSubclassProc(surface,message,wParam,lParam);
+}
+static void PositionNotesFormat(HWND dialog, ClientNotesDialogState &state, UINT dpi) {
+  if (!state.formatVisible || !HasActiveNote(state)) return;
+  HWND edit=GetDlgItem(dialog,IDC_CLIENT_NOTES_TEXT);
+  RECT editor{};GetWindowRect(edit,&editor);
+  MapWindowPoints(nullptr,dialog,reinterpret_cast<POINT *>(&editor),2);
+  RECT text{};SendMessageW(edit,EM_GETRECT,0,reinterpret_cast<LPARAM>(&text));
+  CHARRANGE selection{};SendMessageW(edit,EM_EXGETSEL,0,reinterpret_cast<LPARAM>(&selection));
+  POINT first{},last{};
+  SendMessageW(edit,EM_POSFROMCHAR,reinterpret_cast<WPARAM>(&first),selection.cpMin);
+  SendMessageW(edit,EM_POSFROMCHAR,reinterpret_cast<WPARAM>(&last),selection.cpMax);
+  const auto visible=[&](POINT p) {return p.y >= text.top && p.y < text.bottom;};
+  if (!state.formatExplicit && !visible(first) && !visible(last)) {HideNotesFormat(dialog,state);return;}
+  POINT anchor=visible(first) ? first : visible(last) ? last : POINT{text.left,text.top};
+  MapWindowPoints(edit,dialog,&anchor,1);
+  int width=16;
+  for (const auto [id,w] : {std::pair{IDC_NOTES_STYLE,132},{IDC_NOTES_SIZE,54},
+      {IDC_NOTES_BOLD,32},{IDC_NOTES_ITALIC,32},{IDC_NOTES_UNDERLINE,32},
+      {IDC_NOTES_HIGHLIGHT,48},{IDC_NOTES_BULLETS,32},{IDC_NOTES_NUMBERS,32},
+      {IDC_NOTES_CHECKLIST,32},{IDC_NOTES_LINK,32},{IDC_NOTES_UNDO,32},
+      {IDC_NOTES_REDO,32},{IDC_NOTES_CLEAR,32}}) {
+    width+=w+4;
+    if (id==IDC_NOTES_BOLD || id==IDC_NOTES_BULLETS || id==IDC_NOTES_LINK ||
+        id==IDC_NOTES_UNDO || id==IDC_NOTES_CLEAR) width+=8;
+  }
+  width=ScaleByDpi(width-4,dpi);
+  const int height=ScaleByDpi(48,dpi), inset=ScaleByDpi(6,dpi);
+  const int x=(std::clamp)(static_cast<int>(anchor.x)-ScaleByDpi(16,dpi),
+      static_cast<int>(editor.left)+inset,(std::max)(static_cast<int>(editor.left)+inset,static_cast<int>(editor.right)-width-inset));
+  int y=anchor.y-height-ScaleByDpi(8,dpi);
+  if (y < editor.top+inset) {
+    CHARFORMAT2W format{sizeof(format)};SendMessageW(edit,EM_GETCHARFORMAT,SCF_SELECTION,reinterpret_cast<LPARAM>(&format));
+    LONG zoomNum=0,zoomDen=0;SendMessageW(edit,EM_GETZOOM,reinterpret_cast<WPARAM>(&zoomNum),reinterpret_cast<LPARAM>(&zoomDen));
+    int line=MulDiv(format.yHeight ? format.yHeight : 240,dpi,1440);
+    if (zoomNum && zoomDen) line=MulDiv(line,zoomNum,zoomDen);
+    // Prefer below the whole selected range when it is visible, not across it.
+    const int bottom=visible(last) ? static_cast<int>(last.y)+editor.top : static_cast<int>(anchor.y);
+    y=bottom+(std::max)(line,ScaleByDpi(16,dpi))+ScaleByDpi(10,dpi);
+  }
+  y=(std::clamp)(y,static_cast<int>(editor.top)+inset,
+      (std::max)(static_cast<int>(editor.top)+inset,static_cast<int>(editor.bottom)-height-inset));
+  if (!state.formatSurface) {
+    state.formatSurface=CreateWindowExW(WS_EX_NOACTIVATE,L"STATIC",L"Text formatting",
+        WS_CHILD|WS_CLIPSIBLINGS,0,0,0,0,dialog,nullptr,g_hInst,nullptr);
+    if (!state.formatSurface) {HideNotesFormat(dialog,state,false);return;}
+    SetWindowSubclass(state.formatSurface,NotesFormatSurfaceSubclass,1,0);
+  }
+  HDWP positions=BeginDeferWindowPos(15);
+  auto place=[&](HWND control,int left,int top,int w,int h) {
+    if (positions) positions=DeferWindowPos(positions,control,HWND_TOP,left,top,w,h,SWP_NOACTIVATE|SWP_SHOWWINDOW);
+    else SetWindowPos(control,HWND_TOP,left,top,w,h,SWP_NOACTIVATE|SWP_SHOWWINDOW);
+  };
+  place(state.formatSurface,x,y,width,height);
+  int left=x+ScaleByDpi(8,dpi),top=y+ScaleByDpi(6,dpi);
+  for (const auto [id,w] : {std::pair{IDC_NOTES_STYLE,132},{IDC_NOTES_SIZE,54},
+      {IDC_NOTES_BOLD,32},{IDC_NOTES_ITALIC,32},{IDC_NOTES_UNDERLINE,32},
+      {IDC_NOTES_HIGHLIGHT,48},{IDC_NOTES_BULLETS,32},{IDC_NOTES_NUMBERS,32},
+      {IDC_NOTES_CHECKLIST,32},{IDC_NOTES_LINK,32},{IDC_NOTES_UNDO,32},
+      {IDC_NOTES_REDO,32},{IDC_NOTES_CLEAR,32}}) {
+    if (id==IDC_NOTES_BOLD || id==IDC_NOTES_BULLETS || id==IDC_NOTES_LINK ||
+        id==IDC_NOTES_UNDO || id==IDC_NOTES_CLEAR) left+=ScaleByDpi(8,dpi);
+    const bool combo=id==IDC_NOTES_STYLE || id==IDC_NOTES_SIZE;
+    if (combo) {
+      SendDlgItemMessageW(dialog,id,CB_SETITEMHEIGHT,static_cast<WPARAM>(-1),ScaleByDpi(30,dpi));
+      SendDlgItemMessageW(dialog,id,CB_SETITEMHEIGHT,0,ScaleByDpi(30,dpi));
+    }
+    place(GetDlgItem(dialog,id),left,top,ScaleByDpi(id==IDC_NOTES_HIGHLIGHT ? 32 : w,dpi),ScaleByDpi(combo ? 210 : 36,dpi));
+    if (id==IDC_NOTES_HIGHLIGHT) place(GetDlgItem(dialog,IDC_NOTES_HIGHLIGHT_COLOR),left+ScaleByDpi(32,dpi),top,ScaleByDpi(16,dpi),ScaleByDpi(36,dpi));
+    left+=ScaleByDpi(w+4,dpi);
+  }
+  if (positions) EndDeferWindowPos(positions);
+  InvalidateRect(state.formatSurface,nullptr,FALSE);
+}
+static void ShowNotesFormat(HWND dialog, ClientNotesDialogState &state, bool explicitRequest) {
+  if (state.loading || !HasActiveNote(state)) return;
+  CHARRANGE selection{};SendDlgItemMessageW(dialog,IDC_CLIENT_NOTES_TEXT,EM_EXGETSEL,0,reinterpret_cast<LPARAM>(&selection));
+  if (!explicitRequest && (selection.cpMin==selection.cpMax ||
+      (state.formatDismissed && selection.cpMin==state.dismissedFormatRange.cpMin && selection.cpMax==state.dismissedFormatRange.cpMax))) return;
+  CloseNotesPanel(state);
+  state.formatVisible=true;state.formatExplicit=explicitRequest;state.formatDismissed=false;
+  InvalidateRect(GetDlgItem(dialog,IDC_NOTES_FORMAT),nullptr,FALSE);
+  PositionNotesFormat(dialog,state,GetDpiForWindow(dialog));
+}
+static LRESULT CALLBACK NotesFormatControlSubclass(HWND control,UINT message,
+    WPARAM wParam,LPARAM lParam,UINT_PTR id,DWORD_PTR) {
+  HWND dialog=GetParent(control);
+  auto *state=reinterpret_cast<ClientNotesDialogState *>(GetWindowLongPtrW(dialog,DWLP_USER));
+  if (message==WM_NCDESTROY) RemoveWindowSubclass(control,NotesFormatControlSubclass,id);
+  if (state && message==WM_KEYDOWN && wParam==VK_ESCAPE && state->formatVisible &&
+      !((GetDlgCtrlID(control)==IDC_NOTES_STYLE || GetDlgCtrlID(control)==IDC_NOTES_SIZE) && SendMessageW(control,CB_GETDROPPEDSTATE,0,0))) {
+    HideNotesFormat(dialog,*state);SetFocus(GetDlgItem(dialog,IDC_CLIENT_NOTES_TEXT));return 0;
+  }
+  if (state && message==WM_KILLFOCUS && !state->highlightPalette && wParam &&
+      reinterpret_cast<HWND>(wParam)!=GetDlgItem(dialog,IDC_CLIENT_NOTES_TEXT) &&
+      !NotesFormatOwnsFocus(dialog,reinterpret_cast<HWND>(wParam)) &&
+      reinterpret_cast<HWND>(wParam)!=GetDlgItem(dialog,IDC_NOTES_FORMAT)) HideNotesFormat(dialog,*state);
+  return DefSubclassProc(control,message,wParam,lParam);
+}
 
 static bool SaveClientNotesDraft(HWND dialog, ClientNotesDialogState &state,
                                  bool reportFailure = false);
@@ -16489,24 +18246,30 @@ static bool NotesUpgradeDefaultSpacing(HWND edit) {
   SendMessageW(edit,EM_EXSETSEL,0,reinterpret_cast<LPARAM>(&selection));return changed;
 }
 
+static void SetNotesStatus(HWND dialog, ClientNotesDialogState &state);
 static void SetNotesSaveFailure(HWND dialog, ClientNotesDialogState &state, bool failed) {
   state.saveFailed = failed;
+  if(!failed) state.saveProblemDetail.clear();
   const std::wstring title = L"Client Notes: " + state.clientName +
       (failed ? L" - Could not save" : L"");
   SetWindowTextW(dialog, title.c_str());
-  if (failed) {
-    SetDlgItemTextW(dialog, IDC_NOTES_STATUS, L"Could not save");
-  }
+  SetNotesStatus(dialog,state);
 }
 
 static void SetNotesStatus(HWND dialog, ClientNotesDialogState &state) {
   SetDlgItemTextW(dialog, IDC_NOTES_STATUS,
-                  state.saveFailed ? L"Could not save" : !state.detailsDrafts.empty() ? L"Check details" : L"");
+                  state.saveFailed ? L"Could not save" : state.editorLoadFailed ? L"Could not open note - select its tab to retry" : !state.detailsDrafts.empty() ? L"Check details" : L"");
+  const bool problem=state.saveFailed || state.editorLoadFailed || !state.detailsDrafts.empty();
+  if (state.problemVisible!=problem) {
+    state.problemVisible=problem;
+    LayoutClientNotes(dialog,GetDpiForWindow(dialog));
+  }
 }
 
 static bool NotesDraftMatchesBaseline(HWND dialog,
                                        ClientNotesDialogState &state) {
   if (!HasActiveNote(state)) return true;
+  if (!NotesEditorMatchesActive(state)) return false;
   if (state.baselines[state.activePage].empty())
     return false;
   std::string current;
@@ -16534,7 +18297,7 @@ static bool NotesPlainTextWithinLimit(HWND edit) {
 }
 
 static void MarkNotesChanged(HWND dialog, ClientNotesDialogState &state) {
-  if (state.loading || !HasActiveNote(state))
+  if (state.loading || !NotesEditorMatchesActive(state))
     return;
   state.pages[state.activePage].pristine = false;
   state.formattingChanged = true;
@@ -16547,6 +18310,12 @@ static void NotesSelection(HWND edit, CHARRANGE &range) {
   SendMessageW(edit, EM_EXGETSEL, 0, reinterpret_cast<LPARAM>(&range));
 }
 
+static bool ValidNotesUrl(std::wstring_view url);
+static const wchar_t *NotesWorkStatusLabel(unsigned status) {
+  const wchar_t *labels[]={L"",L"Investigating",L"Waiting",L"Follow-up",L"Resolved"};
+  return status<std::size(labels) ? labels[status] : L"";
+}
+
 static void UpdateNotesToolbar(HWND dialog, ClientNotesDialogState &state) {
   if (state.loading || state.updatingToolbar)
     return;
@@ -16554,22 +18323,29 @@ static void UpdateNotesToolbar(HWND dialog, ClientNotesDialogState &state) {
   for (int id = IDC_NOTES_STYLE; id <= IDC_NOTES_CLEAR; ++id)
     EnableWindow(GetDlgItem(dialog, id), HasActiveNote(state));
   EnableWindow(GetDlgItem(dialog, IDC_NOTES_HIGHLIGHT_COLOR), HasActiveNote(state));
-  for (int id : {IDC_NOTES_FIND_TOGGLE,IDC_NOTES_WORKLOG,IDC_NOTES_METADATA}) EnableWindow(GetDlgItem(dialog,id),HasActiveNote(state));
-  for (int id : {IDC_NOTES_DETAILS, IDC_NOTES_OPEN_TICKET}) EnableWindow(GetDlgItem(dialog,id),HasActiveNote(state));
+  for (int id : {IDC_NOTES_FIND_TOGGLE,IDC_NOTES_WORKLOG,IDC_NOTES_FORMAT}) EnableWindow(GetDlgItem(dialog,id),HasActiveNote(state));
+  EnableWindow(GetDlgItem(dialog,IDC_NOTES_DETAILS),HasActiveNote(state));
+  const bool hasTicketUrl=HasActiveNote(state) && ValidNotesUrl(state.pages[state.activePage].ticketUrl);
+  EnableWindow(GetDlgItem(dialog,IDC_NOTES_OPEN_TICKET),hasTicketUrl);
   SetDlgItemTextW(dialog,IDC_NOTES_SWITCH_CLIENT,state.clientName.c_str());
-  SetDlgItemTextW(dialog,IDC_NOTES_NOTE_HEADING,HasActiveNote(state) ? state.pages[state.activePage].name.c_str() : L"Your notebook");
-  std::wstring context;
+  std::wstring context,ticket;
   if (HasActiveNote(state)) {
     const auto &page=state.pages[state.activePage];
-    context=page.ticket.empty() ? L"No ticket linked" : L"Ticket "+page.ticket;
-    if (!page.tags.empty()) { context+=L"   |   "; for (const auto &tag:page.tags) { if (context.back()!=L' ') context+=L", "; context+=tag; } }
-    SetDlgItemTextW(dialog,IDC_NOTES_OPEN_TICKET,!page.ticketUrl.empty() ? L"Open ticket" : L"Link ticket");
+    ticket=page.ticket.empty() ? (hasTicketUrl ? L"Open ticket" : L"") : L"Ticket "+page.ticket;
+    for (const auto &tag:page.tags) { if (context.empty()) {if (!ticket.empty()) context=L"|   ";} else context+=L", "; context+=tag; }
   }
+  SetDlgItemTextW(dialog,IDC_NOTES_OPEN_TICKET,ticket.c_str());
+  SetDlgItemTextW(dialog,IDC_NOTES_TICKET_REFERENCE,ticket.c_str());
   SetDlgItemTextW(dialog,IDC_NOTES_CONTEXT,context.c_str());
-  if (HasActiveNote(state)) {
-    const wchar_t *statuses[]={L"Status: None",L"Status: Investigating",L"Status: Waiting",L"Status: Follow-up",L"Status: Resolved"};
-    SetDlgItemTextW(dialog,IDC_NOTES_METADATA,statuses[state.pages[state.activePage].status]);
-  } else SetDlgItemTextW(dialog,IDC_NOTES_METADATA,L"Status");
+  const wchar_t *workStatus=NotesWorkStatusLabel(HasActiveNote(state) ? state.pages[state.activePage].status : 0);
+  wchar_t previousStatus[32]{};GetDlgItemTextW(dialog,IDC_NOTES_WORK_STATUS,previousStatus,static_cast<int>(std::size(previousStatus)));
+  if (wcscmp(previousStatus,workStatus)) SetDlgItemTextW(dialog,IDC_NOTES_WORK_STATUS,workStatus);
+  wchar_t ticketLabel[160]{};GetDlgItemTextW(dialog,IDC_NOTES_OPEN_TICKET,ticketLabel,static_cast<int>(std::size(ticketLabel)));
+  const std::wstring headerKey=std::wstring(ticketLabel)+L"\n"+context+L"\n"+workStatus+(hasTicketUrl ? L"\nlinked" : L"\nreference");
+  if (state.headerContextKey!=headerKey) {
+    state.headerContextKey=headerKey;
+    LayoutClientNotes(dialog,GetDpiForWindow(dialog));
+  }
   if (!HasActiveNote(state)) return;
   state.updatingToolbar = true;
   CHARFORMAT2W format{};
@@ -16594,12 +18370,12 @@ static void UpdateNotesToolbar(HWND dialog, ClientNotesDialogState &state) {
   SendDlgItemMessageW(dialog, IDC_NOTES_STYLE, CB_SETCURSEL, style, 0);
   EnableWindow(GetDlgItem(dialog, IDC_NOTES_UNDO), SendMessageW(edit, EM_CANUNDO, 0, 0) != 0);
   EnableWindow(GetDlgItem(dialog, IDC_NOTES_REDO), SendMessageW(edit, EM_CANREDO, 0, 0) != 0);
-  for (const auto [id, mask] : {std::pair{IDC_NOTES_BOLD, CFE_BOLD},
-                                {IDC_NOTES_ITALIC, CFE_ITALIC},
-                                {IDC_NOTES_UNDERLINE, CFE_UNDERLINE}}) {
-    SendDlgItemMessageW(dialog, id, BM_SETSTATE,
-                        (format.dwEffects & mask) != 0, 0);
-  }
+  // BM_SETSTATE is a transient native press, not a formatting toggle. Setting
+  // it on a focused button can emit another click when focus returns to text.
+  // Paint the document's format state without changing native press state.
+  state.formatEffects=format.dwEffects & format.dwMask & (CFE_BOLD|CFE_ITALIC|CFE_UNDERLINE);
+  for (int id : {IDC_NOTES_BOLD,IDC_NOTES_ITALIC,IDC_NOTES_UNDERLINE})
+    InvalidateRect(GetDlgItem(dialog,id),nullptr,FALSE);
   state.updatingToolbar = false;
 }
 
@@ -16635,20 +18411,92 @@ static std::wstring NotesRangeText(HWND edit, LONG first, LONG last) {
   return text;
 }
 
+static std::optional<BrowserKind> NotesLinkBrowser() {
+  wchar_t value[32]{};
+  GetPrivateProfileStringW(L"notes_window",L"link_browser",L"default",value,
+      static_cast<DWORD>(std::size(value)),g_sConfigPath.c_str());
+  return ParseBrowserKind(value);
+}
+static std::wstring NotesLinkBrowserLabel() {
+  const auto browser=NotesLinkBrowser();
+  return browser ? GetBrowserDisplayName(*browser) : L"System default";
+}
+static std::vector<std::pair<UINT,std::wstring>> NotesLinkBrowserChoices() {
+  std::vector<std::pair<UINT,std::wstring>> choices{{1,L"System default"}};
+  const auto current=NotesLinkBrowser();
+  for (BrowserKind browser : {BrowserKind::Edge,BrowserKind::Chrome,BrowserKind::Brave,BrowserKind::Firefox}) {
+    const bool available=IsExactBrowserExecutable(GetBrowserExecutable(browser),browser);
+    if (!available && current!=browser) continue;
+    choices.emplace_back(2+static_cast<UINT>(browser),std::wstring(GetBrowserDisplayName(browser))+
+        (available ? L"" : L" (not installed)"));
+  }
+  return choices;
+}
+static bool NotesSaveLinkBrowser(UINT choice) {
+  if (!choice || choice>5) return false;
+  const auto selected=choice==1 ? std::optional<BrowserKind>{} : std::optional{static_cast<BrowserKind>(choice-2)};
+  if (selected && !IsExactBrowserExecutable(GetBrowserExecutable(*selected),*selected)) return false;
+  if (selected==NotesLinkBrowser()) return true;
+  return SaveConfigMutations(L"Notes link browser preference",{{L"notes_window",L"link_browser",
+      selected ? GetBrowserId(*selected) : L"default"}});
+}
+static void NotesFillLinkBrowser(HWND combo) {
+  SendMessageW(combo,CB_RESETCONTENT,0,0);
+  const auto current=NotesLinkBrowser();
+  const UINT selected=current ? 2+static_cast<UINT>(*current) : 1;
+  for (const auto &[choice,label]:NotesLinkBrowserChoices()) {
+    const auto row=SendMessageW(combo,CB_ADDSTRING,0,reinterpret_cast<LPARAM>(label.c_str()));
+    if (row<0) continue;
+    SendMessageW(combo,CB_SETITEMDATA,row,choice);
+    if (choice==selected) SendMessageW(combo,CB_SETCURSEL,row,0);
+  }
+}
+static void NotesChooseLinkBrowser(HWND dialog) {
+  HMENU menu=CreatePopupMenu();if (!menu) return;
+  const auto current=NotesLinkBrowser();
+  AppendMenuW(menu,MF_STRING|(!current ? MF_CHECKED : 0),1,L"System default");
+  AppendMenuW(menu,MF_SEPARATOR,0,nullptr);
+  for (const auto &[choice,label]:NotesLinkBrowserChoices()) {
+    if (choice==1) continue;
+    const auto browser=static_cast<BrowserKind>(choice-2);
+    const bool available=IsExactBrowserExecutable(GetBrowserExecutable(browser),browser);
+    AppendMenuW(menu,MF_STRING|(current==browser ? MF_CHECKED : 0)|(available ? 0 : MF_GRAYED),choice,label.c_str());
+  }
+  RECT anchor{};GetWindowRect(GetDlgItem(dialog,IDC_NOTES_MORE),&anchor);
+  const UINT choice=TrackThemedNotesMenu(menu,TPM_RETURNCMD|TPM_NONOTIFY|TPM_RIGHTALIGN,
+      anchor.right,anchor.bottom,dialog);
+  DestroyMenu(menu);
+  NotesSaveLinkBrowser(choice);
+}
+
 static void OpenNotesUrl(HWND dialog, ClientNotesDialogState &state,
                           std::wstring_view url, bool ticket = false) {
   if (!ValidNotesUrl(url))
     return;
   const std::wstring target(url);
+  const auto browser=NotesLinkBrowser();
+  const fs::path executable=browser ? GetBrowserExecutable(*browser) : fs::path{};
+  if (browser && !IsExactBrowserExecutable(executable,*browser)) {
+    const std::wstring message=std::wstring(GetBrowserDisplayName(*browser))+
+        L" is not available. Choose an installed browser in Details > Open links in or More > Link browser. Your link has not been opened in another browser.";
+    MessageBoxW(dialog,message.c_str(),L"Open Link",MB_OK|MB_ICONWARNING);return;
+  }
+  const std::wstring destination=browser ? GetBrowserDisplayName(*browser) : L"your default browser";
   const std::wstring question = std::wstring(ticket ? L"Open this ticket" : L"Open this link")+
-      L" in your default browser?\n\nUses your regular PC browser session, outside client browser profiles.\n\n"+target;
+      L" in "+destination+L"?\n\nUses your regular PC browser session, outside client browser profiles.\n\n"+target;
   if (MessageBoxW(dialog, question.c_str(), L"Open Link",
                   MB_YESNO | MB_ICONQUESTION) != IDYES)
     return;
   if (!SaveClientNotesDraft(dialog, state, true))
     return;
-  if (reinterpret_cast<INT_PTR>(ShellExecuteW(dialog,L"open",target.c_str(),nullptr,nullptr,SW_SHOWNORMAL))<=32)
-    MessageBoxW(dialog,L"Windows could not open the link. Check your default browser setting and try again.",L"Open Link",MB_OK|MB_ICONWARNING);
+  // A URL is the only argument: never reuse a client's profile directory,
+  // browser slot, SSO container, or launcher flags for a Notes link.
+  const std::wstring argument=QuoteCommandLineArgument(target);
+  const INT_PTR result=reinterpret_cast<INT_PTR>(browser ?
+      ShellExecuteW(dialog,L"open",executable.c_str(),argument.c_str(),nullptr,SW_SHOWNORMAL) :
+      ShellExecuteW(dialog,L"open",target.c_str(),nullptr,nullptr,SW_SHOWNORMAL));
+  if (result<=32)
+    MessageBoxW(dialog,L"Windows could not open the link. Check Details > Open links in or More > Link browser and try again.",L"Open Link",MB_OK|MB_ICONWARNING);
 }
 
 static bool IsNotesChecklist(std::wstring_view prefix) {
@@ -16766,6 +18614,36 @@ static UINT TrackThemedNotesMenu(HMENU menu,UINT flags,int x,int y,HWND owner) {
   return TrackPopupMenuEx(menu,flags,x,y,owner,nullptr);
 }
 
+static LRESULT CALLBACK NotesTicketContextSubclass(HWND button,UINT message,
+    WPARAM wParam,LPARAM lParam,UINT_PTR id,DWORD_PTR) {
+  if(message==WM_NCDESTROY) RemoveWindowSubclass(button,NotesTicketContextSubclass,id);
+  if(message!=WM_CONTEXTMENU && message!=WM_RBUTTONUP)
+    return DefSubclassProc(button,message,wParam,lParam);
+  HWND dialog=GetParent(button);
+  auto *state=reinterpret_cast<ClientNotesDialogState *>(GetWindowLongPtrW(dialog,DWLP_USER));
+  if(!state || state->loading || state->activePage>=state->pages.size()) return 0;
+  const auto &page=state->pages[state->activePage];
+  const std::wstring address=page.ticketUrl,number=page.ticket;
+  if(!ValidNotesUrl(address)) return 0;
+  const auto pageId=page.id;const fs::path client=state->clientRoot;
+  HMENU menu=CreatePopupMenu();if(!menu) return 0;
+  AppendMenuW(menu,MF_STRING,7,L"Open link");
+  AppendMenuW(menu,MF_STRING,8,L"Copy link address");
+  POINT point{GET_X_LPARAM(lParam),GET_Y_LPARAM(lParam)};
+  if(message==WM_RBUTTONUP) ClientToScreen(button,&point);
+  else if(point.x==-1 && point.y==-1) {RECT area{};GetWindowRect(button,&area);point={area.left,area.bottom};}
+  const UINT action=TrackThemedNotesMenu(menu,TPM_RETURNCMD|TPM_RIGHTBUTTON,point.x,point.y,dialog);
+  DestroyMenu(menu);
+  auto *current=IsWindow(dialog)?reinterpret_cast<ClientNotesDialogState *>(GetWindowLongPtrW(dialog,DWLP_USER)):nullptr;
+  if(!IsWindow(button) || current!=state || !current || current->loading || current->clientRoot!=client ||
+      current->activePage>=current->pages.size() || current->pages[current->activePage].id!=pageId ||
+      current->pages[current->activePage].ticketUrl!=address || current->pages[current->activePage].ticket!=number)
+    return 0;
+  if(action==7) OpenNotesUrl(dialog,*current,address,true);
+  else if(action==8) NotesCopyText(dialog,address);
+  return 0;
+}
+
 static void NotesPastePlainText(HWND edit) {
     if (OpenClipboard(edit)) {
       HANDLE data = GetClipboardData(CF_UNICODETEXT);
@@ -16791,6 +18669,42 @@ static void NotesPastePlainText(HWND edit) {
 
 static LRESULT CALLBACK NotesEditSubclass(HWND edit, UINT message,
     WPARAM wParam, LPARAM lParam, UINT_PTR id, DWORD_PTR) {
+  HWND dialog=GetParent(edit);
+  auto *workspace=reinterpret_cast<ClientNotesDialogState *>(GetWindowLongPtrW(dialog,DWLP_USER));
+  if(message==WM_KEYDOWN)RemovePropW(edit,kNotesHandledTableTab);
+  if(message==WM_CHAR && wParam==VK_TAB && RemovePropW(edit,kNotesHandledTableTab))return 0;
+  if(workspace && !workspace->loading && workspace->attachedEditor==edit &&
+      message==WM_KEYDOWN && wParam==VK_TAB && !(GetKeyState(VK_CONTROL)&0x8000) &&
+      NotesNavigateTableCell(edit,(GetKeyState(VK_SHIFT)&0x8000)!=0)) {
+    // A dialog query makes RichEdit route Tab back to the dialog. Handle the
+    // cell movement before native keyboard handling, and swallow its queued
+    // translated character without turning navigation into a document edit.
+    SetPropW(edit,kNotesHandledTableTab,reinterpret_cast<HANDLE>(static_cast<INT_PTR>(1)));
+    return 0;
+  }
+  if(workspace && !workspace->loading && workspace->attachedEditor==edit &&
+      (message==EM_REPLACESEL || (message==EM_STREAMIN && (wParam&SFF_SELECTION)) || message==WM_CUT || message==WM_CLEAR || message==WM_CHAR || (message==WM_KEYDOWN && wParam==VK_DELETE))) {
+    CHARRANGE affected{};NotesSelection(edit,affected);
+    if(affected.cpMin==affected.cpMax && message==WM_CHAR && wParam==VK_BACK && affected.cpMin>0) --affected.cpMin;
+    if(affected.cpMin==affected.cpMax && message==WM_KEYDOWN && wParam==VK_DELETE) ++affected.cpMax;
+    if(affected.cpMin!=affected.cpMax) NotesTouchRangeCookies(edit,*workspace,affected);
+  }
+  if(workspace && !workspace->loading && workspace->attachedEditor==edit &&
+      (message==EM_REPLACESEL || (message==WM_CHAR && (wParam>=32 || wParam==VK_RETURN || wParam==VK_TAB)))) NotesPrepareLinkTyping(edit,*workspace);
+  if (workspace && message==WM_KEYDOWN && wParam==VK_ESCAPE && workspace->formatVisible) {
+    HideNotesFormat(dialog,*workspace);return 0;
+  }
+  if (workspace && ((message==WM_LBUTTONDOWN || message==WM_RBUTTONDOWN || message==WM_CONTEXTMENU ||
+       message==WM_VSCROLL || message==WM_MOUSEWHEEL) || (message==WM_CHAR && wParam>=32)))
+    HideNotesFormat(dialog,*workspace);
+  if(workspace && !workspace->loading && workspace->attachedEditor==edit && message==WM_RBUTTONDOWN) {
+    const POINT point{GET_X_LPARAM(lParam),GET_Y_LPARAM(lParam)};
+    // Copying a clicked link must not replace the user's unrelated selection.
+    if(!NotesContextLinkAddress(edit,*workspace,&point).empty()) return 0;
+  }
+  if (workspace && message==WM_KILLFOCUS && !workspace->highlightPalette && wParam &&
+      !NotesFormatOwnsFocus(dialog,reinterpret_cast<HWND>(wParam)) &&
+      reinterpret_cast<HWND>(wParam)!=GetDlgItem(dialog,IDC_NOTES_FORMAT)) HideNotesFormat(dialog,*workspace);
   if (message==WM_KEYDOWN && wParam==VK_INSERT && (GetKeyState(VK_SHIFT)&0x8000)) {
     NotesPastePlainText(edit);return 0;
   }
@@ -16808,6 +18722,7 @@ static LRESULT CALLBACK NotesEditSubclass(HWND edit, UINT message,
   if (message == WM_SETFONT)
     return 0;
   if (message == WM_NCDESTROY) {
+    RemovePropW(edit,kNotesHandledTableTab);
     RemoveWindowSubclass(edit, NotesEditSubclass, id);
   } else if (message == WM_PASTE) {
     NotesPastePlainText(edit);return 0;
@@ -16832,6 +18747,18 @@ static LRESULT CALLBACK NotesEditSubclass(HWND edit, UINT message,
     if (!menu)
       return 0;
     CHARRANGE selection{};NotesSelection(edit,selection);
+    POINT point{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
+    const bool keyboard=message==WM_CONTEXTMENU && point.x==-1 && point.y==-1;
+    POINT hit=point;if(message==WM_CONTEXTMENU && !keyboard) ScreenToClient(edit,&hit);
+    const std::wstring address=workspace && !workspace->loading && workspace->attachedEditor==edit ?
+        NotesContextLinkAddress(edit,*workspace,keyboard?nullptr:&hit):std::wstring{};
+    const auto pageId=workspace?workspace->attachedPageId:0;
+    const fs::path client=workspace?workspace->clientRoot:fs::path{};
+    if(!address.empty()) {
+      AppendMenuW(menu,MF_STRING,7,L"Open link");
+      AppendMenuW(menu,MF_STRING,8,L"Copy link address");
+      AppendMenuW(menu,MF_SEPARATOR,0,nullptr);
+    }
     const bool selected=selection.cpMin!=selection.cpMax;
     const auto writable=(GetWindowLongPtrW(edit,GWL_STYLE)&ES_READONLY)==0;
     AppendMenuW(menu, MF_STRING|(SendMessageW(edit,EM_CANUNDO,0,0)&&writable ? 0 : MF_GRAYED), 1, L"Undo\tCtrl+Z");
@@ -16841,15 +18768,27 @@ static LRESULT CALLBACK NotesEditSubclass(HWND edit, UINT message,
     AppendMenuW(menu, MF_STRING|(selected ? 0 : MF_GRAYED), 4, L"Copy\tCtrl+C");
     AppendMenuW(menu, MF_STRING|(writable&&IsClipboardFormatAvailable(CF_UNICODETEXT) ? 0 : MF_GRAYED), 5, L"Paste\tCtrl+V");
     AppendMenuW(menu, MF_STRING, 6, L"Select all\tCtrl+A");
-    POINT point{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
+    AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(menu, MF_STRING, 9, L"Check spelling...\tF7");
     if (message==WM_RBUTTONUP) {SetFocus(edit);ClientToScreen(edit,&point);}
-    if (point.x == -1 && point.y == -1) {
-      GetCaretPos(&point);
-      ClientToScreen(edit, &point);
+    if (keyboard) {
+      POINTL caret{};SendMessageW(edit,EM_POSFROMCHAR,reinterpret_cast<WPARAM>(&caret),selection.cpMin);
+      point={caret.x,caret.y};ClientToScreen(edit,&point);
     }
     const int action = TrackThemedNotesMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON,
                                       point.x, point.y, GetParent(edit));
     DestroyMenu(menu);
+    auto *current=IsWindow(dialog)?reinterpret_cast<ClientNotesDialogState *>(GetWindowLongPtrW(dialog,DWLP_USER)):nullptr;
+    if(!IsWindow(edit) || current!=workspace || !current || current->loading || current->attachedEditor!=edit ||
+        current->attachedPageId!=pageId || current->clientRoot!=client) return 0;
+    if(action==9) { NotesCheckSpelling(dialog,*current);return 0; }
+    if(action==7 || action==8) {
+      if(!address.empty()) {
+        if(action==7) OpenNotesUrl(dialog,*current,address);
+        else NotesCopyText(dialog,address);
+      }
+      return 0;
+    }
     const UINT messages[] = {0, EM_UNDO, EM_REDO, WM_CUT, WM_COPY, WM_PASTE,
                              EM_SETSEL};
     if (action >= 1 && action <= 6) {
@@ -16873,6 +18812,11 @@ static LRESULT CALLBACK NotesEditSubclass(HWND edit, UINT message,
     }
   }
   const LRESULT result = DefSubclassProc(edit, message, wParam, lParam);
+  if(workspace && !workspace->loading && workspace->attachedEditor==edit &&
+      (message==EM_UNDO || message==EM_REDO || message==WM_UNDO || message==EM_REPLACESEL || message==WM_CHAR || message==WM_CUT || message==WM_CLEAR || (message==WM_KEYDOWN && wParam==VK_DELETE)))
+    NotesRestoreCookieLinks(edit,*workspace);
+  if (workspace && message==WM_LBUTTONUP && !workspace->loading && GetFocus()==edit)
+    SetTimer(dialog,kNotesFormatTimer,120,nullptr);
   if (message == WM_PAINT || message == WM_PRINTCLIENT) {
     HDC dc = message == WM_PAINT ? GetDC(edit) : reinterpret_cast<HDC>(wParam);
     DrawNotesChecklistMarkers(edit, dc);
@@ -16894,9 +18838,339 @@ static LRESULT CALLBACK NotesEditSubclass(HWND edit, UINT message,
   return result;
 }
 
+static bool NotesRangeLinkEffects(HWND edit,const CHARRANGE &selection,LONG *effects=nullptr,LONG *cookie=nullptr,bool writeCookie=false,bool *operationOk=nullptr) {
+  IUnknown *ole=nullptr;ITextDocument *document=nullptr;ITextRange *range=nullptr;ITextFont *font=nullptr;ITextFont2 *extended=nullptr;
+  SendMessageW(edit,EM_GETOLEINTERFACE,0,reinterpret_cast<LPARAM>(&ole));
+  if (ole) {ole->QueryInterface(__uuidof(ITextDocument),reinterpret_cast<void **>(&document));ole->Release();}
+  LONG value=0,mask=0;bool linked=false,ok=true;
+  if(operationOk) *operationOk=false;
+  if(cookie && !writeCookie) *cookie=LONG_MIN;
+  if (document && SUCCEEDED(document->Range(selection.cpMin,selection.cpMax,&range)) &&
+      SUCCEEDED(range->GetFont(&font)) && SUCCEEDED(font->QueryInterface(__uuidof(ITextFont2),reinterpret_cast<void **>(&extended)))) {
+    if (effects) ok=SUCCEEDED(extended->SetEffects(*effects,CFM_LINK|CFM_LINKPROTECTED));
+    if (cookie) {
+      if (writeCookie) ok=SUCCEEDED(extended->SetCookie(*cookie)) && ok;
+      else if(FAILED(extended->GetCookie(cookie))) {*cookie=LONG_MIN;ok=false;}
+    }
+    ok=SUCCEEDED(extended->GetEffects(&value,&mask)) && ok;
+    if(ok) {linked=(value&CFE_LINK)!=0;if(operationOk) *operationOk=true;}
+  }
+  if (extended) extended->Release();if (font) font->Release();if (range) range->Release();if (document) document->Release();
+  return linked;
+}
+static LONG NotesRegisterLinkCookie(ClientNotesDialogState &state,uint64_t id,const std::wstring &url) {
+  auto &registry=state.editorLinks[id];
+  for(const auto &[cookie,address]:registry.urls) if(address==url) {
+    registry.lastUse[cookie]=++registry.useCounter;return cookie;
+  }
+  if(registry.nextCookie==LONG_MAX) return 0;
+  const LONG cookie=registry.nextCookie++;registry.urls.emplace(cookie,url);
+  registry.lastUse[cookie]=++registry.useCounter;return cookie;
+}
+static bool NotesBindLinkCookie(HWND edit,ClientNotesDialogState &state,uint64_t id,const CHARRANGE &range,LONG cookie) {
+  LONG previous=0;NotesRangeLinkEffects(edit,range,nullptr,&previous);
+  if(previous==LONG_MIN || !cookie) return false;
+  auto &registry=state.editorLinks[id];
+  if(registry.urls.contains(previous)) registry.lastUse[previous]=++registry.useCounter;
+  bool wrote=false;NotesRangeLinkEffects(edit,range,nullptr,&cookie,true,&wrote);
+  if(!wrote) return false;
+  LONG actual=0;NotesRangeLinkEffects(edit,range,nullptr,&actual);
+  return actual==cookie;
+}
+static void NotesTouchRangeCookies(HWND edit,ClientNotesDialogState &state,const CHARRANGE &selection) {
+  auto &registry=state.editorLinks[state.attachedPageId];
+  IUnknown *ole=nullptr;ITextDocument *document=nullptr;ITextRange *range=nullptr;
+  SendMessageW(edit,EM_GETOLEINTERFACE,0,reinterpret_cast<LPARAM>(&ole));
+  if(ole) {ole->QueryInterface(__uuidof(ITextDocument),reinterpret_cast<void **>(&document));ole->Release();}
+  if(document && SUCCEEDED(document->Range(selection.cpMin,selection.cpMin,&range))) {
+    LONG story=0;range->GetStoryLength(&story);
+    LONG first=selection.cpMin,last=selection.cpMax<0 ? (std::max)(0L,story-1) : (std::min)(selection.cpMax,(std::max)(0L,story-1));
+    while(first<last) {
+      range->SetRange(first,first);LONG moved=0,end=first;
+      if(FAILED(range->MoveEnd(tomCharFormat,1,&moved)) || FAILED(range->GetEnd(&end)) || end<=first) break;
+      end=(std::min)(end,last);LONG cookie=0;NotesRangeLinkEffects(edit,{first,end},nullptr,&cookie);
+      if(registry.urls.contains(cookie)) registry.lastUse[cookie]=++registry.useCounter;
+      first=end;
+    }
+  }
+  if(range) range->Release();if(document) document->Release();
+}
+static void NotesRestoreCookieLinks(HWND edit,ClientNotesDialogState &state) {
+  if(!NotesEditorMatchesActive(state)) return;
+  const auto registry=state.editorLinks.find(state.attachedPageId);
+  if(registry==state.editorLinks.end() || registry->second.urls.empty()) return;
+  IUnknown *ole=nullptr;ITextDocument *document=nullptr;ITextRange *range=nullptr;
+  SendMessageW(edit,EM_GETOLEINTERFACE,0,reinterpret_cast<LPARAM>(&ole));
+  if(ole) {ole->QueryInterface(__uuidof(ITextDocument),reinterpret_cast<void **>(&document));ole->Release();}
+  if(!document || FAILED(document->Range(0,0,&range))) {if(document) document->Release();return;}
+  LONG story=0;
+  if(FAILED(range->GetStoryLength(&story))) {range->Release();document->Release();return;}
+  const bool loading=state.loading;state.loading=true;document->Undo(tomSuspend,nullptr);
+  LONG first=0,length=(std::max)(0L,story-1);
+  while(first<length) {
+    range->SetRange(first,first);LONG moved=0,end=first;
+    if(FAILED(range->MoveEnd(tomCharFormat,1,&moved)) || FAILED(range->GetEnd(&end)) || end<=first) break;
+    end=(std::min)(end,length);LONG cookie=0;
+    if(!NotesRangeLinkEffects(edit,{first,end},nullptr,&cookie) && registry->second.urls.contains(cookie)) {
+      LONG effects=CFE_LINK|CFE_LINKPROTECTED;NotesRangeLinkEffects(edit,{first,end},&effects);
+    }
+    first=end;
+  }
+  document->Undo(tomResume,nullptr);state.loading=loading;range->Release();document->Release();
+}
+static void NotesPrepareLinkTyping(HWND edit,ClientNotesDialogState &state) {
+  CHARRANGE selection{};NotesSelection(edit,selection);
+  if(selection.cpMin!=selection.cpMax) return;
+  LONG cookie=0;NotesRangeLinkEffects(edit,selection,nullptr,&cookie);
+  const auto registry=state.editorLinks.find(state.attachedPageId);
+  if(registry==state.editorLinks.end() || !registry->second.urls.contains(cookie)) return;
+  GETTEXTLENGTHEX measure{GTL_PRECISE|GTL_NUMCHARS,1200};
+  const LONG length=static_cast<LONG>(SendMessageW(edit,EM_GETTEXTLENGTHEX,reinterpret_cast<WPARAM>(&measure),0));LONG next=0;
+  if(selection.cpMin<length) NotesRangeLinkEffects(edit,{selection.cpMin,selection.cpMin+1},nullptr,&next);
+  if(next==cookie) return; // Inside the label, inserted text keeps its target.
+  LONG effects=0,plain=0;NotesRangeLinkEffects(edit,selection,&effects,&plain,true);
+  CHARFORMAT2W format{sizeof(format)};format.dwMask=CFM_UNDERLINE|CFM_COLOR;format.crTextColor=g_themeColors.crControlText;
+  SendMessageW(edit,EM_SETCHARFORMAT,SCF_SELECTION,reinterpret_cast<LPARAM>(&format));
+}
+static std::wstring NotesNativeLinkAddress(HWND edit,const ClientNotesDialogState &state,const CHARRANGE &range) {
+  LONG cookie=0;
+  if(!NotesRangeLinkEffects(edit,range,nullptr,&cookie)) return {};
+  const auto registry=state.editorLinks.find(state.attachedPageId);
+  if(registry==state.editorLinks.end()) return {};
+  const auto address=registry->second.urls.find(cookie);
+  return address==registry->second.urls.end() ? std::wstring{} : address->second;
+}
+static std::wstring NotesContextLinkAddress(HWND edit,const ClientNotesDialogState &state,const POINT *point) {
+  const LONG length=static_cast<LONG>(SendMessageW(edit,WM_GETTEXTLENGTH,0,0));
+  if(length<=0) return {};
+  CHARRANGE selected{};NotesSelection(edit,selected);LONG at=selected.cpMin;
+  if(point) {
+    RECT area{};SendMessageW(edit,EM_GETRECT,0,reinterpret_cast<LPARAM>(&area));
+    if(!PtInRect(&area,*point)) return {};
+    const LONG nearest=static_cast<LONG>(SendMessageW(edit,EM_CHARFROMPOS,0,reinterpret_cast<LPARAM>(point)));
+    if(nearest<0) return {};
+    // RichEdit returns the nearest insertion position, which can be the next
+    // character when the pointer is over a glyph's right half. Test both
+    // adjacent native clusters against their complete glyph rectangles.
+    // Exact bounds also reject margins, blank wrapped-line tails and points
+    // below the last line; a nearest-character fallback alone would not.
+    IUnknown *ole=nullptr;ITextDocument *document=nullptr;ITextRange *range=nullptr;
+    SendMessageW(edit,EM_GETOLEINTERFACE,0,reinterpret_cast<LPARAM>(&ole));
+    if(ole) {ole->QueryInterface(__uuidof(ITextDocument),reinterpret_cast<void **>(&document));ole->Release();}
+    LONG story=0;at=-1;
+    if(document && document->Range(0,0,&range)==S_OK && range->GetStoryLength(&story)==S_OK) {
+      LONG previous=nearest-1,moved=0;
+      if(nearest<=story-1 && SUCCEEDED(range->SetRange(nearest,nearest)) &&
+          SUCCEEDED(range->Move(tomCluster,-1,&moved)) && moved==-1) {
+        LONG start=previous;
+        if(range->GetStart(&start)==S_OK && start>=0 && start<nearest) previous=start;
+      }
+      for(LONG candidate:{nearest,previous}) {
+        if(candidate<0 || candidate>=story-1) continue;
+        // RichEdit normalizes invalid interior caret positions. Read that
+        // actual native position back instead of inferring UTF-16 boundaries
+        // from EM_GETTEXTRANGE, which can adjust its returned substring.
+        if(FAILED(range->SetRange(candidate,candidate)) ||
+            range->GetStart(&candidate)!=S_OK || candidate<0 || candidate>=story-1)
+          continue;
+        LONG first=candidate,last=candidate+1;
+        if(SUCCEEDED(range->Expand(tomCluster,&moved))) {
+          LONG start=first,end=last;
+          if(range->GetStart(&start)==S_OK && range->GetEnd(&end)==S_OK &&
+              start>=0 && start<=candidate && end>candidate && end<=story-1) {
+            first=start;last=end;
+          } else continue;
+        }
+        LONG left=0,right=0,top=0,bottom=0,endX=0,endY=0;
+        // SetRange returns S_FALSE when Expand already established exactly
+        // these endpoints. That is a valid unchanged range, not a failure.
+        if(SUCCEEDED(range->SetRange(first,last)) &&
+            range->GetStart(&first)==S_OK && range->GetEnd(&last)==S_OK &&
+            first>=0 && last>first && last<=story-1 &&
+            range->GetPoint(tomStart|tomClientCoord|TA_TOP|TA_LEFT,&left,&top)==S_OK &&
+            range->GetPoint(tomStart|tomClientCoord|TA_BOTTOM|TA_RIGHT,&right,&bottom)==S_OK) {
+          // Compound clusters can span several glyphs. Their same-line end
+          // gives the full advance. A wrapped end belongs to the next line;
+          // retain the actual first glyph's right edge in that case.
+          if(range->GetPoint(tomEnd|tomClientCoord|TA_TOP|TA_LEFT,&endX,&endY)==S_OK &&
+              endY==top && endX>left) right=endX;
+          if(right>left && bottom>top && point->x>=left && point->x<right &&
+              point->y>=top && point->y<bottom) {at=first;break;}
+        }
+      }
+    }
+    if(range) range->Release();if(document) document->Release();
+    if(at<0) return {};
+  } else if(selected.cpMin==selected.cpMax && at>0 &&
+      (at==length || !NotesRangeLinkEffects(edit,{at,at+1}))) --at;
+  if(at<0 || at>=length) return {};
+  const auto character=NotesRangeText(edit,at,at+1);
+  if(character.empty() || iswspace(character.front())) return {};
+  const CHARRANGE probe=!point && selected.cpMin!=selected.cpMax?selected:CHARRANGE{at,at+1};
+  const auto mapped=NotesNativeLinkAddress(edit,state,probe);
+  if(ValidNotesUrl(mapped)) return mapped;
+  LONG cookie=0;if(!NotesRangeLinkEffects(edit,{at,at+1},nullptr,&cookie)) return {};
+  // Auto-detected URLs have no application cookie. Read their linked run
+  // without selecting it, including any character-format changes inside it.
+  LONG first=at,last=at+1;
+  const auto sameLink=[&](LONG position) {LONG other=0;return NotesRangeLinkEffects(edit,{position,position+1},nullptr,&other) && other==cookie;};
+  while(first>0 && last-first<=2048 && sameLink(first-1)) --first;
+  while(last<length && last-first<=2048 && sameLink(last)) ++last;
+  if(last-first>2048 || (!point && selected.cpMin!=selected.cpMax &&
+      (selected.cpMin<first || selected.cpMax>last))) return {};
+  const auto address=NotesRangeText(edit,first,last);
+  return ValidNotesUrl(address)?address:std::wstring{};
+}
+static bool NotesCaptureLinkMappings(HWND edit,ClientNotesDialogState &state,client_notes::NotePage &page,const CHARRANGE *scope=nullptr) {
+  // The native client cookie is part of RichEdit's character-format Undo.
+  // Each cookie names an immutable address; restoring an older link therefore
+  // restores its actual target, independent of the latest label mapping.
+  auto &registry=state.editorLinks[page.id];
+  if(registry.urls.empty()) {
+    if(!page.links.empty() || !page.linkRanges.empty()) {page.links.clear();page.linkRanges.clear();page.linkRangesKnown=false;state.metadataChanged=true;}
+    return true;
+  }
+  std::vector<std::pair<std::wstring,std::wstring>> links;std::vector<LONG> live;std::vector<client_notes::LinkRange> ranges;
+  IUnknown *ole=nullptr;ITextDocument *document=nullptr;ITextRange *range=nullptr;
+  SendMessageW(edit,EM_GETOLEINTERFACE,0,reinterpret_cast<LPARAM>(&ole));
+  if(ole) {ole->QueryInterface(__uuidof(ITextDocument),reinterpret_cast<void **>(&document));ole->Release();}
+  if(!document || FAILED(document->Range(0,0,&range))) {if(document) document->Release();return page.links.empty();}
+  // TOM ranges use native character positions. WM_GETTEXT expands table row
+  // markers and CR/LF, so its length can extend beyond the actual story.
+  LONG story=0;if(FAILED(range->GetStoryLength(&story))) {range->Release();document->Release();return false;}
+  const LONG base=scope ? (std::max)(0L,scope->cpMin) : 0;
+  const LONG length=scope && scope->cpMax>=0 ? (std::min)(scope->cpMax,(std::max)(0L,story-1)) : (std::max)(0L,story-1);
+  LONG first=base,pending=0,begin=base,last=base;std::wstring label;
+  bool ok=true;
+  const auto finish=[&] {
+    if(label.empty() || !pending) {label.clear();return;}
+    const auto address=registry.urls.find(pending);
+    if(address!=registry.urls.end()) {
+      auto previous=std::find(links.begin(),links.end(),std::pair{label,address->second});
+      const auto target=static_cast<uint32_t>(previous-links.begin());
+      if(previous==links.end()) links.emplace_back(label,address->second);
+      ranges.push_back({static_cast<uint32_t>(begin-base),static_cast<uint32_t>(last-base),target});
+      live.push_back(pending);
+    }
+    label.clear();
+  };
+  while(first<length) {
+    range->SetRange(first,first);LONG moved=0,end=first;
+    if(FAILED(range->MoveEnd(tomCharFormat,1,&moved)) || FAILED(range->GetEnd(&end)) || end<=first) {ok=false;break;}
+    end=(std::min)(end,length);LONG cookie=0;const bool linked=NotesRangeLinkEffects(edit,{first,end},nullptr,&cookie);
+    if(cookie==LONG_MIN) {ok=false;break;}
+    if(linked && registry.urls.contains(cookie)) {
+      if(pending!=cookie) {finish();pending=cookie;begin=first;}
+      // A bounded read returns empty for an overlong or unreadable native
+      // run. Omitting it would silently save the text without its address.
+      const auto part=NotesRangeText(edit,first,end);
+      if(part.empty() || part.size()>2048-label.size()) {ok=false;break;}
+      label+=part;
+      last=end;
+    } else {finish();pending=0;}
+    first=end;
+  }
+  finish();range->Release();document->Release();
+  if(!ok || links.size()>256 || !client_notes::ValidLinkRanges(ranges,!links.empty(),links.size()) || std::any_of(links.begin(),links.end(),[](const auto &link){return link.first.size()>2048;})) return false;
+  if(page.links!=links || page.linkRanges!=ranges || page.linkRangesKnown!=!links.empty()) {
+    page.links=std::move(links);page.modified=client_notes::Now();if(!page.created) page.created=page.modified;
+    page.linkRanges=std::move(ranges);page.linkRangesKnown=!page.links.empty();
+    state.metadataChanged=true;
+  }
+  // Retain 256 live targets plus 256 native Undo records. RichEdit counts the
+  // individual records inside an edit collection against that limit, rather
+  // than the grouped actions shown to the user. Touch replaced/removed targets
+  // before editing and never prune a live target or reuse a cookie ID.
+  while(!scope && registry.urls.size()>512) {
+    auto oldest=registry.urls.end();
+    for(auto it=registry.urls.begin();it!=registry.urls.end();++it) {
+      if(std::find(live.begin(),live.end(),it->first)!=live.end()) continue;
+      if(oldest==registry.urls.end() || registry.lastUse[it->first]<registry.lastUse[oldest->first]) oldest=it;
+    }
+    if(oldest==registry.urls.end()) break;
+    registry.lastUse.erase(oldest->first);registry.urls.erase(oldest);
+  }
+  return true;
+}
+static bool NotesSavedLinkStyle(const CHARFORMAT2W &format) {
+  return ((format.dwMask&CFM_UNDERLINE) && (format.dwEffects&CFE_UNDERLINE)) ||
+      ((format.dwMask&CFM_COLOR) && !(format.dwEffects&CFE_AUTOCOLOR) &&
+       (format.crTextColor==RGB(138,205,235) || format.crTextColor==RGB(0,91,158)));
+}
+static bool NotesLinkLabelExists(HWND edit,const std::wstring &label,bool stored=false) {
+  if (!edit || label.empty()) return false;
+  CHARRANGE original{};NotesSelection(edit,original);POINT scroll{};
+  SendMessageW(edit,EM_GETSCROLLPOS,0,reinterpret_cast<LPARAM>(&scroll));
+  FINDTEXTEXW find{{0,-1},label.c_str(),{}};bool linked=false;
+  while (SendMessageW(edit,EM_FINDTEXTEXW,FR_DOWN|FR_MATCHCASE,reinterpret_cast<LPARAM>(&find))>=0) {
+    SendMessageW(edit,EM_EXSETSEL,0,reinterpret_cast<LPARAM>(&find.chrgText));
+    CHARFORMAT2W format{sizeof(format)};SendMessageW(edit,EM_GETCHARFORMAT,SCF_SELECTION,reinterpret_cast<LPARAM>(&format));
+    // Native RTF normalization strips field instructions, so saved labeled
+    // links retain their underline plus the validated external address map.
+    if (NotesRangeLinkEffects(edit,find.chrgText) || (format.dwEffects&CFE_LINK) ||
+        (stored && NotesSavedLinkStyle(format))) {linked=true;break;}
+    find.chrg.cpMin=find.chrgText.cpMax;
+  }
+  SendMessageW(edit,EM_EXSETSEL,0,reinterpret_cast<LPARAM>(&original));
+  SendMessageW(edit,EM_SETSCROLLPOS,0,reinterpret_cast<LPARAM>(&scroll));
+  return linked;
+}
+static bool NotesRestoreMappedLinks(HWND edit,ClientNotesDialogState &state,const client_notes::NotePage &page,const CHARRANGE *scope=nullptr) {
+  if (page.links.empty()) return true;
+  if(!client_notes::ValidLinkRanges(page.linkRanges,page.linkRangesKnown,page.links.size())) return false;
+  bool ok=true;
+  CHARRANGE original{};NotesSelection(edit,original);
+  const auto bind=[&](const CHARRANGE &range,const std::wstring &url) {
+    const LONG cookie=NotesRegisterLinkCookie(state,page.id,url);
+    CHARFORMAT2W format{sizeof(format)};format.dwMask=CFM_LINK|CFM_LINKPROTECTED|CFM_COLOR;format.dwEffects=CFE_LINK|CFE_LINKPROTECTED;
+    format.crTextColor=g_bThemeIsDark ? RGB(138,205,235) : RGB(0,91,158);
+    SendMessageW(edit,EM_EXSETSEL,0,reinterpret_cast<LPARAM>(&range));SendMessageW(edit,EM_SETCHARFORMAT,SCF_SELECTION,reinterpret_cast<LPARAM>(&format));
+    LONG effects=CFE_LINK|CFE_LINKPROTECTED;bool effectsOk=false;NotesRangeLinkEffects(edit,range,&effects,nullptr,false,&effectsOk);
+    return effectsOk && NotesBindLinkCookie(edit,state,page.id,range,cookie);
+  };
+  if(page.linkRangesKnown) {
+    GETTEXTLENGTHEX measure{GTL_PRECISE|GTL_NUMCHARS,1200};const LONG length=static_cast<LONG>(SendMessageW(edit,EM_GETTEXTLENGTHEX,reinterpret_cast<WPARAM>(&measure),0));
+    const LONG offset=scope ? scope->cpMin : 0,limit=scope ? (std::min)(scope->cpMax,length) : length;
+    for(const auto &range:page.linkRanges) {
+      const auto &[label,url]=page.links[range.target];const CHARRANGE actual{offset+static_cast<LONG>(range.first),offset+static_cast<LONG>(range.last)};
+      if(actual.cpMin<offset || actual.cpMax>limit || !ValidNotesUrl(url) || NotesRangeText(edit,actual.cpMin,actual.cpMax)!=label) {ok=false;break;}
+    }
+    if(ok) for(const auto &range:page.linkRanges) ok=bind({offset+static_cast<LONG>(range.first),offset+static_cast<LONG>(range.last)},page.links[range.target].second) && ok;
+    SendMessageW(edit,EM_EXSETSEL,0,reinterpret_cast<LPARAM>(&original));return ok;
+  }
+  // Legacy caption-only metadata has no occurrence identity. A unique styled
+  // occurrence can migrate; multiple candidates are kept safely on disk rather
+  // than assigning a URL to an arbitrary ordinary underline.
+  for(size_t i=0;i<page.links.size();++i) for(size_t j=0;j<i;++j)
+    if(page.links[i].first==page.links[j].first && page.links[i].second!=page.links[j].second) return false;
+  for (const auto &[label,url]:page.links) {
+    if (label.empty() || !ValidNotesUrl(url)) continue;
+    FINDTEXTEXW find{{scope ? scope->cpMin : 0,scope ? scope->cpMax : -1},label.c_str(),{}};
+    std::vector<CHARRANGE> candidates;
+    while (SendMessageW(edit,EM_FINDTEXTEXW,FR_DOWN|FR_MATCHCASE,reinterpret_cast<LPARAM>(&find))>=0) {
+      SendMessageW(edit,EM_EXSETSEL,0,reinterpret_cast<LPARAM>(&find.chrgText));
+      CHARFORMAT2W format{sizeof(format)};SendMessageW(edit,EM_GETCHARFORMAT,SCF_SELECTION,reinterpret_cast<LPARAM>(&format));
+      if (NotesSavedLinkStyle(format)) {
+        candidates.push_back(find.chrgText);
+      }
+      find.chrg.cpMin=find.chrgText.cpMax;
+    }
+    if(candidates.size()!=1) {ok=false;break;}
+    if(!candidates.empty()) ok=bind(candidates.front(),url) && ok;
+  }
+  SendMessageW(edit,EM_EXSETSEL,0,reinterpret_cast<LPARAM>(&original));
+  return ok;
+}
+
 static bool CaptureNotesPage(HWND dialog, ClientNotesDialogState &state,
                               bool reportFailure = true) {
   if (!HasActiveNote(state)) return true;
+  // Never stream a HWND under a different note identity, even if a failed
+  // transition leaves a caller with a newly selected index.
+  if (!NotesEditorMatchesActive(state)) {
+    if (reportFailure) MessageBoxW(dialog,L"This note's editor could not be opened. Its saved content has been kept. Select the note again to retry.",L"Client Notes",MB_OK|MB_ICONWARNING);
+    return false;
+  }
   HWND edit = GetDlgItem(dialog, IDC_CLIENT_NOTES_TEXT);
   if (!NotesPlainTextWithinLimit(edit)) {
     if (reportFailure) MessageBoxW(dialog, L"The document exceeds the 32 MiB text limit. Shorten it and try again.",
@@ -16910,21 +19184,43 @@ static bool CaptureNotesPage(HWND dialog, ClientNotesDialogState &state,
     return false;
   }
   auto &page = state.pages[state.activePage];
+  const auto previousLinks=page.links;
+  const auto previousRanges=page.linkRanges;const bool previousRangesKnown=page.linkRangesKnown;
+  const bool loading=state.loading;state.loading=true;
+  const bool linksOk=NotesCaptureLinkMappings(edit,state,page);
+  state.loading=loading;
+  if(!linksOk) {
+    if(reportFailure) MessageBoxW(dialog,L"The links could not be saved safely. A note supports up to 256 link targets, 16,384 linked ranges and 2,048 characters per label. Your draft is still open.",L"Check note links",MB_OK|MB_ICONWARNING);
+    return false;
+  }
   const std::string previous = page.rtf;
   page.rich = true; page.rtf = std::move(rtf); page.text.clear();
-  if (page.rtf != previous && (state.formattingChanged || SendMessageW(edit, EM_GETMODIFY, 0, 0))) {
-    client_notes::RememberRevision(page, previous);
+  if ((page.rtf != previous || page.links!=previousLinks || page.linkRanges!=previousRanges || page.linkRangesKnown!=previousRangesKnown) && (state.formattingChanged || SendMessageW(edit, EM_GETMODIFY, 0, 0))) {
+    client_notes::RememberRevision(page, previous,false,&previousLinks,&previousRanges,previousRangesKnown);
     page.modified = client_notes::Now();
     if (!page.created) page.created = page.modified;
   }
   return true;
 }
 
+static bool NotesKeepUnloadedSavedText(const ClientNotesDialogState &state) {
+  return !state.pendingTransactionRecovery && state.editorLoadFailed && !state.attachedPageId && state.pages.size()==state.original.pages.size() &&
+      std::all_of(state.pages.begin(),state.pages.end(),[&](const auto &page){const auto saved=std::find_if(state.original.pages.begin(),state.original.pages.end(),[&](const auto &prior){return prior.id==page.id;});
+        return saved!=state.original.pages.end() && page.rich==saved->rich && page.rtf==saved->rtf && page.text==saved->text && page.links==saved->links && page.linkRanges==saved->linkRanges && page.linkRangesKnown==saved->linkRangesKnown;});
+}
 static bool SaveClientNotesDraft(HWND dialog, ClientNotesDialogState &state,
                                  bool reportFailure) {
+  if (state.pendingTransactionRecovery) {
+    KillTimer(dialog, 1);
+    SetNotesSaveFailure(dialog, state, true);
+    if (reportFailure) MessageBoxW(dialog,
+        L"An edit could not be recovered safely. Saving is paused and your original draft is retained in memory. Keep this Notes window open.",
+        L"Client Notes", MB_OK | MB_ICONWARNING);
+    return false;
+  }
   KillTimer(dialog, 1);
   NotesRememberView(dialog, state);
-  if (!CaptureNotesPage(dialog, state, reportFailure)) {
+  if (!NotesKeepUnloadedSavedText(state) && !CaptureNotesPage(dialog, state, reportFailure)) {
     SetNotesSaveFailure(dialog, state, true);
     SetDlgItemTextW(dialog, IDC_NOTES_STATUS, L"Could not save: shorten this note");
     return false;
@@ -16944,20 +19240,22 @@ static bool SaveClientNotesDraft(HWND dialog, ClientNotesDialogState &state,
   };
   if (!safeClient() ||
       !client_notes::WriteNotebook(state.clientRoot, state.pages, state.original, safeClient)) {
+    state.saveProblemDetail=client_notes::PersistenceError();
     NotesWriteRecovery(dialog, state);
     SetNotesSaveFailure(dialog, state, true);
     SetDlgItemTextW(dialog, IDC_NOTES_STATUS, L"Could not save - drafts are still open");
-    if (reportFailure) MessageBoxW(dialog,
+    if (reportFailure) MessageBoxW(dialog,(std::wstring(
                 L"The notes could not be saved safely. They may have changed on "
                 L"disk, the notebook may exceed 256 MiB, or the client folder may "
-                L"be unavailable. Your drafts are still here; copy them or try saving again.",
+                L"be unavailable. Your drafts are still here; copy them or try saving again.")+ (state.saveProblemDetail.empty() ? L"" : L"\n\n"+state.saveProblemDetail)).c_str(),
                 L"Client Notes", MB_OK | MB_ICONWARNING);
     return false;
   }
   // Keep the exact committed bytes as the next expected snapshot. Reading
   // again here could accidentally accept a concurrent writer's later version.
   state.metadataChanged = false;
-  DeleteFileW((state.clientRoot / state.draftName).c_str());
+  client_notes::DeleteAuxiliary(state.clientRoot,state.draftName,state.original.directory_identity,state.draftIdentity);
+  state.draftIdentity={};
   state.original.status = client_notes::ReadStatus::Ok;
   state.original.pages = state.pages;
   state.original.notebook_snapshot.status = client_notes::ReadStatus::Ok;
@@ -16968,6 +19266,30 @@ static bool SaveClientNotesDraft(HWND dialog, ClientNotesDialogState &state,
   SendDlgItemMessageW(dialog, IDC_CLIENT_NOTES_TEXT, EM_SETMODIFY, FALSE, 0);
   SetNotesSaveFailure(dialog, state, false);
   SetNotesStatus(dialog, state);
+  return true;
+}
+
+static bool FlushClientNotesForBackup(
+    const std::vector<std::wstring> &selectedClients, std::wstring &error) {
+  if (!g_hNotesWindow || !IsWindow(g_hNotesWindow)) return true;
+  auto *state=reinterpret_cast<ClientNotesDialogState *>(GetWindowLongPtrW(g_hNotesWindow,DWLP_USER));
+  if (!state) return true;
+  if (std::none_of(selectedClients.begin(), selectedClients.end(),
+          [&](const auto &name) {
+            return client_name_comparison::EqualIgnoringCase(name, state->clientName);
+          }))
+    return true;
+  CloseNotesPanel(*state);
+  if (!state->detailsDrafts.empty()) {
+    error=L"These notes have unfinished invalid Details:\n"+NotesInvalidDetailsSummary(*state)+
+        L"\nReopen a saved note in All notes to correct its Details. Restore archived or trashed notes first, or close Notes and explicitly discard the identified unfinished details. Your saved text and previously saved details are kept.";
+    return false;
+  }
+  if (!SaveClientNotesDraft(g_hNotesWindow,*state,false)) {
+    error=L"The open notes could not be saved safely. Resolve the Notes save problem before creating a backup.";
+    if(!state->saveProblemDetail.empty()) error+=L"\n\n"+state->saveProblemDetail;
+    return false;
+  }
   return true;
 }
 
@@ -17003,8 +19325,6 @@ static void RestoreNotesWindowSize(HWND dialog) {
   const int top = std::clamp(static_cast<int>((owner.top + owner.bottom - height) / 2),
                             static_cast<int>(work.top), static_cast<int>(work.bottom) - height);
   SetWindowPos(dialog, nullptr, left, top, width, height, SWP_NOZORDER | SWP_NOACTIVATE);
-  if (GetPrivateProfileIntW(L"notes_window", L"maximized", 0, g_sConfigPath.c_str()) == 1)
-    ShowWindow(dialog, SW_MAXIMIZE);
 }
 
 static void NotesDiscardEmptyDrafts(HWND,ClientNotesDialogState &);
@@ -17012,11 +19332,12 @@ static void CloseClientNotesDialog(HWND dialog,
                                    ClientNotesDialogState &state) {
   CloseNotesPanel(state);
   if (!state.detailsDrafts.empty() && MessageBoxW(dialog,
-      L"Some details have invalid values and have not been saved. Close without those details?\n\nYour note text and previously saved details are kept.",
+      (L"These notes have unfinished invalid Details:\n"+NotesInvalidDetailsSummary(state)+
+       L"\nClose without these unfinished details?\n\nYes discards them and closes Notes. No takes you to the affected note; archived or trashed notes remain there until you choose Restore. Your note text and previously saved details are kept.").c_str(),
       L"Check note details",MB_YESNO|MB_DEFBUTTON2|MB_ICONWARNING)!=IDYES) {
-    NotesWorkspaceCommand(dialog,state,IDC_NOTES_DETAILS);return;
+    NotesReviewInvalidDetails(dialog,state);return;
   }
-  if (!CaptureNotesPage(dialog,state,true)) return;
+  if (!NotesKeepUnloadedSavedText(state) && !CaptureNotesPage(dialog,state,true)) return;
   NotesDiscardEmptyDrafts(dialog,state);
   if (SaveClientNotesDraft(dialog, state, true)) {
     RememberNotesWindowSize(dialog);
@@ -17069,12 +19390,40 @@ static LRESULT CALLBACK NotesWindowSubclass(HWND dialog, UINT message,
   return DefSubclassProc(dialog, message, wParam, lParam);
 }
 
+class NotesLayoutBatch {
+public:
+  NotesLayoutBatch():batch_(BeginDeferWindowPos(64)) {}
+  void Place(HWND child,int x,int y,int width,int height,UINT flags) {
+    if(count_==placements_.size()) {Commit();count_=0;batch_=nullptr;}
+    placements_[count_++]={child,x,y,width,height,flags};
+    if(batch_) batch_=DeferWindowPos(batch_,child,nullptr,x,y,width,height,flags);
+  }
+  void Commit() {
+    const bool committed=batch_ && EndDeferWindowPos(batch_);
+    batch_=nullptr;
+    if(!committed) for(size_t i=0;i<count_;++i) {
+      const auto &place=placements_[i];SetWindowPos(place.child,nullptr,place.x,place.y,place.width,place.height,place.flags);
+    }
+  }
+private:
+  struct Placement {HWND child;int x,y,width,height;UINT flags;};
+  std::array<Placement,64> placements_{};
+  size_t count_=0;
+  HDWP batch_=nullptr;
+};
+static RECT NotesWorkArea(HWND owner) {
+  MONITORINFO monitor{sizeof(monitor)};
+  if(GetMonitorInfoW(MonitorFromWindow(owner,MONITOR_DEFAULTTONEAREST),&monitor)) return monitor.rcWork;
+  RECT work{};if(SystemParametersInfoW(SPI_GETWORKAREA,0,&work,0)) return work;
+  return {0,0,(std::max)(1,GetSystemMetrics(SM_CXSCREEN)),(std::max)(1,GetSystemMetrics(SM_CYSCREEN))};
+}
 static void LayoutClientNotes(HWND dialog, UINT dpi) {
   auto *state = reinterpret_cast<ClientNotesDialogState *>(GetWindowLongPtrW(dialog, DWLP_USER));
   if (!state) return;
   const bool dpiChanged = state->fontDpi != dpi;
+  RefreshNotesClientIcon(dialog,*state,dpi);
   if (dpiChanged) {
-    const HFONT oldFont = state->uiFont, oldTabFont = state->tabFont, oldTitleFont = state->titleFont;
+    const HFONT oldFont = state->uiFont, oldTabFont = state->tabFont;
     state->uiFont = CreateFontW(-MulDiv(10, dpi, 72), 0, 0, 0, FW_NORMAL,
         FALSE, FALSE, FALSE, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, L"Segoe UI");
     EnumChildWindows(dialog, [](HWND control, LPARAM font) -> BOOL {
@@ -17084,10 +19433,7 @@ static void LayoutClientNotes(HWND dialog, UINT dpi) {
     }, reinterpret_cast<LPARAM>(state->uiFont));
     state->tabFont = CreateFontW(-MulDiv(12, dpi, 72), 0, 0, 0, FW_SEMIBOLD,
         FALSE, FALSE, FALSE, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, L"Segoe UI");
-    state->titleFont = CreateFontW(-MulDiv(16, dpi, 72), 0, 0, 0, FW_SEMIBOLD,
-        FALSE, FALSE, FALSE, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, L"Segoe UI");
-    SendDlgItemMessageW(dialog,IDC_NOTES_NOTE_HEADING,WM_SETFONT,reinterpret_cast<WPARAM>(state->titleFont),TRUE);
-    for (HFONT font : {oldFont, oldTabFont, oldTitleFont}) if (font) DeleteObject(font);
+    for (HFONT font : {oldFont, oldTabFont}) if (font) DeleteObject(font);
     state->fontDpi = dpi;
   }
   RECT area{}; GetClientRect(dialog, &area);
@@ -17095,7 +19441,10 @@ static void LayoutClientNotes(HWND dialog, UINT dpi) {
   const int height = ScaleByDpi(36, dpi);
   RECT priorEditorBounds{};
   GetClientRect(GetDlgItem(dialog, IDC_CLIENT_NOTES_TEXT), &priorEditorBounds);
-  HDWP layout = BeginDeferWindowPos(24);
+  RECT priorTabsBounds{};
+  GetClientRect(GetDlgItem(dialog, IDC_NOTES_TABS), &priorTabsBounds);
+  NotesLayoutBatch layout;
+  bool addTabBoundsChanged=false;
   auto place = [&](int id, int x, int y, int width, int h = -1) {
     HWND control = GetDlgItem(dialog, id);
     if (!control) return;
@@ -17107,46 +19456,76 @@ static void LayoutClientNotes(HWND dialog, UINT dpi) {
         (combo && !dpiChanged && old.right - old.left == width ? SWP_NOSIZE : 0);
     if (old.left == x && old.top == y && old.right - old.left == width &&
         ((combo && !dpiChanged) || old.bottom - old.top == targetHeight)) return;
-    if (layout) layout = DeferWindowPos(layout, control, nullptr, x, y, width, targetHeight,
-        flags);
-    else SetWindowPos(control, nullptr, x, y, width, targetHeight,
-        flags);
+    if (id==IDC_NOTES_ADD_TAB) addTabBoundsChanged=true;
+    layout.Place(control,x,y,width,targetHeight,flags);
   };
-  place(IDC_NOTES_CLIENT_HEADING, ScaleByDpi(20,dpi), ScaleByDpi(11,dpi),ScaleByDpi(45,dpi),ScaleByDpi(24,dpi));
   SIZE clientLabel{};
   HWND clientPicker = GetDlgItem(dialog, IDC_NOTES_SWITCH_CLIENT);
   if (HDC dc = GetDC(clientPicker)) {
-    HGDIOBJ oldFont = SelectObject(dc, state->uiFont);
+    HGDIOBJ oldFont = SelectObject(dc,GetOwnerDrawFont(clientPicker));
     GetTextExtentPoint32W(dc, state->clientName.c_str(),
                          static_cast<int>(state->clientName.size()), &clientLabel);
     SelectObject(dc, oldFont);
     ReleaseDC(clientPicker, dc);
   }
   const int clientWidth = (std::min)(
-      (std::clamp)(static_cast<int>(clientLabel.cx) + ScaleByDpi(48,dpi),
+      (std::clamp)(static_cast<int>(clientLabel.cx) + ScaleByDpi(74,dpi),
                    ScaleByDpi(96,dpi), ScaleByDpi(290,dpi)),
       (std::max)(1, static_cast<int>(area.right) - ScaleByDpi(485,dpi)));
-  place(IDC_NOTES_SWITCH_CLIENT,ScaleByDpi(74,dpi),ScaleByDpi(5,dpi),
+  place(IDC_NOTES_SWITCH_CLIENT,margin,ScaleByDpi(5,dpi),
         clientWidth,ScaleByDpi(30,dpi));
   place(IDC_NOTES_LIBRARY,area.right-ScaleByDpi(365,dpi),ScaleByDpi(5,dpi),ScaleByDpi(90,dpi),ScaleByDpi(30,dpi));
   place(IDC_NOTES_TRASH,area.right-ScaleByDpi(267,dpi),ScaleByDpi(5,dpi),ScaleByDpi(64,dpi),ScaleByDpi(30,dpi));
   place(IDC_NOTES_MORE,area.right-ScaleByDpi(195,dpi),ScaleByDpi(5,dpi),ScaleByDpi(75,dpi),ScaleByDpi(30,dpi));
   place(IDC_NOTES_HELP,area.right-ScaleByDpi(112,dpi),ScaleByDpi(5,dpi),ScaleByDpi(55,dpi),ScaleByDpi(30,dpi));
   place(IDCANCEL,area.right-ScaleByDpi(44,dpi),ScaleByDpi(2,dpi),ScaleByDpi(36,dpi),ScaleByDpi(36,dpi));
-  // Keep the document context above one compact, left-aligned action row.
-  place(IDC_NOTES_NOTE_HEADING,margin,ScaleByDpi(96,dpi),area.right-margin*2-ScaleByDpi(344,dpi),ScaleByDpi(26,dpi));
-  place(IDC_NOTES_STATUS,area.right-margin-ScaleByDpi(340,dpi),ScaleByDpi(101,dpi),ScaleByDpi(110,dpi),ScaleByDpi(20,dpi));
-  place(IDC_NOTES_CONTEXT,area.right-margin-ScaleByDpi(224,dpi),ScaleByDpi(101,dpi),ScaleByDpi(224,dpi),ScaleByDpi(22,dpi));
+  // Tabs name the notes. Show one small ticket/tag line only when populated;
+  // otherwise everyday actions lead straight into the document.
+  const auto labelWidth=[&](int id) {
+    SIZE size{};wchar_t label[768]{};HWND control=GetDlgItem(dialog,id);
+    GetWindowTextW(control,label,static_cast<int>(std::size(label)));
+    if(HDC dc=GetDC(control)) {
+      HGDIOBJ old=SelectObject(dc,GetOwnerDrawFont(control));
+      GetTextExtentPoint32W(dc,label,static_cast<int>(wcslen(label)),&size);
+      SelectObject(dc,old);ReleaseDC(control,dc);
+    }
+    return static_cast<int>(size.cx);
+  };
+  // Date-based ticket IDs need their full measured width. The reference is
+  // plain information until a URL supplies a distinct open-ticket action.
+  const int contextGap=ScaleByDpi(8,dpi);
+  const int metadataMax=(std::min)(ScaleByDpi(720,dpi),static_cast<int>(area.right-margin*2));
+  const bool hasTicket=labelWidth(IDC_NOTES_OPEN_TICKET)>0;
+  const bool hasTicketUrl=HasActiveNote(*state) && ValidNotesUrl(state->pages[state->activePage].ticketUrl);
+  const int ticketWidth=hasTicket ? (std::clamp)(labelWidth(IDC_NOTES_OPEN_TICKET)+ScaleByDpi(16,dpi),
+      ScaleByDpi(96,dpi),(std::max)(ScaleByDpi(96,dpi),(std::min)(ScaleByDpi(360,dpi),metadataMax-contextGap))) : 0;
+  const int tagWidth=(std::min)({labelWidth(IDC_NOTES_CONTEXT),ScaleByDpi(224,dpi),
+      (std::max)(0,metadataMax-ticketWidth-contextGap)});
+  const bool hasContext=hasTicket || tagWidth>0;
+  const int tagLeft=margin+ticketWidth+(hasTicket && tagWidth>0 ? contextGap : 0);
+  place(IDC_NOTES_OPEN_TICKET,margin,ScaleByDpi(97,dpi),(std::max)(1,ticketWidth),ScaleByDpi(28,dpi));
+  place(IDC_NOTES_TICKET_REFERENCE,margin,ScaleByDpi(97,dpi),(std::max)(1,ticketWidth),ScaleByDpi(28,dpi));
+  place(IDC_NOTES_CONTEXT,tagLeft,ScaleByDpi(101,dpi),tagWidth,ScaleByDpi(22,dpi));
+  ShowWindow(GetDlgItem(dialog,IDC_NOTES_OPEN_TICKET),hasTicket && hasTicketUrl ? SW_SHOW : SW_HIDE);
+  ShowWindow(GetDlgItem(dialog,IDC_NOTES_TICKET_REFERENCE),hasTicket && !hasTicketUrl ? SW_SHOW : SW_HIDE);
+  const int actionTop=hasContext ? 128 : 96;
+  place(IDC_NOTES_STATUS,margin,ScaleByDpi(actionTop+31,dpi),area.right-margin*2,ScaleByDpi(20,dpi));
   int actionX=margin;
   for (const auto [id,width] : {std::pair{IDC_NOTES_FIND_TOGGLE,54},
-      {IDC_NOTES_SNIPPETS,82},{IDC_NOTES_TEMPLATES,90},{IDC_NOTES_DETAILS,66},
-      {IDC_NOTES_METADATA,146},{IDC_NOTES_OPEN_TICKET,100},{IDC_NOTES_WORKLOG,92}}) {
-    if (id==IDC_NOTES_METADATA) actionX+=ScaleByDpi(10,dpi);
-    place(id,actionX,ScaleByDpi(128,dpi),ScaleByDpi(width,dpi),ScaleByDpi(28,dpi));
-    actionX+=ScaleByDpi(width+6,dpi);
+      {IDC_NOTES_SNIPPETS,82},{IDC_NOTES_TEMPLATES,90},{IDC_NOTES_WORKLOG,92},
+      {IDC_NOTES_FORMAT,74}}) {
+    const int actionWidth=(std::max)(ScaleByDpi(width,dpi),labelWidth(id)+ScaleByDpi(27,dpi));
+    place(id,actionX,ScaleByDpi(actionTop,dpi),actionWidth,ScaleByDpi(28,dpi));
+    actionX+=actionWidth+ScaleByDpi(6,dpi);
   }
-  ShowWindow(GetDlgItem(dialog,IDC_NOTES_CONTEXT),SW_SHOW);
-  ShowWindow(GetDlgItem(dialog,IDC_NOTES_STATUS),SW_SHOW);
+  const int detailsLeft=area.right-margin-ScaleByDpi(66,dpi);
+  const bool hasWorkStatus=HasActiveNote(*state) && *NotesWorkStatusLabel(state->pages[state->activePage].status);
+  const int statusWidth=hasWorkStatus ? labelWidth(IDC_NOTES_WORK_STATUS)+ScaleByDpi(28,dpi) : 1;
+  place(IDC_NOTES_WORK_STATUS,detailsLeft-ScaleByDpi(16,dpi)-statusWidth,ScaleByDpi(actionTop,dpi),statusWidth,ScaleByDpi(28,dpi));
+  place(IDC_NOTES_DETAILS,detailsLeft,ScaleByDpi(actionTop,dpi),ScaleByDpi(66,dpi),ScaleByDpi(28,dpi));
+  ShowWindow(GetDlgItem(dialog,IDC_NOTES_WORK_STATUS),hasWorkStatus ? SW_SHOW : SW_HIDE);
+  ShowWindow(GetDlgItem(dialog,IDC_NOTES_CONTEXT),tagWidth>0 ? SW_SHOW : SW_HIDE);
+  ShowWindow(GetDlgItem(dialog,IDC_NOTES_STATUS),state->problemVisible ? SW_SHOW : SW_HIDE);
   ShowWindow(GetDlgItem(dialog,IDC_NOTES_RENAME_TAB),SW_HIDE);
   const int tabTop = ScaleByDpi(46, dpi), plusWidth = ScaleByDpi(40, dpi);
   const int maxTabs = (std::max)(1, static_cast<int>(area.right) - margin * 2 - plusWidth - gap);
@@ -17160,64 +19539,132 @@ static void LayoutClientNotes(HWND dialog, UINT dpi) {
   const int tabWidth = (std::min)(maxTabs, (std::max)(1, count) * ScaleByDpi(118, dpi) + ScaleByDpi(6, dpi));
   place(IDC_NOTES_TABS, margin, tabTop, tabWidth, height + ScaleByDpi(3, dpi));
   place(IDC_NOTES_ADD_TAB, margin + tabWidth + gap, tabTop, plusWidth);
-  const int extra = std::clamp(MulDiv(area.right, 96, dpi) - 900, 0, 50);
-  const int toolGap = ScaleByDpi(6 + extra * 4 / 50, dpi);
-  int x = margin + ScaleByDpi(extra * 12 / 50, dpi);
-  const int top = ScaleByDpi(162, dpi);
-  for (const auto [id, width] : {
-           std::pair{IDC_NOTES_STYLE, 140}, {IDC_NOTES_SIZE, 62},
-           {IDC_NOTES_BOLD, 40}, {IDC_NOTES_ITALIC, 40}, {IDC_NOTES_UNDERLINE, 40},
-           {IDC_NOTES_HIGHLIGHT, 58}, {IDC_NOTES_BULLETS, 40}, {IDC_NOTES_NUMBERS, 40},
-           {IDC_NOTES_CHECKLIST, 40}, {IDC_NOTES_LINK, 40},
-           {IDC_NOTES_UNDO, 40}, {IDC_NOTES_REDO, 40}, {IDC_NOTES_CLEAR, 40}}) {
-    if (id == IDC_NOTES_BOLD || id == IDC_NOTES_BULLETS ||
-        id == IDC_NOTES_LINK || id == IDC_NOTES_UNDO || id == IDC_NOTES_CLEAR)
-      x += ScaleByDpi(16 + extra * 3 / 50, dpi);
-    const bool combo = id == IDC_NOTES_STYLE || id == IDC_NOTES_SIZE;
-    if (combo && dpiChanged) {
-      SendDlgItemMessageW(dialog, id, CB_SETITEMHEIGHT, -1, ScaleByDpi(30, dpi));
-      SendDlgItemMessageW(dialog, id, CB_SETITEMHEIGHT, 0, ScaleByDpi(30, dpi));
-    }
-    if (id == IDC_NOTES_HIGHLIGHT)
-      place(IDC_NOTES_HIGHLIGHT_COLOR, x + ScaleByDpi(40, dpi), top, ScaleByDpi(18, dpi));
-    place(id, x, top + (combo ? ScaleByDpi(2, dpi) : 0), ScaleByDpi(id == IDC_NOTES_HIGHLIGHT ? 40 : width, dpi),
-          combo ? ScaleByDpi(210, dpi) : -1);
-    x += ScaleByDpi(width, dpi) + toolGap;
+  const int findTop=ScaleByDpi(actionTop+36+(state->problemVisible ? 20 : 0),dpi);
+  const int findGap=ScaleByDpi(6,dpi),findHeight=ScaleByDpi(28,dpi);
+  const int available=static_cast<int>(area.right)-margin*2;
+  const int queryWidth=(std::max)(ScaleByDpi(120,dpi),available-ScaleByDpi(350,dpi));
+  int findX=margin;
+  for(const auto [id,width]:{std::pair{IDC_NOTES_FIND,queryWidth},{IDC_NOTES_FIND_PREV,ScaleByDpi(76,dpi)},
+      {IDC_NOTES_FIND_NEXT,ScaleByDpi(56,dpi)},{IDC_NOTES_REPLACE,ScaleByDpi(90,dpi)},{IDC_NOTES_FIND_CLOSE,ScaleByDpi(104,dpi)}}) {
+    place(id,findX,findTop,width,findHeight);findX+=width+findGap;
+    ShowWindow(GetDlgItem(dialog,id),state->findVisible?SW_SHOW:SW_HIDE);
   }
-  int findX = margin;
-  for (const auto [id, width] : {std::pair{IDC_NOTES_FIND, 300}, {IDC_NOTES_FIND_PREV, 80},
-      {IDC_NOTES_FIND_NEXT,60}, {IDC_NOTES_REPLACE,100}, {IDC_NOTES_FIND_CLOSE,120}}) {
-    place(id,findX,ScaleByDpi(205,dpi),ScaleByDpi(width,dpi),ScaleByDpi(30,dpi));
-    ShowWindow(GetDlgItem(dialog,id),state->findVisible ? SW_SHOW : SW_HIDE);
-    findX += ScaleByDpi(width+6,dpi);
+  findX=margin;
+  for(const auto [id,width]:{std::pair{IDC_NOTES_FIND_MATCH_CASE,100},{IDC_NOTES_FIND_WHOLE_WORD,108},{IDC_NOTES_FIND_WRAP,64}}) {
+    place(id,findX,findTop+ScaleByDpi(34,dpi),ScaleByDpi(width,dpi),findHeight);findX+=ScaleByDpi(width+6,dpi);
+    ShowWindow(GetDlgItem(dialog,id),state->findVisible?SW_SHOW:SW_HIDE);
   }
-  const int editorTop = ScaleByDpi(state->findVisible ? 242 : 204, dpi);
+  place(IDC_NOTES_FIND_INFO,findX,findTop+ScaleByDpi(34,dpi),(std::max)(1,static_cast<int>(area.right)-margin-findX),findHeight);
+  ShowWindow(GetDlgItem(dialog,IDC_NOTES_FIND_INFO),state->findVisible?SW_SHOW:SW_HIDE);
+  findX=margin;
+  for(const auto [id,width]:{std::pair{IDC_NOTES_REPLACE_TEXT,available-ScaleByDpi(244,dpi)},
+      {IDC_NOTES_REPLACE_NEXT,ScaleByDpi(116,dpi)},{IDC_NOTES_REPLACE_ALL,ScaleByDpi(116,dpi)}}) {
+    place(id,findX,findTop+ScaleByDpi(68,dpi),width,findHeight);findX+=width+findGap;
+    ShowWindow(GetDlgItem(dialog,id),state->findVisible&&state->replaceVisible?SW_SHOW:SW_HIDE);
+  }
+  const int editorTop = ScaleByDpi(actionTop+36+NotesFindHeight(*state)+(state->problemVisible ? 20 : 0), dpi);
   place(IDC_NOTES_EMPTY, margin, editorTop + ScaleByDpi(80,dpi),area.right-margin*2,ScaleByDpi(60,dpi));
   ShowWindow(GetDlgItem(dialog,IDC_NOTES_EMPTY),HasActiveNote(*state) ? SW_HIDE : SW_SHOW);
   place(IDC_CLIENT_NOTES_TEXT, margin + ScaleByDpi(4, dpi), editorTop,
         (std::max)(0, static_cast<int>(area.right) - margin * 2 - ScaleByDpi(8, dpi)),
         (std::max)(0, static_cast<int>(area.bottom) - margin - editorTop));
-  if (layout) EndDeferWindowPos(layout);
+  layout.Commit();
+  // Moving the strip can preserve a partially painted native button image.
+  // Queue its complete owner-drawn surface only after its final bounds exist;
+  // the clipped parent repaint does not cover this child's border.
+  if (addTabBoundsChanged) InvalidateRect(GetDlgItem(dialog,IDC_NOTES_ADD_TAB),nullptr,FALSE);
   ThemeNotesOverflow(tabs);
-  RECT document{};
-  GetClientRect(GetDlgItem(dialog, IDC_CLIENT_NOTES_TEXT), &document);
-  InflateRect(&document, -ScaleByDpi(28, dpi), -ScaleByDpi(16, dpi));
-  RECT previous{};
-  SendDlgItemMessageW(dialog, IDC_CLIENT_NOTES_TEXT, EM_GETRECT, 0, reinterpret_cast<LPARAM>(&previous));
-  // RichEdit can update the reported rectangle before recalculating wrapped
-  // lines. Compare the actual width across positioning as well as padding.
-  if (!EqualRect(&previous, &document) || priorEditorBounds.right != document.right + ScaleByDpi(28, dpi)) {
-    SendDlgItemMessageW(dialog, IDC_CLIENT_NOTES_TEXT, EM_SETRECT, 0, reinterpret_cast<LPARAM>(&document));
-    SendDlgItemMessageW(dialog, IDC_CLIENT_NOTES_TEXT, EM_SETTARGETDEVICE, 0, 0);
-    InvalidateRect(GetDlgItem(dialog, IDC_CLIENT_NOTES_TEXT), nullptr, TRUE);
+  if (priorTabsBounds.right != tabWidth) {
+    // Native tabs retain their old first-visible item when an overflowing row
+    // grows. Use newly available whole-item slots before the trailing arrows,
+    // without changing a manually scrolled viewport at an unchanged width.
+    if (priorTabsBounds.right < tabWidth && count > 0) {
+      HWND arrows=FindWindowExW(tabs,nullptr,UPDOWN_CLASSW,nullptr);
+      RECT first{},last{},navigation{};
+      if (arrows && (GetWindowLongPtrW(arrows,GWL_STYLE)&WS_VISIBLE) &&
+          TabCtrl_GetItemRect(tabs,0,&first) && TabCtrl_GetItemRect(tabs,count-1,&last) && first.left<0) {
+        GetWindowRect(arrows,&navigation);
+        MapWindowPoints(nullptr,tabs,reinterpret_cast<POINT *>(&navigation),2);
+        const int itemWidth=(std::max)(1,static_cast<int>(last.right-last.left));
+        const int slots=(std::max)(0,static_cast<int>(navigation.left-last.right))/itemWidth;
+        if (slots) {
+          int low=0,high=0;
+          SendMessageW(arrows,UDM_GETRANGE32,reinterpret_cast<WPARAM>(&low),reinterpret_cast<LPARAM>(&high));
+          const int current=static_cast<int>(SendMessageW(arrows,UDM_GETPOS32,0,0));
+          const int position=(std::clamp)(current-slots,(std::min)(low,high),(std::max)(low,high));
+          if (position!=current) {
+            SendMessageW(arrows,UDM_SETPOS32,0,position);
+            SendMessageW(tabs,WM_HSCROLL,MAKEWPARAM(SB_THUMBPOSITION,position),reinterpret_cast<LPARAM>(arrows));
+          }
+        }
+      }
+    }
+    // When a wide row loses its overflow control, Windows resets its scroll
+    // position. Shrinking the row must bring the unchanged active tab back
+    // into view without reloading its editor or changing keyboard focus.
+    const int selected=TabCtrl_GetCurSel(tabs);
+    HWND arrows=FindWindowExW(tabs,nullptr,UPDOWN_CLASSW,nullptr);
+    RECT selectedBounds{},navigation{};
+    if (selected>=0 && arrows && (GetWindowLongPtrW(arrows,GWL_STYLE)&WS_VISIBLE) &&
+        TabCtrl_GetItemRect(tabs,selected,&selectedBounds)) {
+      GetWindowRect(arrows,&navigation);
+      MapWindowPoints(nullptr,tabs,reinterpret_cast<POINT *>(&navigation),2);
+      const int itemWidth=(std::max)(1,static_cast<int>(selectedBounds.right-selectedBounds.left));
+      const int delta=selectedBounds.left<0 ? -static_cast<int>((-selectedBounds.left+itemWidth-1)/itemWidth) :
+          selectedBounds.right>navigation.left ? static_cast<int>((selectedBounds.right-navigation.left+itemWidth-1)/itemWidth) : 0;
+      if (delta) {
+        int low=0,high=0;
+        SendMessageW(arrows,UDM_GETRANGE32,reinterpret_cast<WPARAM>(&low),reinterpret_cast<LPARAM>(&high));
+        const int current=static_cast<int>(SendMessageW(arrows,UDM_GETPOS32,0,0));
+        const int position=(std::clamp)(current+delta,(std::min)(low,high),(std::max)(low,high));
+        if (position!=current) {
+          SendMessageW(arrows,UDM_SETPOS32,0,position);
+          SendMessageW(tabs,WM_HSCROLL,MAKEWPARAM(SB_THUMBPOSITION,position),reinterpret_cast<LPARAM>(arrows));
+        }
+      }
+    }
+  }
+  // Closing the last tab removes its editor. InvalidateRect(nullptr, ...) has
+  // desktop-wide semantics, so empty-workspace layout must skip editor work.
+  if (const HWND edit=GetDlgItem(dialog, IDC_CLIENT_NOTES_TEXT)) {
+    RECT document{};
+    GetClientRect(edit, &document);
+    InflateRect(&document, -ScaleByDpi(28, dpi), -ScaleByDpi(16, dpi));
+    RECT previous{};
+    SendMessageW(edit, EM_GETRECT, 0, reinterpret_cast<LPARAM>(&previous));
+    // RichEdit can update the reported rectangle before recalculating wrapped
+    // lines. Compare the actual width across positioning as well as padding.
+    if (!EqualRect(&previous, &document) || priorEditorBounds.right != document.right + ScaleByDpi(28, dpi)) {
+      SendMessageW(edit, EM_SETRECT, 0, reinterpret_cast<LPARAM>(&document));
+      SendMessageW(edit, EM_SETTARGETDEVICE, 0, state->wordWrap ? 0 : 1);
+      InvalidateRect(edit, nullptr, TRUE);
+    }
   }
   // Let Windows coalesce resize paints. Child positioning already invalidates
   // changed controls; never synchronously redraw every editor and toolbar here.
   InvalidateRect(dialog, nullptr, FALSE);
+  PositionNotesFormat(dialog,*state,dpi);
 }
 
+static bool IsNotesToolbarItem(const DRAWITEMSTRUCT &draw);
 static void ApplyNotesEditorTheme(HWND dialog, ClientNotesDialogState &state) {
   ApplyCleanupDialogTheme(dialog);
+  EnumChildWindows(dialog,[](HWND control,LPARAM)->BOOL {
+    wchar_t type[32]{};GetClassNameW(control,type,static_cast<int>(std::size(type)));
+    DRAWITEMSTRUCT item{};item.CtlType=_wcsicmp(type,L"Button")==0 ? ODT_BUTTON : ODT_STATIC;
+    item.CtlID=GetDlgCtrlID(control);
+    if(IsNotesToolbarItem(item) || (item.CtlType==ODT_STATIC &&
+        (item.CtlID==IDC_NOTES_TICKET_REFERENCE || item.CtlID==IDC_NOTES_WORK_STATUS)))
+      SetWindowSubclass(control,NotesOpaqueSurfaceSubclass,3,0);
+    return TRUE;
+  },0);
+  // Shared dialog theming may install its own font. Keep Notes' DPI-scaled UI
+  // font so changing colours does not change control widths or clip labels.
+  if (state.uiFont) EnumChildWindows(dialog,[](HWND control,LPARAM font)->BOOL {
+    if (GetDlgCtrlID(control)!=IDC_CLIENT_NOTES_TEXT && GetDlgCtrlID(control)!=0)
+      SendMessageW(control,WM_SETFONT,font,FALSE);
+    return TRUE;
+  },reinterpret_cast<LPARAM>(state.uiFont));
   // Keep DWM enabled for transitions and shadows. The notes subclass blocks
   // native frame activation/painting as well as owning the full client area;
   // a DWM border color alone does not suppress the classic inactive border.
@@ -17226,15 +19673,17 @@ static void ApplyNotesEditorTheme(HWND dialog, ClientNotesDialogState &state) {
   const COLORREF noBorder = 0xfffffffe; // DWMWA_COLOR_NONE
   DwmSetWindowAttribute(dialog, static_cast<DWMWINDOWATTRIBUTE>(34), &noBorder, sizeof(noBorder));
   HWND edit = GetDlgItem(dialog, IDC_CLIENT_NOTES_TEXT);
-  SetWindowTheme(edit, g_bThemeIsDark ? L"DarkMode_Explorer" : L"Explorer", nullptr);
-  SendMessageW(edit, EM_SETBKGNDCOLOR, 0, g_themeColors.crControl);
+  if (edit) {
+    SetWindowTheme(edit, g_bThemeIsDark ? L"DarkMode_Explorer" : L"Explorer", nullptr);
+    SendMessageW(edit, EM_SETBKGNDCOLOR, 0, g_themeColors.crControl);
+  }
   for (const auto &[id,window] : state.editors) {
     SetWindowTheme(window, g_bThemeIsDark ? L"DarkMode_Explorer" : L"Explorer", nullptr);
     SendMessageW(window,EM_SETBKGNDCOLOR,0,g_themeColors.crControl);
   }
   // Character colors are set when loading a page. Reapplying the window
   // theme for DPI changes must not rewrite formatting or add undo records.
-  RedrawWindow(edit, nullptr, nullptr, RDW_INVALIDATE | RDW_ERASE);
+  if (edit) RedrawWindow(edit, nullptr, nullptr, RDW_INVALIDATE | RDW_ERASE);
   if (state.toolbarTooltip) {
     SetWindowTheme(state.toolbarTooltip, L"", L"");
     SendMessageW(state.toolbarTooltip, TTM_SETTIPBKCOLOR, g_themeColors.crTip, 0);
@@ -17242,43 +19691,154 @@ static void ApplyNotesEditorTheme(HWND dialog, ClientNotesDialogState &state) {
   }
 }
 
-static bool DrawNotesToolbarButton(const DRAWITEMSTRUCT &draw,
-                                  const ClientNotesDialogState &state) {
+static bool DrawNotesTicketReferenceCore(const DRAWITEMSTRUCT &draw) {
+  if (draw.CtlType!=ODT_STATIC || draw.CtlID!=IDC_NOTES_TICKET_REFERENCE) return false;
+  PaintNotesChrome(draw.hDC,draw.hwndItem);
+  RECT label=draw.rcItem;InflateRect(&label,-ScaleByDpi(8,GetDpiForWindow(draw.hwndItem)),0);
+  const HGDIOBJ previous=SelectObject(draw.hDC,GetOwnerDrawFont(draw.hwndItem));
+  SetBkMode(draw.hDC,TRANSPARENT);SetTextColor(draw.hDC,g_themeColors.crControlText);
+  wchar_t text[160]{};GetWindowTextW(draw.hwndItem,text,static_cast<int>(std::size(text)));
+  DrawTextW(draw.hDC,text,-1,&label,DT_LEFT|DT_VCENTER|DT_SINGLELINE|DT_NOPREFIX|DT_END_ELLIPSIS);
+  SelectObject(draw.hDC,previous);return true;
+}
+static bool DrawNotesTicketReference(const DRAWITEMSTRUCT &draw) {
+  if(draw.CtlType!=ODT_STATIC || draw.CtlID!=IDC_NOTES_TICKET_REFERENCE) return false;
+  return DrawNotesBufferedItem(draw,DrawNotesTicketReferenceCore);
+}
+
+static bool DrawNotesWorkStatusCore(const DRAWITEMSTRUCT &draw,
+                                const ClientNotesDialogState &state) {
+  if (draw.CtlType!=ODT_STATIC || draw.CtlID!=IDC_NOTES_WORK_STATUS) return false;
+  PaintNotesChrome(draw.hDC,draw.hwndItem);
+  if (!HasActiveNote(state)) return true;
+  const unsigned status=state.pages[state.activePage].status;
+  if (!*NotesWorkStatusLabel(status)) return true;
+  const UINT dpi=GetDpiForWindow(draw.hwndItem);
+  const COLORREF colorsDark[]={0,RGB(113,185,245),RGB(245,193,64),RGB(255,165,92),RGB(115,209,154)};
+  const COLORREF colorsLight[]={0,RGB(37,99,175),RGB(156,99,0),RGB(170,73,24),RGB(23,119,62)};
+  const COLORREF color=(g_bThemeIsDark ? colorsDark : colorsLight)[status];
+  const Gdiplus::REAL scale=static_cast<Gdiplus::REAL>(dpi)/96.0f;
+  const Gdiplus::REAL left=static_cast<Gdiplus::REAL>(draw.rcItem.left);
+  const Gdiplus::REAL top=(draw.rcItem.top+draw.rcItem.bottom)/2.0f-9.0f*scale;
+  {
+    Gdiplus::Graphics graphics(draw.hDC);
+    graphics.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+    Gdiplus::Pen pen(Gdiplus::Color(255,GetRValue(color),GetGValue(color),GetBValue(color)),1.8f*scale);
+    pen.SetStartCap(Gdiplus::LineCapRound);pen.SetEndCap(Gdiplus::LineCapRound);pen.SetLineJoin(Gdiplus::LineJoinRound);
+    const auto line=[&](float x1,float y1,float x2,float y2) {
+      graphics.DrawLine(&pen,left+x1*scale,top+y1*scale,left+x2*scale,top+y2*scale);
+    };
+    if (status==1) {
+      graphics.DrawEllipse(&pen,left+1.5f*scale,top+1.5f*scale,11.0f*scale,11.0f*scale);
+      line(11,11,16.5f,16.5f);
+    } else if (status==3) {
+      line(4,2,4,16);line(4,3,15,3);line(15,3,12,6);line(12,6,15,9);line(15,9,4,9);
+    } else {
+      graphics.DrawEllipse(&pen,left+1.5f*scale,top+1.5f*scale,15.0f*scale,15.0f*scale);
+      if (status==2) {line(9,4.5f,9,9);line(9,9,12.5f,11);}
+      else {line(5,9,8,12);line(8,12,13,6);}
+    }
+  }
+  RECT label=draw.rcItem;label.left+=ScaleByDpi(26,dpi);
+  const HGDIOBJ previous=SelectObject(draw.hDC,GetOwnerDrawFont(draw.hwndItem));
+  SetBkMode(draw.hDC,TRANSPARENT);SetTextColor(draw.hDC,g_themeColors.crControlText);
+  DrawTextW(draw.hDC,NotesWorkStatusLabel(status),-1,&label,DT_LEFT|DT_VCENTER|DT_SINGLELINE|DT_NOPREFIX);
+  SelectObject(draw.hDC,previous);
+  return true;
+}
+static bool DrawNotesWorkStatus(const DRAWITEMSTRUCT &draw,const ClientNotesDialogState &state) {
+  if(draw.CtlType!=ODT_STATIC || draw.CtlID!=IDC_NOTES_WORK_STATUS) return false;
+  return DrawNotesBufferedItem(draw,[&](const DRAWITEMSTRUCT &finished){return DrawNotesWorkStatusCore(finished,state);});
+}
+
+static bool IsNotesToolbarItem(const DRAWITEMSTRUCT &draw) {
+  if(draw.CtlType!=ODT_BUTTON) return false;
+  for(const UINT id:{IDC_NOTES_SWITCH_CLIENT,IDC_NOTES_LIBRARY,IDC_NOTES_TRASH,IDC_NOTES_MORE,IDC_NOTES_HELP,
+      IDC_NOTES_FIND_TOGGLE,IDC_NOTES_SNIPPETS,IDC_NOTES_TEMPLATES,IDC_NOTES_DETAILS,IDC_NOTES_OPEN_TICKET,
+      IDC_NOTES_WORKLOG,IDC_NOTES_FORMAT,IDC_NOTES_ADD_TAB,IDC_NOTES_HIGHLIGHT_COLOR,IDCANCEL})
+    if(draw.CtlID==id) return true;
+  return draw.CtlID>=IDC_NOTES_BOLD && draw.CtlID<=IDC_NOTES_CLEAR;
+}
+static bool DrawNotesToolbarButtonCore(const DRAWITEMSTRUCT &draw,
+                                      const ClientNotesDialogState &state) {
+  const bool clientPicker=draw.CtlID==IDC_NOTES_SWITCH_CLIENT;
+  const bool headerAction=clientPicker || draw.CtlID==IDC_NOTES_LIBRARY || draw.CtlID==IDC_NOTES_TRASH ||
+      draw.CtlID==IDC_NOTES_MORE || draw.CtlID==IDC_NOTES_HELP;
   const bool textAction = draw.CtlID == IDC_NOTES_FIND_TOGGLE || draw.CtlID == IDC_NOTES_SNIPPETS ||
       draw.CtlID == IDC_NOTES_TEMPLATES || draw.CtlID == IDC_NOTES_DETAILS ||
-      draw.CtlID == IDC_NOTES_METADATA || draw.CtlID == IDC_NOTES_OPEN_TICKET || draw.CtlID == IDC_NOTES_WORKLOG;
+      draw.CtlID == IDC_NOTES_OPEN_TICKET || draw.CtlID == IDC_NOTES_WORKLOG || draw.CtlID == IDC_NOTES_FORMAT;
   if (draw.CtlType != ODT_BUTTON ||
       !((draw.CtlID >= IDC_NOTES_BOLD && draw.CtlID <= IDC_NOTES_CLEAR) ||
-        textAction || draw.CtlID == IDC_NOTES_ADD_TAB || draw.CtlID == IDC_NOTES_HIGHLIGHT_COLOR || draw.CtlID == IDCANCEL)) return false;
+        textAction || headerAction || draw.CtlID == IDC_NOTES_ADD_TAB || draw.CtlID == IDC_NOTES_HIGHLIGHT_COLOR || draw.CtlID == IDCANCEL)) return false;
   const UINT dpi = GetDpiForWindow(draw.hwndItem);
   const bool disabled = (draw.itemState & ODS_DISABLED) != 0;
-  const bool active = !disabled && (SendMessageW(draw.hwndItem, BM_GETSTATE, 0, 0) & BST_PUSHED);
-  const bool hot = !disabled && (draw.hwndItem == g_hHotButton || (draw.itemState & ODS_SELECTED));
-  PaintNotesChrome(draw.hDC, draw.hwndItem);
-  if (active || hot || textAction || draw.CtlID == IDC_NOTES_ADD_TAB)
-    DrawNotesSurface(draw.hDC, draw.rcItem,
-        active ? BlendColor(g_themeColors.crWindow, g_themeColors.crAccent, 28) :
-        hot ? g_themeColors.crControlHot : NotesControlColor(),
-        active ? g_themeColors.crAccent : NotesBorder(), dpi);
-  const COLORREF ink = disabled ? BlendColor(g_themeColors.crControlText, g_themeColors.crWindow, 55) :
-                                  g_themeColors.crControlText;
+  const DWORD effect=draw.CtlID==IDC_NOTES_BOLD ? CFE_BOLD : draw.CtlID==IDC_NOTES_ITALIC ? CFE_ITALIC :
+      draw.CtlID==IDC_NOTES_UNDERLINE ? CFE_UNDERLINE : 0;
+  const bool active=!disabled && ((effect && (state.formatEffects & effect)) ||
+      (draw.CtlID==IDC_NOTES_FORMAT && state.formatVisible));
+  const bool hot = !disabled && (draw.hwndItem == g_hHotButton || (draw.itemState & (ODS_SELECTED|ODS_HOTLIGHT)));
+  if (state.formatVisible && IsNotesFormatControl(draw.CtlID)) {
+    SetDCBrushColor(draw.hDC,NotesControlColor());
+    FillRect(draw.hDC,&draw.rcItem,reinterpret_cast<HBRUSH>(GetStockObject(DC_BRUSH)));
+  } else PaintNotesChrome(draw.hDC, draw.hwndItem);
+  const bool ticketLink=draw.CtlID==IDC_NOTES_OPEN_TICKET;
+  const bool newNote=draw.CtlID==IDC_NOTES_ADD_TAB;
+  const bool utility=textAction && !ticketLink && draw.CtlID!=IDC_NOTES_DETAILS;
+  if (active || hot || (textAction && !ticketLink) || headerAction || newNote) {
+    // Named palettes can give the resting button and crControlHot the same
+    // colour. Derive filled-button hover from its actual face so it is visible.
+    COLORREF fill=active ? BlendColor(g_themeColors.crWindow, g_themeColors.crAccent, 28) :
+        hot ? (headerAction || draw.CtlID==IDC_NOTES_DETAILS ?
+            TintColor(NotesControlColor(),g_bThemeIsDark ? 8 : -8) : g_themeColors.crControlHot) : newNote ? NotesWindowColor() :
+        utility ? BlendColor(g_themeColors.crWindow,g_themeColors.crControl,g_bThemeIsDark ? 18 : 30) : NotesControlColor();
+    COLORREF border=active || newNote || hot ? g_themeColors.crAccent :
+        utility ? BlendColor(g_themeColors.crControlBorder,g_themeColors.crWindow,42) : g_themeColors.crControlBorder;
+    if (disabled) {fill=BlendColor(fill,g_themeColors.crWindow,50);border=BlendColor(border,g_themeColors.crWindow,50);}
+    else if (draw.itemState&ODS_SELECTED) fill=TintColor(fill,-12);
+    DrawNotesSurface(draw.hDC,draw.rcItem,fill,border,dpi);
+  }
+  const COLORREF buttonInk=ticketLink ? g_themeColors.crControlText : g_themeColors.crButtonText;
+  const COLORREF ink = disabled ? BlendColor(buttonInk,g_themeColors.crWindowText,60) : buttonInk;
   RECT icon = draw.rcItem;
-  if (textAction) {
+  if (clientPicker) {
+    const int iconSize=ScaleByDpi(18,dpi);const int middle=(draw.rcItem.top+draw.rcItem.bottom)/2;
+    if (state.clientIcon) DrawIconEx(draw.hDC,draw.rcItem.left+ScaleByDpi(12,dpi),middle-iconSize/2,state.clientIcon,iconSize,iconSize,0,nullptr,DI_NORMAL);
+    RECT label=draw.rcItem;label.left+=ScaleByDpi(38,dpi);label.right-=ScaleByDpi(36,dpi);
+    const HGDIOBJ previous=SelectObject(draw.hDC,GetOwnerDrawFont(draw.hwndItem));
+    SetBkMode(draw.hDC,TRANSPARENT);SetTextColor(draw.hDC,ink);
+    wchar_t name[128]{};GetWindowTextW(draw.hwndItem,name,static_cast<int>(std::size(name)));
+    DrawTextW(draw.hDC,name,-1,&label,DT_LEFT|DT_VCENTER|DT_SINGLELINE|DT_NOPREFIX|DT_END_ELLIPSIS);SelectObject(draw.hDC,previous);
+    RECT arrow=draw.rcItem;arrow.left=arrow.right-ScaleByDpi(32,dpi);DrawModernComboChevron(draw.hDC,arrow,ink,dpi);
+  } else if (textAction || headerAction) {
     const HFONT font=GetOwnerDrawFont(draw.hwndItem);
     const HGDIOBJ previous=SelectObject(draw.hDC,font);
-    RECT label=draw.rcItem;InflateRect(&label,-ScaleByDpi(8,dpi),0);
+    RECT label=draw.rcItem;InflateRect(&label,-ScaleByDpi(notes_editor_ui::HasActionIcon(draw.CtlID) ? 4 : 8,dpi),0);
     SetBkMode(draw.hDC,TRANSPARENT);SetTextColor(draw.hDC,ink);
     wchar_t text[128]{};GetWindowTextW(draw.hwndItem,text,static_cast<int>(std::size(text)));
-    DrawTextW(draw.hDC,text,-1,&label,DT_CENTER|DT_VCENTER|DT_SINGLELINE|DT_NOPREFIX|DT_END_ELLIPSIS);
+    if (notes_editor_ui::HasActionIcon(draw.CtlID)) {
+      SIZE extent{};GetTextExtentPoint32W(draw.hDC,text,static_cast<int>(wcslen(text)),&extent);
+      const int iconSize=ScaleByDpi(14,dpi),gap=ScaleByDpi(3,dpi);
+      const int groupWidth=(std::min)(label.right-label.left,extent.cx+iconSize+gap);
+      const int left=label.left+(label.right-label.left-groupWidth)/2;
+      const int middle=(label.top+label.bottom)/2;
+      RECT glyph{left,middle-iconSize/2,left+iconSize,middle-iconSize/2+iconSize};
+      notes_editor_ui::DrawActionIcon(draw.hDC,glyph,draw.CtlID,hot && !disabled ? g_themeColors.crAccent : ink);
+      label.left=left+iconSize+gap;
+    }
+    DrawTextW(draw.hDC,text,-1,&label,(ticketLink || notes_editor_ui::HasActionIcon(draw.CtlID) ? DT_LEFT : DT_CENTER)|DT_VCENTER|DT_SINGLELINE|DT_NOPREFIX|DT_END_ELLIPSIS);
     SelectObject(draw.hDC,previous);
   } else if (draw.CtlID == IDC_NOTES_HIGHLIGHT_COLOR)
     DrawModernComboChevron(draw.hDC, icon, ink, dpi);
   else
-    notes_editor_ui::DrawIcon(draw.hDC, icon, draw.CtlID, ink, state.highlightColor);
+    notes_editor_ui::DrawIcon(draw.hDC, icon, draw.CtlID,newNote && !disabled ? g_themeColors.crAccent : ink,state.highlightColor);
   if ((draw.itemState & (ODS_FOCUS | ODS_NOFOCUSRECT)) == ODS_FOCUS) {
     RECT focus = draw.rcItem; InflateRect(&focus, -3, -3); DrawFocusRect(draw.hDC, &focus);
   }
   return true;
+}
+static bool DrawNotesToolbarButton(const DRAWITEMSTRUCT &draw,const ClientNotesDialogState &state) {
+  if(!IsNotesToolbarItem(draw)) return false;
+  return DrawNotesBufferedItem(draw,[&](const DRAWITEMSTRUCT &finished){return DrawNotesToolbarButtonCore(finished,state);});
 }
 
 static LRESULT CALLBACK NotesComboSubclass(HWND combo, UINT message,
@@ -17287,9 +19847,12 @@ static LRESULT CALLBACK NotesComboSubclass(HWND combo, UINT message,
   if (message == WM_ERASEBKGND) return 1;
   if (message == WM_PAINT || message == WM_PRINTCLIENT) {
     PAINTSTRUCT paint{};
-    HDC dc = message == WM_PAINT ? BeginPaint(combo, &paint) : reinterpret_cast<HDC>(wParam);
+    HDC target = message == WM_PAINT ? BeginPaint(combo, &paint) : reinterpret_cast<HDC>(wParam);
     RECT rect{}; GetClientRect(combo, &rect);
-    PaintNotesChrome(dc, combo);
+    {
+    NotesPaintBuffer buffer(target,rect);HDC dc=buffer.dc();
+    SetDCBrushColor(dc,NotesControlColor());
+    FillRect(dc,&rect,reinterpret_cast<HBRUSH>(GetStockObject(DC_BRUSH)));
     const UINT dpi = GetDpiForWindow(combo);
     const bool focused = GetFocus() == combo;
     DrawNotesSurface(dc, rect, NotesControlColor(),
@@ -17302,6 +19865,7 @@ static LRESULT CALLBACK NotesComboSubclass(HWND combo, UINT message,
     RECT arrow{rect.right - ScaleByDpi(28, dpi), rect.top, rect.right - ScaleByDpi(8, dpi), rect.bottom};
     DrawModernComboChevron(dc, arrow, g_themeColors.crControlText, dpi);
     SelectObject(dc, oldFont);
+    }
     if (message == WM_PAINT) EndPaint(combo, &paint);
     return 0;
   }
@@ -17313,14 +19877,17 @@ static LRESULT CALLBACK NotesComboSubclass(HWND combo, UINT message,
   return DefSubclassProc(combo, message, wParam, lParam);
 }
 
-static bool DrawNotesComboItem(const DRAWITEMSTRUCT &draw) {
-  if (draw.CtlType != ODT_COMBOBOX ||
-      (draw.CtlID != IDC_NOTES_STYLE && draw.CtlID != IDC_NOTES_SIZE && draw.CtlID != IDC_NOTES_FILTER && draw.CtlID != IDC_NOTES_SCOPE && draw.CtlID != IDC_NOTES_CLIENT_PICKER && draw.CtlID != IDC_NOTES_TOUR_TOPICS && draw.CtlID != IDC_NOTES_SORT && draw.CtlID != IDC_NOTES_STATUS_FILTER && draw.CtlID != IDC_NOTES_STATUS_PICK && draw.CtlID != IDC_NOTES_CODE_LANGUAGE)) return false;
+static bool IsNotesComboItem(const DRAWITEMSTRUCT &draw) {
+  return draw.CtlType==ODT_COMBOBOX &&
+      (draw.CtlID==IDC_NOTES_STYLE || draw.CtlID==IDC_NOTES_SIZE || draw.CtlID==IDC_NOTES_FILTER || draw.CtlID==IDC_NOTES_SCOPE || draw.CtlID==IDC_NOTES_CLIENT_PICKER || draw.CtlID==IDC_NOTES_TOUR_TOPICS || draw.CtlID==IDC_NOTES_SORT || draw.CtlID==IDC_NOTES_STATUS_FILTER || draw.CtlID==IDC_NOTES_STATUS_PICK || draw.CtlID==IDC_NOTES_LINK_BROWSER_PICK || draw.CtlID==IDC_NOTES_CODE_LANGUAGE || draw.CtlID==IDC_NOTES_SPELL_LANGUAGE || draw.CtlID==IDC_NOTES_SPELL_SUGGESTIONS);
+}
+static bool DrawNotesComboItemCore(const DRAWITEMSTRUCT &draw) {
+  if (!IsNotesComboItem(draw)) return false;
   const bool selected = (draw.itemState & ODS_SELECTED) != 0;
   HBRUSH background = CreateSolidBrush(selected ? g_themeColors.crAccent : g_themeColors.crControl);
   FillRect(draw.hDC, &draw.rcItem, background); DeleteObject(background);
   if (draw.itemID != static_cast<UINT>(-1)) {
-    wchar_t text[128]{};
+    wchar_t text[2049]{};
     const LRESULT length = SendMessageW(draw.hwndItem, CB_GETLBTEXTLEN, draw.itemID, 0);
     if (length >= 0 && length < static_cast<LRESULT>(std::size(text))) {
       SendMessageW(draw.hwndItem, CB_GETLBTEXT, draw.itemID, reinterpret_cast<LPARAM>(text));
@@ -17334,6 +19901,10 @@ static bool DrawNotesComboItem(const DRAWITEMSTRUCT &draw) {
   }
   return true;
 }
+static bool DrawNotesComboItem(const DRAWITEMSTRUCT &draw) {
+  if(!IsNotesComboItem(draw)) return false;
+  return DrawNotesBufferedItem(draw,DrawNotesComboItemCore);
+}
 
 static void ApplyNotesTextColors(HWND edit) {
   IUnknown *ole = nullptr;
@@ -17344,9 +19915,10 @@ static void ApplyNotesTextColors(HWND edit) {
     ole->Release();
   }
   if (!document) return;
-  const LONG length = GetWindowTextLengthW(edit);
   ITextRange *range = nullptr;
   if (SUCCEEDED(document->Range(0, 0, &range))) {
+    LONG story=0;range->GetStoryLength(&story);
+    const LONG length=(std::max)(0L,story-1);
     LONG first = 0;
     while (first < length) {
       range->SetRange(first, first);
@@ -17357,13 +19929,19 @@ static void ApplyNotesTextColors(HWND edit) {
       if (SUCCEEDED(range->GetFont(&font))) {
         LONG background = tomAutoColor;
         font->GetBackColor(&background);
-        // Highlight and checked-marker ink must retain their own contrast.
+        // Highlighted links use a readable blue that also preserves their
+        // saved link marker when underline styling has been removed.
+        if(background!=tomAutoColor && NotesRangeLinkEffects(edit,{first,end}))
+          font->SetForeColor(RGB(0,91,158));
+        // Ordinary highlight and checked-marker ink retain their contrast.
         if (background == tomAutoColor) {
           LONG strike = tomFalse;
           font->GetStrikeThrough(&strike);
           COLORREF foreground = strike == tomTrue ?
               BlendColor(g_themeColors.crControlText, g_themeColors.crControl, 30) : g_themeColors.crControlText;
-          if (end - first <= 2048) {
+          if (NotesRangeLinkEffects(edit,{first,end}))
+            foreground = g_bThemeIsDark ? RGB(138, 205, 235) : RGB(0, 91, 158);
+          else if (end - first <= 2048) {
             BSTR text = nullptr;
             if (SUCCEEDED(range->GetText(&text)) && text) {
               if (ValidNotesUrl(std::wstring_view(text, SysStringLen(text))))
@@ -17401,16 +19979,43 @@ static void RefreshNotesForTheme() {
   }
   state->loading=false;
   UpdateNotesToolbar(g_hNotesWindow,*state);
+  LayoutClientNotes(g_hNotesWindow,GetDpiForWindow(g_hNotesWindow));
   RedrawWindow(g_hNotesWindow,nullptr,nullptr,RDW_INVALIDATE|RDW_ERASE|RDW_ALLCHILDREN);
 }
 
+static constexpr size_t kNotesEditorCacheLimit=16;
+static void NotesTrimEditors(ClientNotesDialogState &state) {
+  for (auto it=state.editors.begin();it!=state.editors.end();) {
+    const auto page=std::find_if(state.pages.begin(),state.pages.end(),[&](const auto &p){return p.id==it->first;});
+    if (it->second!=state.attachedEditor && (page==state.pages.end() || !page->open || page->archived || page->deleted)) {
+      DestroyWindow(it->second);state.editorUse.erase(it->first);state.editorViews.erase(it->first);state.editorLinks.erase(it->first);it=state.editors.erase(it);
+    } else ++it;
+  }
+  while (state.editors.size()>kNotesEditorCacheLimit) {
+    auto oldest=state.editors.end();
+    for (auto it=state.editors.begin();it!=state.editors.end();++it) {
+      if (it->second==state.attachedEditor || SendMessageW(it->second,EM_GETMODIFY,0,0)) continue;
+      if (oldest==state.editors.end() || state.editorUse[it->first]<state.editorUse[oldest->first]) oldest=it;
+    }
+    if (oldest==state.editors.end()) break;
+    ClientNotesDialogState::EditorView view;
+    NotesSelection(oldest->second,view.selection);SendMessageW(oldest->second,EM_GETSCROLLPOS,0,reinterpret_cast<LPARAM>(&view.scroll));
+    state.editorViews[oldest->first]=view;state.editorUse.erase(oldest->first);
+    state.editorLinks.erase(oldest->first);
+    DestroyWindow(oldest->second);state.editors.erase(oldest);
+  }
+}
+
 static bool LoadNotesPage(HWND dialog, ClientNotesDialogState &state) {
+  if (state.pendingTransactionRecovery) return false;
+  HideNotesFormat(dialog,state);
   // Keep the previous document on screen until the replacement is formatted
   // and positioned. Showing a 100x100 editor before streaming its text exposes
   // intermediate frames during add/delete and tab changes.
   const HWND previousEditor=state.attachedEditor;
+  const uint64_t previousId=state.attachedPageId;
   if (previousEditor) SetWindowLongPtrW(previousEditor,GWLP_ID,0);
-  state.attachedEditor=nullptr;
+  state.attachedEditor=nullptr;state.attachedPageId=0;
   const bool retirePrevious=previousEditor && std::none_of(state.editors.begin(),state.editors.end(),
       [&](const auto &entry){return entry.second==previousEditor;});
   auto reveal=[&](HWND next) {
@@ -17422,6 +20027,7 @@ static bool LoadNotesPage(HWND dialog, ClientNotesDialogState &state) {
     if (swap) EndDeferWindowPos(swap);
     else { if (next) ShowWindow(next,SW_SHOW); if (previousEditor && previousEditor!=next) ShowWindow(previousEditor,SW_HIDE); }
     if (retirePrevious) DestroyWindow(previousEditor);
+    NotesTrimEditors(state);
     // Invalidate after the final visibility swap so the document outline is
     // painted against the new child clipping region, never an intermediate one.
     if (next) InvalidateRect(next,nullptr,TRUE);
@@ -17430,36 +20036,55 @@ static bool LoadNotesPage(HWND dialog, ClientNotesDialogState &state) {
   if (!HasActiveNote(state)) {
     // The resource editor exists before any page has attached to it.
     if (!previousEditor) ShowWindow(GetDlgItem(dialog,IDC_CLIENT_NOTES_TEXT),SW_HIDE);
+    state.editorLoadFailed=false;
+    SetDlgItemTextW(dialog,IDC_NOTES_EMPTY,L"No notes are open. Choose + to start writing, or All notes to reopen a saved note.");
     ShowWindow(GetDlgItem(dialog, IDC_NOTES_EMPTY), SW_SHOW);
-    reveal(nullptr); UpdateNotesToolbar(dialog, state); return true;
+    reveal(nullptr); UpdateNotesToolbar(dialog, state);SetNotesStatus(dialog,state);return true;
   }
   ShowWindow(GetDlgItem(dialog, IDC_NOTES_EMPTY), SW_HIDE);
   const auto id = state.pages[state.activePage].id;
   auto found = state.editors.find(id);
   if (found != state.editors.end()) {
     state.attachedEditor = found->second;
+    state.attachedPageId=id;state.editorUse[id]=++state.editorUseCounter;
     SetWindowLongPtrW(found->second, GWLP_ID, IDC_CLIENT_NOTES_TEXT);
     LayoutClientNotes(dialog, GetDpiForWindow(dialog));
     reveal(found->second);
-    UpdateNotesToolbar(dialog, state); SetFocus(found->second); return true;
+    state.editorLoadFailed=false;UpdateNotesToolbar(dialog, state);SetNotesStatus(dialog,state);SetFocus(found->second);return true;
   }
   HWND edit = GetDlgItem(dialog, IDC_CLIENT_NOTES_TEXT);
   if (!edit) edit = CreateWindowExW(0, L"RICHEDIT50W", L"",
       WS_CHILD | WS_TABSTOP | WS_VSCROLL | ES_MULTILINE | ES_AUTOVSCROLL | ES_WANTRETURN,
       0,0,100,100,dialog,reinterpret_cast<HMENU>(IDC_CLIENT_NOTES_TEXT),g_hInst,nullptr);
   auto restorePrevious=[&] {
-    if (state.attachedEditor) {state.editors.erase(id);DestroyWindow(state.attachedEditor);}
-    state.attachedEditor=previousEditor;
-    if (previousEditor) SetWindowLongPtrW(previousEditor,GWLP_ID,IDC_CLIENT_NOTES_TEXT);
+    if (state.attachedEditor) {state.editors.erase(id);state.editorLinks.erase(id);state.editorUse.erase(id);DestroyWindow(state.attachedEditor);}
+    state.activePage=state.pages.size();
+    for (size_t i=0;i<state.pages.size();++i) if (state.pages[i].id==previousId && state.pages[i].open && !state.pages[i].archived && !state.pages[i].deleted) {state.activePage=i;break;}
+    state.attachedEditor=HasActiveNote(state) ? previousEditor : nullptr;
+    state.attachedPageId=state.attachedEditor ? previousId : 0;
+    if (state.attachedEditor) SetWindowLongPtrW(previousEditor,GWLP_ID,IDC_CLIENT_NOTES_TEXT);
+    else if (previousEditor) {
+      ShowWindow(previousEditor,SW_HIDE);
+      // A client switch temporarily carries another notebook's editor with
+      // no local identity. Its owner restores it if this load fails.
+      if (retirePrevious && previousId) DestroyWindow(previousEditor);
+    }
     state.loading=false;
+    state.editorLoadFailed=true;
+    if (!HasActiveNote(state)) SetDlgItemTextW(dialog,IDC_NOTES_EMPTY,L"This note could not be opened. Its saved content is kept. Select its tab to retry.");
+    ShowWindow(GetDlgItem(dialog,IDC_NOTES_EMPTY),HasActiveNote(state) ? SW_HIDE : SW_SHOW);
+    UpdateNotesToolbar(dialog,state);SetNotesStatus(dialog,state);
   };
   if (!edit) {restorePrevious();return false;}
-  state.attachedEditor = edit; state.editors[id] = edit;
+  state.attachedEditor = edit; state.attachedPageId=id;state.editors[id] = edit;
+  state.editorUse[id]=++state.editorUseCounter;
+  SetWindowLongPtrW(edit,GWL_STYLE,GetWindowLongPtrW(edit,GWL_STYLE)|WS_CLIPSIBLINGS);
   SetWindowTheme(edit, g_bThemeIsDark ? L"DarkMode_Explorer" : L"Explorer", nullptr);
   ShowWindow(edit, SW_HIDE);
   SetWindowSubclass(edit, NotesEditSubclass, 1, 0);
   SendMessageW(edit, EM_SETOLECALLBACK, 0, reinterpret_cast<LPARAM>(&g_notesOleCallback));
   SendMessageW(edit, EM_EXLIMITTEXT, 0, client_notes::kMaxRichBytes);
+  SendMessageW(edit, EM_SETUNDOLIMIT, 256, 0);
   SendMessageW(edit, EM_SETEVENTMASK, 0, ENM_CHANGE | ENM_SELCHANGE | ENM_LINK);
   SendMessageW(edit, EM_AUTOURLDETECT, AURL_ENABLEURL, 0);
   SendMessageW(edit, EM_SETBKGNDCOLOR, 0, g_themeColors.crControl);
@@ -17469,7 +20094,7 @@ static bool LoadNotesPage(HWND dialog, ClientNotesDialogState &state) {
   SetWindowTextW(edit, L"");
   CHARFORMAT2W normal{};
   normal.cbSize = sizeof(normal);
-  normal.dwMask = CFM_BOLD | CFM_ITALIC | CFM_UNDERLINE | CFM_STRIKEOUT | CFM_LINK |
+  normal.dwMask = CFM_BOLD | CFM_ITALIC | CFM_UNDERLINE | CFM_STRIKEOUT | CFM_LINK | CFM_LINKPROTECTED |
                   CFM_SIZE | CFM_COLOR | CFM_BACKCOLOR | CFM_FACE;
   normal.dwEffects = CFE_AUTOBACKCOLOR;
   normal.crTextColor = g_themeColors.crControlText;
@@ -17502,8 +20127,9 @@ static bool LoadNotesPage(HWND dialog, ClientNotesDialogState &state) {
   }
 
   const bool upgradedSpacing=ok && page.rich && page.rtf.find("\\sa80")!=std::string::npos && NotesUpgradeDefaultSpacing(edit);
-  ApplyNotesTextColors(edit);
   std::string normalized;
+  if (ok) ok=NotesRestoreMappedLinks(edit,state,page);
+  if (ok) ApplyNotesTextColors(edit);
   ok = ok && StreamClientNotesOut(edit, normalized);
   if (!ok) {restorePrevious();return false;}
   if (ok) {
@@ -17524,11 +20150,16 @@ static bool LoadNotesPage(HWND dialog, ClientNotesDialogState &state) {
     state.formattingChanged = false;
   }
   CHARRANGE caret{static_cast<LONG>(page.cursor), static_cast<LONG>(page.cursor)};
+  const auto remembered=state.editorViews.find(id);
+  if (remembered!=state.editorViews.end()) caret=remembered->second.selection;
   SendMessageW(edit, EM_EXSETSEL, 0, reinterpret_cast<LPARAM>(&caret));
   SendMessageW(edit, EM_SETZOOM, page.zoom, 100);
+  NotesApplyWordWrap(edit,state.wordWrap);
   POINT scroll{0,static_cast<LONG>(page.scroll)};
+  if (remembered!=state.editorViews.end()) scroll=remembered->second.scroll;
   SendMessageW(edit, EM_SETSCROLLPOS, 0, reinterpret_cast<LPARAM>(&scroll));
   state.loading = false;
+  state.editorLoadFailed=false;
   if (upgradedSpacing) SetTimer(dialog,1,750,nullptr);
   LayoutClientNotes(dialog, GetDpiForWindow(dialog));
   reveal(edit);
@@ -17560,6 +20191,14 @@ static bool NotesReorderTab(HWND dialog,ClientNotesDialogState &state,int from,i
   RefreshNotesTabs(dialog,state);
   return SaveClientNotesDraft(dialog,state,true);
 }
+static bool NotesCanRenameTabAt(HWND tabs,const ClientNotesDialogState &state,POINT point) {
+  if (!HasActiveNote(state)) return false;
+  TCHITTESTINFO hit{point,0};const int index=TabCtrl_HitTest(tabs,&hit);
+  if (index<0 || index!=TabCtrl_GetCurSel(tabs) || static_cast<size_t>(index)>=state.visiblePages.size() ||
+      state.visiblePages[index]!=state.activePage) return false;
+  RECT bounds{};
+  return TabCtrl_GetItemRect(tabs,index,&bounds) && point.x<bounds.right-ScaleByDpi(25,GetDpiForWindow(tabs));
+}
 static LRESULT CALLBACK NotesTabsSubclass(HWND tabs, UINT message,
     WPARAM wParam, LPARAM lParam, UINT_PTR id, DWORD_PTR) {
   HWND dialog=GetParent(tabs);
@@ -17572,7 +20211,8 @@ static LRESULT CALLBACK NotesTabsSubclass(HWND tabs, UINT message,
       RECT rect{}; TabCtrl_GetItemRect(tabs,tab,&rect);
       if (hit.pt.x>=rect.right-ScaleByDpi(25,GetDpiForWindow(tabs))) {
         if (!SaveClientNotesDraft(dialog,*workspace,true)) return 0;
-        workspace->activePage=workspace->visiblePages[tab]; LoadNotesPage(dialog,*workspace);
+        workspace->activePage=workspace->visiblePages[tab];
+        if (!LoadNotesPage(dialog,*workspace)) {RefreshNotesTabs(dialog,*workspace);return 0;}
         NotesWorkspaceCommand(dialog,*workspace,IDC_NOTES_CLOSE_TAB); workspace->dragTab=-1; return 0;
       }
       // Let the native control select first, then own the complete drag gesture.
@@ -17620,12 +20260,15 @@ static LRESULT CALLBACK NotesTabsSubclass(HWND tabs, UINT message,
     if (!SaveClientNotesDraft(dialog,*workspace,true)) return 0;
     int selected=TabCtrl_GetCurSel(tabs)+(GET_WHEEL_DELTA_WPARAM(wParam)<0 ? 1 : -1);
     selected=std::clamp(selected,0,static_cast<int>(workspace->visiblePages.size())-1);
-    workspace->activePage=workspace->visiblePages[selected]; RefreshNotesTabs(dialog,*workspace); LoadNotesPage(dialog,*workspace); return 0;
+    workspace->activePage=workspace->visiblePages[selected];
+    if (!LoadNotesPage(dialog,*workspace)) MessageBoxW(dialog,L"This note's editor could not be opened. Its saved content has been kept.",L"Client Notes",MB_OK|MB_ICONWARNING);
+    RefreshNotesTabs(dialog,*workspace);return 0;
   }
   if (message == WM_NCDESTROY)
     RemoveWindowSubclass(tabs, NotesTabsSubclass, id);
   if (message == WM_LBUTTONDBLCLK) {
-    PostMessageW(GetParent(tabs), WM_COMMAND, IDC_NOTES_RENAME_TAB, 0);
+    if (workspace && NotesCanRenameTabAt(tabs,*workspace,{GET_X_LPARAM(lParam),GET_Y_LPARAM(lParam)}))
+      PostMessageW(dialog, WM_COMMAND, IDC_NOTES_RENAME_TAB, 0);
     return 0;
   }
   if (message == WM_CONTEXTMENU) {
@@ -17749,25 +20392,53 @@ static LRESULT CALLBACK NotesTabsSubclass(HWND tabs, UINT message,
 
 static void RefreshNotesTabs(HWND dialog, ClientNotesDialogState &state) {
   HWND tabs = GetDlgItem(dialog, IDC_NOTES_TABS);
+  // Native tab tooltip tools are indexed by position. Close the current tip
+  // before a close, rename or reorder can give its cached index a new note.
+  if (HWND tooltip=TabCtrl_GetToolTips(tabs)) SendMessageW(tooltip,TTM_POP,0,0);
+  state.tabTooltip.clear();
+  std::vector<uint64_t> existing;
+  for (int i=0;i<TabCtrl_GetItemCount(tabs);++i) {
+    TCITEMW item{};item.mask=TCIF_PARAM;TabCtrl_GetItem(tabs,i,&item);
+    existing.push_back(static_cast<uint64_t>(item.lParam));
+  }
+  std::vector<size_t> visiblePages;
+  for (bool pinned : {true, false}) for (size_t i=0;i<state.pages.size();++i) {
+    const auto &page=state.pages[i];
+    if (page.open && !page.archived && !page.deleted && page.pinned==pinned) visiblePages.push_back(i);
+  }
+  // Preserve the unchanged ends of the native strip. Rebuilding it resets its
+  // scroll position and overflow child, even when only one tab was added.
+  size_t prefix=0,suffix=0;
+  while (prefix<existing.size() && prefix<visiblePages.size() &&
+      existing[prefix]==state.pages[visiblePages[prefix]].id) ++prefix;
+  while (suffix<existing.size()-prefix && suffix<visiblePages.size()-prefix &&
+      existing[existing.size()-suffix-1]==state.pages[visiblePages[visiblePages.size()-suffix-1]].id) ++suffix;
   const bool visible=(GetWindowLongPtrW(tabs,GWL_STYLE)&WS_VISIBLE)!=0;
   if (visible) SendMessageW(tabs,WM_SETREDRAW,FALSE,0);
-  TabCtrl_DeleteAllItems(tabs);state.visiblePages.clear();
-  for (bool pinned : {true, false}) for (size_t i = 0; i < state.pages.size(); ++i) {
-    const auto &p = state.pages[i];
-    if (!p.open || p.archived || p.deleted || p.pinned != pinned) continue;
+  for (size_t i=prefix;i<existing.size()-suffix;++i) TabCtrl_DeleteItem(tabs,static_cast<int>(prefix));
+  state.visiblePages=std::move(visiblePages);
+  for (size_t i=prefix;i<state.visiblePages.size()-suffix;++i) {
+    const auto &p=state.pages[state.visiblePages[i]];
     TCITEMW item{}; item.mask = TCIF_TEXT|TCIF_PARAM;
     item.pszText = const_cast<wchar_t *>(p.name.c_str());
     item.lParam=static_cast<LPARAM>(p.id);
-    TabCtrl_InsertItem(tabs,static_cast<int>(state.visiblePages.size()),&item);
-    state.visiblePages.push_back(i);
+    TabCtrl_InsertItem(tabs,static_cast<int>(i),&item);
+  }
+  for (size_t i=0;i<state.visiblePages.size();++i) {
+    wchar_t label[65]{};TCITEMW item{};item.mask=TCIF_TEXT;item.pszText=label;item.cchTextMax=static_cast<int>(std::size(label));
+    TabCtrl_GetItem(tabs,static_cast<int>(i),&item);
+    const auto &name=state.pages[state.visiblePages[i]].name;
+    if (name!=label) {item.pszText=const_cast<wchar_t *>(name.c_str());TabCtrl_SetItem(tabs,static_cast<int>(i),&item);}
   }
   int selection = -1;
   for (size_t i = 0; i < state.visiblePages.size(); ++i)
     if (state.visiblePages[i] == state.activePage) selection = static_cast<int>(i);
-  if (visible) SendMessageW(tabs,WM_SETREDRAW,TRUE,0);
-  TabCtrl_SetCurSel(tabs,selection);
   EnableWindow(GetDlgItem(dialog, IDC_NOTES_ADD_TAB),state.pages.size() < client_notes::kMaxPages);
   LayoutClientNotes(dialog,GetDpiForWindow(dialog));
+  if (visible) SendMessageW(tabs,WM_SETREDRAW,TRUE,0);
+  // Select against the final row width and only when it changes. An unchanged
+  // selection must not pull a manually scrolled row back to the active tab.
+  if (TabCtrl_GetCurSel(tabs)!=selection) TabCtrl_SetCurSel(tabs,selection);
   InvalidateRect(tabs,nullptr,FALSE);
 }
 
@@ -17821,8 +20492,15 @@ static INT_PTR CALLBACK NotesTabNameDlgProc(HWND dialog, UINT message,
 
 static void NotesCharacterFormat(HWND dialog, ClientNotesDialogState &state,
                                  DWORD mask, DWORD effect, COLORREF color,
-                                 LONG height) {
+                                 LONG height,bool collectLinkEdit) {
   HWND edit = GetDlgItem(dialog, IDC_CLIENT_NOTES_TEXT);
+  IUnknown *ole=nullptr;ITextDocument *collection=nullptr;
+  if ((mask&CFM_LINKPROTECTED) && collectLinkEdit) {
+    SendMessageW(edit,EM_GETOLEINTERFACE,0,reinterpret_cast<LPARAM>(&ole));
+    if (ole) {ole->QueryInterface(__uuidof(ITextDocument),reinterpret_cast<void **>(&collection));ole->Release();}
+    SendMessageW(edit,EM_STOPGROUPTYPING,0,0);if(collection) collection->BeginEditCollection();
+  }
+  if((mask&CFM_LINKPROTECTED) && !(effect&CFE_LINK)) {CHARRANGE selected{};NotesSelection(edit,selected);NotesTouchRangeCookies(edit,state,selected);}
   CHARFORMAT2W format{};
   format.cbSize = sizeof(format);
   format.dwMask = mask;
@@ -17833,6 +20511,15 @@ static void NotesCharacterFormat(HWND dialog, ClientNotesDialogState &state,
   if (mask & CFM_FACE) wcscpy_s(format.szFaceName, L"Segoe UI");
   SendMessageW(edit, EM_SETCHARFORMAT, SCF_SELECTION,
                reinterpret_cast<LPARAM>(&format));
+  if (mask&CFM_LINKPROTECTED) {
+    CHARRANGE selection{};NotesSelection(edit,selection);LONG effects=effect&(CFE_LINK|CFE_LINKPROTECTED);
+    if(!(effect&CFE_LINK)) {
+      LONG cookie=0;
+      NotesRangeLinkEffects(edit,selection,nullptr,&cookie,true);
+    }
+    NotesRangeLinkEffects(edit,selection,&effects);
+  }
+  if(collection) {collection->EndEditCollection();collection->Release();}
   MarkNotesChanged(dialog, state);
   UpdateNotesToolbar(dialog, state);
   SetFocus(edit);
@@ -17862,12 +20549,15 @@ static INT_PTR CALLBACK ClientNotesDlgProc(HWND dialog, UINT message,
     SetWindowLongPtrW(dialog, DWLP_USER, lParam);
     if (!state)
       return FALSE;
+    state->wordWrap=GetPrivateProfileIntW(L"notes_editor",L"word_wrap",1,g_sConfigPath.c_str())!=0;
+    NotesFindInitialize(dialog,*state);
     const std::wstring title = L"Client Notes: " + state->clientName;
     SetWindowTextW(dialog, title.c_str());
-    SetDlgItemTextW(dialog, IDC_NOTES_CLIENT_HEADING, L"Notes");
     SetDlgItemTextW(dialog, IDC_NOTES_MORE, L"More \u2026");
     SetDlgItemTextW(dialog, IDC_NOTES_CONTEXT, L"");
     SetDlgItemTextW(dialog, IDCANCEL, L"Close notes");
+    SendDlgItemMessageW(dialog, IDC_NOTES_FIND, EM_SETCUEBANNER, TRUE,
+                       reinterpret_cast<LPARAM>(L"Find in note"));
     SetDialogDpiChangeBehavior(dialog, DDC_DISABLE_ALL, DDC_DISABLE_ALL);
     SetWindowSubclass(dialog, NotesWindowSubclass, 1, 0);
     SetWindowLongPtrW(dialog, GWL_STYLE, (GetWindowLongPtrW(dialog, GWL_STYLE) & ~(WS_CAPTION | DS_MODALFRAME)) | WS_CLIPCHILDREN);
@@ -17904,12 +20594,17 @@ static INT_PTR CALLBACK ClientNotesDlgProc(HWND dialog, UINT message,
       SetWindowSubclass(GetDlgItem(dialog, comboId), NotesComboSubclass, 1, 0);
       SetWindowTheme(GetDlgItem(dialog, comboId), L"", L"");
     }
+    for (int id=IDC_NOTES_STYLE;id<=IDC_NOTES_CLEAR;++id)
+      SetWindowSubclass(GetDlgItem(dialog,id),NotesFormatControlSubclass,2,0);
+    SetWindowSubclass(GetDlgItem(dialog,IDC_NOTES_HIGHLIGHT_COLOR),NotesFormatControlSubclass,2,0);
+    HideNotesFormat(dialog,*state,false);
     state->loading = true;
     state->loading = false;
     ApplyNotesEditorTheme(dialog, *state);
     HWND tabs = GetDlgItem(dialog, IDC_NOTES_TABS);
     SetWindowLongPtrW(tabs, GWL_STYLE, GetWindowLongPtrW(tabs, GWL_STYLE) | WS_CLIPCHILDREN);
     SetWindowSubclass(tabs, NotesTabsSubclass, 1, 0);
+    SetWindowSubclass(GetDlgItem(dialog,IDC_NOTES_OPEN_TICKET),NotesTicketContextSubclass,1,0);
     state->toolbarTooltip = CreateWindowExW(WS_EX_TOPMOST, TOOLTIPS_CLASSW, nullptr,
         WS_POPUP | TTS_ALWAYSTIP | TTS_NOPREFIX, CW_USEDEFAULT, CW_USEDEFAULT,
         CW_USEDEFAULT, CW_USEDEFAULT, dialog, nullptr, g_hInst, nullptr);
@@ -17925,20 +20620,23 @@ static INT_PTR CALLBACK ClientNotesDlgProc(HWND dialog, UINT message,
         {IDC_NOTES_TRASH,L"Trash - restore deleted notes or permanently remove them; no automatic expiry"},
         {IDC_NOTES_SWITCH_CLIENT,L"Switch notebooks - type to search all clients"},
         {IDC_NOTES_DETAILS,L"Ticket details, local status and tags - saves automatically"},
-        {IDC_NOTES_OPEN_TICKET,L"Ticket details - set or open a ticket in your PC default browser"},
+        {IDC_NOTES_OPEN_TICKET,L"Open the linked ticket in your chosen PC browser"},
+        {IDC_NOTES_TICKET_REFERENCE,L"Ticket reference - edit it in Details"},
         {IDC_NOTES_MORE,L"Search actions (Ctrl+K): snippets, status, tags, work log and export"},
         {IDC_NOTES_HELP,L"How notes work - writing, autosave, templates and deleted notes"},
+        {IDC_NOTES_STATUS,L"Notes save problem"},
         {IDC_NOTES_FIND_TOGGLE,L"Find text in this note (Ctrl+F)"},
         {IDC_NOTES_SNIPPETS,L"Create, edit, save or insert reusable text blocks"},
         {IDC_NOTES_WORKLOG,L"Add a dated work log update at the end of this note"},
-        {IDC_NOTES_METADATA,L"Note / ticket work status and tags - local organization, no ticket-system sync"},
+        {IDC_NOTES_FORMAT,L"Show text formatting at the selection or typing position; Escape closes it"},
+        {IDC_NOTES_WORK_STATUS,L"Note status - change it in Details; local organization, no ticket-system sync"},
         {IDC_NOTES_TEMPLATES,L"Create and edit reusable starters directly, or use one for a new note"},
         {IDC_NOTES_STYLE,L"Text style - Code opens a language picker and inserts a bordered code block"},
         {IDCANCEL,L"Close notes - saves pending changes"}}) {
       TOOLINFOW tool{}; tool.cbSize = sizeof(tool); tool.hwnd = dialog;
       tool.uFlags = TTF_IDISHWND | TTF_SUBCLASS;
       tool.uId = reinterpret_cast<UINT_PTR>(GetDlgItem(dialog, id));
-      tool.lpszText = const_cast<wchar_t *>(text);
+      tool.lpszText = (id==IDC_NOTES_OPEN_TICKET || id==IDC_NOTES_TICKET_REFERENCE || id==IDC_NOTES_WORK_STATUS || id==IDC_NOTES_STATUS) ? LPSTR_TEXTCALLBACKW : const_cast<wchar_t *>(text);
       SendMessageW(state->toolbarTooltip, TTM_ADDTOOLW, 0, reinterpret_cast<LPARAM>(&tool));
     }
     ApplyNotesEditorTheme(dialog, *state);
@@ -17953,10 +20651,8 @@ static INT_PTR CALLBACK ClientNotesDlgProc(HWND dialog, UINT message,
     }
     RefreshNotesTabs(dialog, *state);
     if (!LoadNotesPage(dialog, *state)) {
-      MessageBoxW(dialog, L"The note cannot be edited within the rich text size limit.",
+      MessageBoxW(dialog, L"This saved note could not be opened safely. Its original text and link metadata are kept. Select its tab to retry, or use More > Export client notebook to keep an exact copy. You can close Notes without changing the saved notebook.",
                   L"Client Notes", MB_OK | MB_ICONWARNING);
-      DestroyWindow(dialog);
-      return FALSE;
     }
     state->topmost=GetPrivateProfileIntW(L"notes_window",L"topmost",0,g_sConfigPath.c_str())!=0;
     state->showProgress=GetPrivateProfileIntW(L"notes_window",L"progress",0,g_sConfigPath.c_str())!=0;
@@ -17981,7 +20677,7 @@ static INT_PTR CALLBACK ClientNotesDlgProc(HWND dialog, UINT message,
       }
       return TRUE;
     }
-    if (DrawNotesComboItem(draw) || (state && DrawNotesToolbarButton(draw, *state))) return TRUE;
+    if (DrawNotesComboItem(draw) || DrawNotesTicketReference(draw) || (state && (DrawNotesWorkStatus(draw,*state) || DrawNotesToolbarButton(draw, *state)))) return TRUE;
   }
   if (message == WM_MEASUREITEM && lParam) {
     auto *measure = reinterpret_cast<MEASUREITEMSTRUCT *>(lParam);
@@ -18001,20 +20697,26 @@ static INT_PTR CALLBACK ClientNotesDlgProc(HWND dialog, UINT message,
     RECT tabLine{ScaleByDpi(24, dpi), ScaleByDpi(87, dpi),
                  area.right - ScaleByDpi(24, dpi), ScaleByDpi(88, dpi)};
     PaintNotesChrome(dc, dialog);
-    // Document and toolbar outlines share the frame's subtle border color.
-    RECT editor{}; GetWindowRect(GetDlgItem(dialog, IDC_CLIENT_NOTES_TEXT), &editor);
-    MapWindowPoints(nullptr, dialog, reinterpret_cast<POINT *>(&editor), 2);
-    InflateRect(&editor, 1, 1);
-    FrameRect(dc, &editor, g_hbrThemeBorder);
+    // Notes owns its paint rather than the shared dialog's erase path. Draw
+    // the search fields' replacement outlines here after native edges are
+    // removed, using the same selected-theme border as the editor.
+    for (const int id : {IDC_CLIENT_NOTES_TEXT, IDC_NOTES_FIND,
+                         IDC_NOTES_REPLACE_TEXT}) {
+      RECT editor{};
+      const HWND editorWindow = GetDlgItem(dialog, id);
+      if (!editorWindow || (id == IDC_NOTES_FIND && !state->findVisible) ||
+          (id == IDC_NOTES_REPLACE_TEXT &&
+           (!state->findVisible || !state->replaceVisible)) ||
+          (id != IDC_CLIENT_NOTES_TEXT &&
+          !(GetWindowLongPtrW(editorWindow, GWL_STYLE) & WS_VISIBLE)) ||
+          !GetWindowRect(editorWindow, &editor))
+        continue;
+      MapWindowPoints(nullptr, dialog, reinterpret_cast<POINT *>(&editor), 2);
+      InflateRect(&editor, 1, 1);
+      FrameRect(dc, &editor, g_hbrThemeBorder);
+    }
     SetDCBrushColor(dc, NotesBorder());
     FillRect(dc, &tabLine, reinterpret_cast<HBRUSH>(GetStockObject(DC_BRUSH)));
-    for (int id : {IDC_NOTES_BOLD, IDC_NOTES_BULLETS, IDC_NOTES_LINK, IDC_NOTES_UNDO, IDC_NOTES_CLEAR}) {
-      RECT rect{}; GetWindowRect(GetDlgItem(dialog, id), &rect);
-      MapWindowPoints(nullptr, dialog, reinterpret_cast<POINT *>(&rect), 2);
-      const int x = rect.left - ScaleByDpi(11, dpi);
-      RECT divider{x, rect.top, x + 1, rect.top + ScaleByDpi(36, dpi)};
-      FillRect(dc, &divider, reinterpret_cast<HBRUSH>(GetStockObject(DC_BRUSH)));
-    }
     }
     EndPaint(dialog, &paint);
     return TRUE;
@@ -18023,9 +20725,7 @@ static INT_PTR CALLBACK ClientNotesDlgProc(HWND dialog, UINT message,
     HDC dc = reinterpret_cast<HDC>(wParam);
     HWND control = reinterpret_cast<HWND>(lParam);
     PaintNotesChrome(dc, control);
-    const int id = GetDlgCtrlID(control);
-    SetTextColor(dc, (id == IDC_NOTES_CLIENT_HEADING || id == IDC_NOTES_NOTE_HEADING) ? g_themeColors.crWindowText :
-        BlendColor(g_themeColors.crWindowText, g_themeColors.crWindow, 22));
+    SetTextColor(dc,BlendColor(g_themeColors.crWindowText,g_themeColors.crWindow,22));
     SetBkMode(dc, TRANSPARENT);
     return reinterpret_cast<INT_PTR>(GetStockObject(NULL_BRUSH));
   }
@@ -18036,20 +20736,32 @@ static INT_PTR CALLBACK ClientNotesDlgProc(HWND dialog, UINT message,
     return FALSE;
   switch (message) {
   case WM_APP_SWITCH_NOTES_CLIENT: OpenRequestedNotesClient(lParam);return TRUE;
+  case WM_APP_REFRESH_NOTES_ICON:
+    state->clientIconDpi=0;RefreshNotesClientIcon(dialog,*state,GetDpiForWindow(dialog));return TRUE;
+  case WM_LBUTTONDOWN:
+    HideNotesFormat(dialog,*state);break;
+  case WM_ACTIVATE:
+    if (LOWORD(wParam)==WA_INACTIVE && !state->highlightPalette) HideNotesFormat(dialog,*state);
+    break;
+  case WM_ENTERSIZEMOVE:
+    HideNotesFormat(dialog,*state);return TRUE;
   case WM_EXITSIZEMOVE:
     RememberNotesWindowSize(dialog);
     return TRUE;
   case WM_GETMINMAXINFO: {
     auto *limits = reinterpret_cast<MINMAXINFO *>(lParam);
-    limits->ptMinTrackSize.x = ScaleByDpi(900, GetDpiForWindow(dialog));
-    limits->ptMinTrackSize.y = ScaleByDpi(540, GetDpiForWindow(dialog));
+    const auto work=NotesWorkArea(dialog);
+    limits->ptMinTrackSize.x = (std::min)(ScaleByDpi(900, GetDpiForWindow(dialog)),(std::max)(1,static_cast<int>(work.right-work.left)));
+    limits->ptMinTrackSize.y = (std::min)(ScaleByDpi(540, GetDpiForWindow(dialog)),(std::max)(1,static_cast<int>(work.bottom-work.top)));
     return TRUE;
   }
   case WM_SIZE:
+    HideNotesFormat(dialog,*state);
     if (wParam != SIZE_MINIMIZED)
       LayoutClientNotes(dialog, GetDpiForWindow(dialog));
     return TRUE;
   case WM_DPICHANGED: {
+    HideNotesFormat(dialog,*state);
     const RECT *suggested = reinterpret_cast<const RECT *>(lParam);
     if (suggested)
       SetWindowPos(dialog, nullptr, suggested->left, suggested->top,
@@ -18066,6 +20778,34 @@ static INT_PTR CALLBACK ClientNotesDlgProc(HWND dialog, UINT message,
     return TRUE;
   case WM_NOTIFY: {
     auto *notice = reinterpret_cast<NMHDR *>(lParam);
+    if(notice && notice->code==TTN_GETDISPINFOW && notice->hwndFrom==state->toolbarTooltip &&
+        notice->idFrom==reinterpret_cast<UINT_PTR>(GetDlgItem(dialog,IDC_NOTES_STATUS))) {
+      auto *tip=reinterpret_cast<NMTTDISPINFOW *>(lParam);
+      tip->lpszText=state->saveProblemDetail.empty() ? const_cast<wchar_t *>(L"The saved note is kept. Your draft remains open; retry saving or use the recovery/export actions.") : state->saveProblemDetail.data();
+      return TRUE;
+    }
+    if (notice && notice->code==TTN_GETDISPINFOW && notice->hwndFrom==state->toolbarTooltip &&
+        notice->idFrom==reinterpret_cast<UINT_PTR>(GetDlgItem(dialog,IDC_NOTES_WORK_STATUS))) {
+      auto *tip=reinterpret_cast<NMTTDISPINFOW *>(lParam);
+      state->workStatusTooltip=L"Note status";
+      if (HasActiveNote(*state)) state->workStatusTooltip+=L": "+std::wstring(kNotesStatuses[state->pages[state->activePage].status]);
+      state->workStatusTooltip+=L"\r\nChange it in Details. Local organization; no ticket-system sync.";
+      tip->lpszText=state->workStatusTooltip.data();
+      return TRUE;
+    }
+    if (notice && notice->code==TTN_GETDISPINFOW && notice->hwndFrom==state->toolbarTooltip &&
+        (notice->idFrom==reinterpret_cast<UINT_PTR>(GetDlgItem(dialog,IDC_NOTES_OPEN_TICKET)) ||
+         notice->idFrom==reinterpret_cast<UINT_PTR>(GetDlgItem(dialog,IDC_NOTES_TICKET_REFERENCE)))) {
+      auto *tip=reinterpret_cast<NMTTDISPINFOW *>(lParam);
+      if (HasActiveNote(*state)) {
+        const auto &page=state->pages[state->activePage];
+        state->ticketTooltip=page.ticket.empty() ? L"Ticket details" : L"Ticket "+page.ticket;
+        state->ticketTooltip+=ValidNotesUrl(page.ticketUrl) ?
+            L"\r\nOpen in "+NotesLinkBrowserLabel()+L", outside client profiles." : L"\r\nTicket reference. Edit its number or URL in Details.";
+        tip->lpszText=state->ticketTooltip.data();
+      }
+      return TRUE;
+    }
     if (notice && notice->code==TTN_GETDISPINFOW && notice->hwndFrom==TabCtrl_GetToolTips(GetDlgItem(dialog,IDC_NOTES_TABS))) {
       auto *tip=reinterpret_cast<NMTTDISPINFOW *>(lParam);
       if (notice->idFrom<state->visiblePages.size()) {
@@ -18083,14 +20823,11 @@ static INT_PTR CALLBACK ClientNotesDlgProc(HWND dialog, UINT message,
       if (notice->code == TCN_SELCHANGE) {
         const int selected = TabCtrl_GetCurSel(notice->hwndFrom);
         if (selected >= 0 && static_cast<size_t>(selected) < state->visiblePages.size()) {
-          const size_t previous = state->activePage;
           state->activePage = state->visiblePages[selected];
           if (!LoadNotesPage(dialog, *state)) {
-            MessageBoxW(dialog, L"This tab cannot be edited within the rich text size limit.",
+            MessageBoxW(dialog, L"This note's editor could not be opened. Its saved content has been kept.",
                         L"Client Notes", MB_OK | MB_ICONWARNING);
-            state->activePage = previous;
             RefreshNotesTabs(dialog, *state);
-            LoadNotesPage(dialog, *state);
           }
           InvalidateRect(notice->hwndFrom, nullptr, TRUE);
         }
@@ -18101,16 +20838,22 @@ static INT_PTR CALLBACK ClientNotesDlgProc(HWND dialog, UINT message,
       break;
     if (notice->code == EN_SELCHANGE) {
       UpdateNotesToolbar(dialog, *state);
+      NotesFindChanged(dialog,*state);
+      if (!state->loading && GetFocus()==notice->hwndFrom) {
+        const auto &selection=reinterpret_cast<SELCHANGE *>(lParam)->chrg;
+        if (selection.cpMin==selection.cpMax && !state->formatExplicit) HideNotesFormat(dialog,*state,false);
+        else if (!(GetKeyState(VK_LBUTTON)&0x8000)) SetTimer(dialog,kNotesFormatTimer,120,nullptr);
+      }
       return TRUE;
     }
     if (notice->code == EN_LINK) {
       auto *link = reinterpret_cast<ENLINK *>(lParam);
       if (link->msg == WM_LBUTTONUP || link->msg == WM_LBUTTONDBLCLK) {
+        if (notice->hwndFrom!=state->attachedEditor || !CaptureNotesPage(dialog,*state,false)) return TRUE;
         const std::wstring url = NotesRangeText(notice->hwndFrom,
                                                link->chrg.cpMin, link->chrg.cpMax);
-        std::wstring target=url;
-        if (HasActiveNote(*state)) for (const auto &[label,address] : state->pages[state->activePage].links)
-          if (label==url) { target=address; break; }
+        std::wstring target=NotesNativeLinkAddress(notice->hwndFrom,*state,link->chrg);
+        if(target.empty()) target=url;
         OpenNotesUrl(dialog, *state, target);
         return TRUE;
       }
@@ -18118,7 +20861,19 @@ static INT_PTR CALLBACK ClientNotesDlgProc(HWND dialog, UINT message,
     break;
   }
   case WM_COMMAND:
+    if (LOWORD(wParam)==IDC_NOTES_FORMAT && HIWORD(wParam)==BN_CLICKED) {
+      if (state->formatVisible) HideNotesFormat(dialog,*state);
+      else {UpdateNotesToolbar(dialog,*state);ShowNotesFormat(dialog,*state,true);}
+      SetFocus(GetDlgItem(dialog,IDC_CLIENT_NOTES_TEXT));
+      return TRUE;
+    }
+    // The dialog manager turns Escape into IDCANCEL. Dismiss an open palette
+    // first, while a click on the window's X still closes Notes normally.
+    if (LOWORD(wParam)==IDCANCEL && !lParam && state->formatVisible) {
+      HideNotesFormat(dialog,*state);SetFocus(GetDlgItem(dialog,IDC_CLIENT_NOTES_TEXT));return TRUE;
+    }
     if (HIWORD(wParam) == BN_CLICKED) {
+      if (!IsNotesFormatControl(LOWORD(wParam))) HideNotesFormat(dialog,*state);
       CloseNotesPanel(*state);
       if (NotesWorkspaceCommand(dialog, *state, LOWORD(wParam))) return TRUE;
     } else if (LOWORD(wParam) != IDC_CLIENT_NOTES_TEXT &&
@@ -18130,6 +20885,7 @@ static INT_PTR CALLBACK ClientNotesDlgProc(HWND dialog, UINT message,
     }
     if (LOWORD(wParam) == IDC_NOTES_ADD_TAB || LOWORD(wParam) == IDC_NOTES_RENAME_TAB) {
       const bool adding = LOWORD(wParam) == IDC_NOTES_ADD_TAB;
+      if (!adding && !HasActiveNote(*state)) return TRUE;
       if (adding && state->pages.size() >= client_notes::kMaxPages)
         return TRUE;
       if (!SaveClientNotesDraft(dialog, *state, true))
@@ -18141,10 +20897,9 @@ static INT_PTR CALLBACK ClientNotesDlgProc(HWND dialog, UINT message,
           name = L"Untitled " + std::to_wstring(suffix);
         client_notes::NotePage page{name,true,"{\\rtf1\\ansi }",{}};
         page.id = client_notes::NextId(state->pages); page.created = page.modified = client_notes::Now();
-        page.pristine = true; state->pages.push_back(std::move(page));
-        state->baselines.emplace_back();
-        state->activePage = state->pages.size() - 1;
-        LoadNotesPage(dialog, *state);
+        page.pristine = true;
+        NotesAddPage(dialog,*state,std::move(page));
+        return TRUE;
       } else {
         NotesTabNameState name{&state->pages, state->activePage, state->pages[state->activePage].name};
         if (DialogBoxParamW(g_hInst, MAKEINTRESOURCEW(IDD_NOTES_TAB_NAME), dialog,
@@ -18158,10 +20913,15 @@ static INT_PTR CALLBACK ClientNotesDlgProc(HWND dialog, UINT message,
       SetFocus(GetDlgItem(dialog, IDC_CLIENT_NOTES_TEXT));
       return TRUE;
     }
+    if (LOWORD(wParam)==IDC_NOTES_FIND && HIWORD(wParam)==EN_CHANGE) {
+      NotesFindChanged(dialog,*state);return TRUE;
+    }
     if (LOWORD(wParam) == IDC_CLIENT_NOTES_TEXT &&
         HIWORD(wParam) == EN_CHANGE) {
-      if (!state->loading)
+      if (!state->loading) {
         MarkNotesChanged(dialog, *state);
+        NotesFindChanged(dialog,*state);
+      }
       return TRUE;
     }
     if (LOWORD(wParam) == IDOK) {
@@ -18265,8 +21025,14 @@ static INT_PTR CALLBACK ClientNotesDlgProc(HWND dialog, UINT message,
       format.crBackColor = state->highlightColor;
       format.crTextColor = remove ? g_themeColors.crControlText : RGB(24, 24, 24);
       HWND edit = GetDlgItem(dialog, IDC_CLIENT_NOTES_TEXT);
+      IUnknown *ole=nullptr;ITextDocument *document=nullptr;
+      SendMessageW(edit,EM_GETOLEINTERFACE,0,reinterpret_cast<LPARAM>(&ole));
+      if(ole) {ole->QueryInterface(__uuidof(ITextDocument),reinterpret_cast<void **>(&document));ole->Release();}
+      SendMessageW(edit,EM_STOPGROUPTYPING,0,0);if(document) document->BeginEditCollection();
       SendMessageW(edit, EM_SETCHARFORMAT, SCF_SELECTION,
                    reinterpret_cast<LPARAM>(&format));
+      ApplyNotesTextColors(edit);
+      if(document) {document->EndEditCollection();document->Release();}
       MarkNotesChanged(dialog, *state);
       SetFocus(edit);
       return TRUE;
@@ -18299,8 +21065,8 @@ static INT_PTR CALLBACK ClientNotesDlgProc(HWND dialog, UINT message,
         MessageBoxW(dialog, L"Select a complete http:// or https:// URL in the note to make it a link.",
                     L"Client Notes", MB_OK | MB_ICONINFORMATION);
       } else {
-        NotesCharacterFormat(dialog, *state, CFM_LINK | CFM_UNDERLINE | CFM_COLOR,
-                             CFE_LINK | CFE_UNDERLINE, g_bThemeIsDark ? RGB(138, 205, 235) : RGB(0, 91, 158));
+        NotesCharacterFormat(dialog, *state, CFM_LINK | CFM_LINKPROTECTED | CFM_UNDERLINE | CFM_COLOR,
+                             CFE_LINK | CFE_LINKPROTECTED | CFE_UNDERLINE, g_bThemeIsDark ? RGB(138, 205, 235) : RGB(0, 91, 158));
       }
       return TRUE;
     }
@@ -18314,10 +21080,14 @@ static INT_PTR CALLBACK ClientNotesDlgProc(HWND dialog, UINT message,
       return TRUE;
     }
     if (LOWORD(wParam) == IDC_NOTES_CLEAR) {
+      HWND edit=GetDlgItem(dialog,IDC_CLIENT_NOTES_TEXT);IUnknown *ole=nullptr;ITextDocument *collection=nullptr;
+      SendMessageW(edit,EM_GETOLEINTERFACE,0,reinterpret_cast<LPARAM>(&ole));
+      if(ole) {ole->QueryInterface(__uuidof(ITextDocument),reinterpret_cast<void **>(&collection));ole->Release();}
+      SendMessageW(edit,EM_STOPGROUPTYPING,0,0);if(collection) collection->BeginEditCollection();
       NotesCharacterFormat(dialog, *state,
-          CFM_BOLD | CFM_ITALIC | CFM_UNDERLINE | CFM_STRIKEOUT | CFM_LINK |
+          CFM_BOLD | CFM_ITALIC | CFM_UNDERLINE | CFM_STRIKEOUT | CFM_LINK | CFM_LINKPROTECTED |
           CFM_SIZE | CFM_COLOR | CFM_BACKCOLOR | CFM_FACE, CFE_AUTOBACKCOLOR,
-          g_themeColors.crControlText, 240);
+          g_themeColors.crControlText, 240,false);
       NotesParagraphNumbering(dialog, *state, 0);
       PARAFORMAT2 paragraph{sizeof(paragraph)};
       paragraph.dwMask = PFM_SPACEBEFORE | PFM_SPACEAFTER | PFM_LINESPACING;
@@ -18325,6 +21095,7 @@ static INT_PTR CALLBACK ClientNotesDlgProc(HWND dialog, UINT message,
       paragraph.dyLineSpacing = 20;
       paragraph.dySpaceAfter = 0;
       SendDlgItemMessageW(dialog, IDC_CLIENT_NOTES_TEXT, EM_SETPARAFORMAT, 0, reinterpret_cast<LPARAM>(&paragraph));
+      if(collection) {collection->EndEditCollection();collection->Release();}
       return TRUE;
     }
     break;
@@ -18336,6 +21107,15 @@ static INT_PTR CALLBACK ClientNotesDlgProc(HWND dialog, UINT message,
     CloseClientNotesDialog(dialog, *state);
     return TRUE;
   case WM_TIMER:
+    if (wParam==kNotesFindTimer) { NotesFindRefresh(dialog,*state);return TRUE; }
+    if (wParam==kNotesFormatTimer) {
+      KillTimer(dialog,kNotesFormatTimer);
+      if (!state->loading && GetFocus()==GetDlgItem(dialog,IDC_CLIENT_NOTES_TEXT) && !(GetKeyState(VK_LBUTTON)&0x8000)) {
+        if (state->formatVisible && state->formatExplicit) PositionNotesFormat(dialog,*state,GetDpiForWindow(dialog));
+        else ShowNotesFormat(dialog,*state,false);
+      }
+      return TRUE;
+    }
     if (wParam == 2) { KillTimer(dialog, 2); NotesWriteRecovery(dialog, *state); return TRUE; }
     if (wParam == 1 && !state->loading) {
       SaveClientNotesDraft(dialog, *state);
@@ -18353,15 +21133,16 @@ static bool SwitchClientNotes(HWND dialog, ClientNotesDialogState &state,
   }
   ClientNotesDialogState next{clientName,clientRoot,client_notes::ReadNotebook(clientRoot)};
   if (next.original.status == client_notes::ReadStatus::Error) {
-    MessageBoxW(dialog,L"The client's notes could not be read safely.",L"Client Notes",MB_OK|MB_ICONWARNING);return false;
+    MessageBoxW(dialog,client_notes::PersistenceFailure(L"The client's notes could not be read safely.").c_str(),L"Client Notes",MB_OK|MB_ICONWARNING);return false;
   }
   CloseNotesPanel(state);
   if (!state.detailsDrafts.empty() && MessageBoxW(dialog,
-      L"Some details have invalid values and have not been saved. Switch clients without those details?\n\nYour note text and previously saved details are kept.",
+      (L"These notes have unfinished invalid Details:\n"+NotesInvalidDetailsSummary(state)+
+       L"\nSwitch clients without these unfinished details?\n\nYes discards them and switches. No takes you to the affected note; archived or trashed notes remain there until you choose Restore. Your note text and previously saved details are kept.").c_str(),
       L"Check note details",MB_YESNO|MB_DEFBUTTON2|MB_ICONWARNING)!=IDYES) {
-    NotesWorkspaceCommand(dialog,state,IDC_NOTES_DETAILS);return false;
+    NotesReviewInvalidDetails(dialog,state);return false;
   }
-  if (!CaptureNotesPage(dialog,state,true)) return false;
+  if (!NotesKeepUnloadedSavedText(state) && !CaptureNotesPage(dialog,state,true)) return false;
   NotesDiscardEmptyDrafts(dialog,state);
   if (!SaveClientNotesDraft(dialog,state,true)) return false;
   KillTimer(dialog,2);
@@ -18376,9 +21157,16 @@ static bool SwitchClientNotes(HWND dialog, ClientNotesDialogState &state,
   // preferences stay in place. Keep old editors until the new document loads.
   state.SwapNotebook(next);
   state.attachedEditor=next.attachedEditor;
+  state.attachedPageId=0;
   RefreshNotesTabs(dialog,state);
   if (!LoadNotesPage(dialog,state)) {
+    // The old notebook belongs to next; restore its HWND and identity only
+    // after undoing the state swap, never by matching notebook-local IDs.
     state.SwapNotebook(next);
+    if (state.attachedEditor) {
+      SetWindowLongPtrW(state.attachedEditor,GWLP_ID,IDC_CLIENT_NOTES_TEXT);
+      ShowWindow(state.attachedEditor,SW_SHOW);
+    }
     RefreshNotesTabs(dialog,state);LayoutClientNotes(dialog,GetDpiForWindow(dialog));
     UpdateNotesToolbar(dialog,state);SetNotesStatus(dialog,state);
     MessageBoxW(dialog,L"The note cannot be edited within the rich text size limit. Your previous notebook is still open.",L"Client Notes",MB_OK|MB_ICONWARNING);return false;
@@ -18387,6 +21175,8 @@ static bool SwitchClientNotes(HWND dialog, ClientNotesDialogState &state,
     if(edit!=next.attachedEditor && IsWindow(edit)) DestroyWindow(edit);
   SetNotesSaveFailure(dialog,state,false);
   SetDlgItemTextW(dialog,IDC_NOTES_FIND,L"");
+  SetDlgItemTextW(dialog,IDC_NOTES_REPLACE_TEXT,L"");
+  NotesFindInitialize(dialog,state);
   LayoutClientNotes(dialog,GetDpiForWindow(dialog));SetNotesStatus(dialog,state);
   NotesRememberClient(clientName);
   if(IsIconic(dialog)) ShowWindow(dialog,SW_RESTORE);
@@ -18416,17 +21206,23 @@ static void ShowClientNotes(const std::wstring &clientName) {
   }
   auto *state = new ClientNotesDialogState{clientName,clientRoot,client_notes::ReadNotebook(clientRoot)};
   state->browser = g_selectedBrowser;
-  state->draftName = L"ctSpaces-notes-draft-" + std::to_wstring(GetCurrentProcessId()) + L".ctn";
+  state->draftName = NotesNewDraftName();
+  if(state->draftName.empty()) {
+    delete state;MessageBoxW(g_hGui,L"A unique recovery file could not be prepared. Retry opening Notes.",L"Client Notes",MB_OK|MB_ICONWARNING);return;
+  }
   if (state->original.status == client_notes::ReadStatus::Error) {
-    delete state; MessageBoxW(g_hGui,L"The client's notes could not be read safely.",L"Client Notes",MB_OK|MB_ICONWARNING); return;
+    delete state; MessageBoxW(g_hGui,client_notes::PersistenceFailure(L"The client's notes could not be read safely.").c_str(),L"Client Notes",MB_OK|MB_ICONWARNING); return;
   }
   state->richEditModule = LoadLibraryExW(L"Msftedit.dll",nullptr,LOAD_LIBRARY_SEARCH_SYSTEM32);
   if (!state->richEditModule) { delete state; return; }
-  g_hNotesWindow = CreateDialogParamW(g_hInst,MAKEINTRESOURCEW(IDD_CLIENT_NOTES),g_hGui,
+  g_hNotesWindow = CreateDialogParamW(g_hInst,MAKEINTRESOURCEW(IDD_CLIENT_NOTES),nullptr,
       ClientNotesDlgProc,reinterpret_cast<LPARAM>(state));
   if (g_hNotesWindow) {
     NotesRememberClient(clientName);
-    ShowWindow(g_hNotesWindow,SW_SHOW); SetForegroundWindow(g_hNotesWindow);
+    // CreateDialog must finish all theming, layout and editor initialization
+    // before the first visible frame, including a remembered maximized state.
+    ShowWindow(g_hNotesWindow,GetPrivateProfileIntW(L"notes_window",L"maximized",0,g_sConfigPath.c_str())==1 ? SW_MAXIMIZE : SW_SHOW);
+    SetForegroundWindow(g_hNotesWindow);
     NotesRecoverDrafts(g_hNotesWindow,*state);
     if (!GetPrivateProfileIntW(L"notes_window",L"help_seen",0,g_sConfigPath.c_str()))
       PostMessageW(g_hNotesWindow,WM_COMMAND,IDC_NOTES_HELP,0);
@@ -18868,6 +21664,19 @@ static void CollectCleanupCandidates(CleanupScanState &state) {
         LogCleanupQaDecision(name, L"skipped-unsafe-root");
         continue;
       }
+      client_deletion_safety::BoundTree candidateNamespace;
+      std::wstring namespaceError;
+      if (!candidateNamespace.CaptureNamespace(root, namespaceError)) {
+        ++state.skipped;
+        LogCleanupQaDecision(name, L"skipped-unverifiable-directory", namespaceError);
+        continue;
+      }
+      auto directory = transient_profile::Identity::Capture(root);
+      if (!directory || !directory->MatchesPath(root)) {
+        ++state.skipped;
+        LogCleanupQaDecision(name, L"skipped-unverifiable-directory");
+        continue;
+      }
       // Preserve the existing import/upgrade behavior: unknown history starts
       // a fresh three-month tracking period even in manual-selection mode.
       client_activity::Write(root, {now, true}, true);
@@ -18909,7 +21718,7 @@ static void CollectCleanupCandidates(CleanupScanState &state) {
       }
       LogCleanupQaDecision(name, L"candidate");
       state.candidates.push_back(
-          {name, activity.value_or(client_activity::Record{})});
+          {name, activity.value_or(client_activity::Record{}), std::move(directory)});
     }
   } catch (const std::exception &error) {
     if (!cancelled())
@@ -19189,7 +21998,7 @@ static void GuiCleanupInactiveClients(bool manualSelection) {
     const std::optional<client_activity::Record> expectedActivity =
         manualSelection ? std::nullopt
                         : std::optional<client_activity::Record>(client.activity);
-    if (DeleteEntireClient(client.name, true, expectedActivity, outcome)) {
+    if (DeleteEntireClient(client.name, true, expectedActivity, outcome, client.directory)) {
       ++deleted;
       LogCleanupQaDecision(client.name, L"deleted", outcome);
       if (outcome.find(L"could not be removed") != std::wstring::npos)
@@ -20059,6 +22868,7 @@ enum class QuickTourTarget {
   ClientIcon,
   RestoreTabs,
   Temporary,
+  Notes,
   Options,
 };
 
@@ -20179,7 +22989,7 @@ static constexpr std::array<QuickTourStep, 23> kQuickTourSteps{{
      L"Close finishes pending saves. Notes only shows a saving message when "
      L"a problem needs attention. "
      L"This illustration does not open or edit notes.",
-     QuickTourTarget::Options, QuickTourDemo::ClientNotes},
+     QuickTourTarget::Notes, QuickTourDemo::ClientNotes},
     {L"Clean up inactive clients",
      L"Options can preview clients not opened for three calendar months. Unknown "
      L"history begins a fresh tracking period. Archived clients can appear; "
@@ -20295,6 +23105,8 @@ static bool GetQuickTourTargetRect(QuickTourTarget target, RECT &rect) {
     return MainClientRectToScreen(g_rcBrowserSelector, rect);
   case QuickTourTarget::PrimaryAction:
     return QuickTourWindowRect(g_hBtnGo, rect);
+  case QuickTourTarget::Notes:
+    return QuickTourWindowRect(g_hBtnNotes, rect);
   case QuickTourTarget::PinnedClients:
     BuildPinnedClientRects();
     if (!g_pinnedClients.empty() &&
@@ -20457,9 +23269,9 @@ static const wchar_t *QuickTourDemoAccessibleText(QuickTourDemo demo) {
     return L"Illustration only \u2014 no actions performed. Options > Client name "
            L"first in window titles. Example: Client A \u2014 Browser.";
   case QuickTourDemo::ClientNotes:
-    return L"Illustration only: no actions performed. Select Client A, "
-           L"then Settings > Client Notes or open its pin menu. Add named ticket "
-           L"tabs with separate formatted notes. Edits save automatically.";
+    return L"Illustration only: no actions performed. Notes beside Close all > "
+           L"Choose client. Start with a blank tab or template. "
+           L"Edits save automatically; problems are reported.";
   case QuickTourDemo::None:
     return L"";
   }
@@ -20698,8 +23510,8 @@ static void DrawQuickTourDemo(const DRAWITEMSTRUCT &draw) {
                    L"Client A \u2014 Browser\r\nEasier to identify in the window and Alt+Tab");
     break;
   case QuickTourDemo::ClientNotes:
-    drawOptionFlow(L"Settings > Client Notes",
-                   L"Named ticket tabs\r\nFormatted notes save automatically");
+    drawOptionFlow(L"Notes > Choose client",
+                   L"Blank tab or template\r\nAutosaves; problems are reported");
     break;
   case QuickTourDemo::None:
     break;
@@ -21311,7 +24123,8 @@ static INT_PTR CALLBACK ThemeDlgProc(HWND hDlg, UINT msg, WPARAM wParam,
     if (iId == IDC_THEME_APPLY) {
       if (vState) {
         vCancelPreviewTimer();
-        ApplyTheme(vState->iCurrentMode, false);
+        if (!ApplyTheme(vState->iCurrentMode, false))
+          return (INT_PTR)TRUE;
         vState->iPreviewedMode = vState->iCurrentMode;
       }
       EndDialog(hDlg, IDOK);
@@ -21320,8 +24133,8 @@ static INT_PTR CALLBACK ThemeDlgProc(HWND hDlg, UINT msg, WPARAM wParam,
     if (iId == IDC_THEME_CANCEL || iId == IDCANCEL) {
       if (vState) {
         vCancelPreviewTimer();
-        if (vState->iPreviewedMode != vState->iInitialMode)
-          ApplyTheme(vState->iInitialMode, false);
+        if (vState->iPreviewedMode != g_iThemeMode)
+          ApplyTheme(g_iThemeMode, false, false);
       }
       EndDialog(hDlg, IDCANCEL);
       return (INT_PTR)TRUE;
@@ -21332,8 +24145,8 @@ static INT_PTR CALLBACK ThemeDlgProc(HWND hDlg, UINT msg, WPARAM wParam,
   case WM_CLOSE:
     if (vState) {
       vCancelPreviewTimer();
-      if (vState->iPreviewedMode != vState->iInitialMode)
-        ApplyTheme(vState->iInitialMode, false);
+      if (vState->iPreviewedMode != g_iThemeMode)
+        ApplyTheme(g_iThemeMode, false, false);
     }
     EndDialog(hDlg, IDCANCEL);
     return (INT_PTR)TRUE;
@@ -21508,6 +24321,23 @@ static void MenuAddSep(HMENU hMenu) {
   mi.dwItemData = (ULONG_PTR)vData;
   InsertMenuItemW(hMenu, (UINT)-1, TRUE, &mi);
 }
+
+static HMENU CreateTabLayoutMenu(bool forClient, const MENUINFO &menuInfo) {
+  HMENU menu = CreatePopupMenu();
+  if (!menu) return nullptr;
+  SetMenuInfo(menu, &menuInfo);
+  MenuAddItemOD(menu, forClient ? IDM_TAB_LAYOUT_CLIENT_FOLLOW
+                               : IDM_TAB_LAYOUT_GLOBAL_BROWSER,
+                forClient ? L"Follow global setting" : L"Keep browser's choice",
+                nullptr, false, false);
+  MenuAddItemOD(menu, forClient ? IDM_TAB_LAYOUT_CLIENT_VERTICAL
+                               : IDM_TAB_LAYOUT_GLOBAL_VERTICAL,
+                L"Vertical tabs", nullptr, false, false);
+  MenuAddItemOD(menu, forClient ? IDM_TAB_LAYOUT_CLIENT_HORIZONTAL
+                               : IDM_TAB_LAYOUT_GLOBAL_HORIZONTAL,
+                L"Horizontal tabs", nullptr, false, false);
+  return menu;
+}
 static void EnsureConfigMenu(HWND hWnd) {
   if (g_hConfigMenu)
     return;
@@ -21606,6 +24436,11 @@ static void EnsureConfigMenu(HWND hWnd) {
   addItem(IDM_CTX_RENAME_PROFILE, L"Rename Client", iIcoEdit);
   addItem(IDM_CTX_CLIENT_NOTES, L"Client Notes", iIcoEdit);
   addItem(IDM_CTX_QUICK_NOTE, L"Quick note", iIcoEdit);
+  g_hClientTabLayoutMenu = CreateTabLayoutMenu(true, mnuInfo);
+  if (g_hClientTabLayoutMenu)
+    MenuAddItemOD(g_hConfigMenu, IDM_TAB_LAYOUT_CLIENT,
+                  L"Tab layout - this client", nullptr, false, true,
+                  g_hClientTabLayoutMenu);
   addItem(IDM_CTX_ARCHIVE_PROFILE, L"Archive Client", iIcoAbout);
   addItem(IDM_CTX_RESET_PROFILE, L"Reset (Nuke)", iIcoReset);
   addItem(IDM_CTX_VACUUM_PROFILE, L"Vacuum (Clear Cache)", iIcoVacuum);
@@ -21633,6 +24468,11 @@ static void EnsureConfigMenu(HWND hWnd) {
                 L"Client name first in window titles", nullptr,
                 g_bClientTitleFirst.load(), false);
   MenuAddItemOD(g_hConfigMenu,IDM_CTX_MINIMIZE_TRAY,L"Minimize to tray",nullptr,g_minimizeToTray,false);
+  g_hGlobalTabLayoutMenu = CreateTabLayoutMenu(false, mnuInfo);
+  if (g_hGlobalTabLayoutMenu)
+    MenuAddItemOD(g_hConfigMenu, IDM_TAB_LAYOUT_GLOBAL,
+                  L"Tab layout - all clients", nullptr, false, false,
+                  g_hGlobalTabLayoutMenu);
 
   MenuAddSep(g_hConfigMenu);
 
@@ -21696,7 +24536,36 @@ static void EnsureConfigMenu(HWND hWnd) {
   addItem(IDM_ABOUT, L"About", iIcoAbout);
 }
 
+static bool ConfigCommandUsesSelectedClient(UINT command) {
+  if (IsClientTabLayoutCommand(command)) return true;
+  switch (command) {
+  case IDM_CTX_SET_PROFILE_ICON:
+  case IDM_CTX_REMOVE_ICON:
+  case IDM_CTX_CREATE_SHORTCUT:
+  case IDM_CTX_RENAME_PROFILE:
+  case IDM_CTX_CLIENT_NOTES:
+  case IDM_CTX_QUICK_NOTE:
+  case IDM_CTX_ARCHIVE_PROFILE:
+  case IDM_CTX_RESET_PROFILE:
+  case IDM_CTX_VACUUM_PROFILE:
+  case IDM_CTX_FETCH_ICON:
+  case IDM_CTX_DELETE_PROFILE:
+    return true;
+  default:
+    return false;
+  }
+}
+
 static UINT ShowConfigMenuFromButton(HWND hWnd) {
+  const std::wstring selectedClient = GetSelectedClientNameSanitized(false);
+  const BrowserKind selectedBrowser = g_selectedBrowser;
+  client_deletion_safety::BoundTree layoutNamespace;
+  fs::path layoutRoot;
+  std::wstring layoutError;
+  const bool layoutTargetBound =
+      IsExistingClientProfile(selectedClient) &&
+      TryGetSafeClientProfilePath(selectedClient, layoutRoot) &&
+      layoutNamespace.CaptureNamespace(layoutRoot, layoutError);
   EnsureConfigMenu(hWnd);
   UpdateConfigMenuEnabledState();
   HideMenuTooltip();
@@ -21710,6 +24579,28 @@ static UINT ShowConfigMenuFromButton(HWND hWnd) {
                               rc.left, rc.bottom, hWnd, nullptr);
   HideMenuTooltip();
   PostMessageW(hWnd, WM_NULL, 0, 0); // allow menu to dismiss cleanly
+  // The native popup pumps messages, including session-start notifications
+  // that can select another client. Never give its command to the caller for
+  // a different selection. Shortcuts also carry the selected browser intent.
+  if (ConfigCommandUsesSelectedClient(cmd) &&
+      (!client_name_comparison::EqualIgnoringCase(
+           selectedClient, GetSelectedClientNameSanitized(false)) ||
+       (cmd == IDM_CTX_CREATE_SHORTCUT && selectedBrowser != g_selectedBrowser)))
+    return 0;
+  if (IsClientTabLayoutCommand(cmd)) {
+    // Commit before releasing the original client namespace. A popup pumps
+    // messages; a reused pathname must never receive the previous client's edit.
+    if (layoutTargetBound && layoutNamespace.Verify(layoutError)) {
+      const auto choice = cmd == IDM_TAB_LAYOUT_CLIENT_VERTICAL
+                              ? client_tab_layout::Override::Vertical
+                          : cmd == IDM_TAB_LAYOUT_CLIENT_HORIZONTAL
+                              ? client_tab_layout::Override::Horizontal
+                              : client_tab_layout::Override::FollowGlobal;
+      SetClientTabLayoutPreference(selectedClient, choice);
+      UpdateConfigMenuEnabledState();
+    }
+    return 0;
+  }
   return cmd;
 }
 
@@ -22175,6 +25066,24 @@ static void EnsureMenuTooltips(HWND hWnd) {
   g_menuTipText[IDM_CTX_CLIENT_TITLE_FIRST] =
       L"Put the client name first in browser and Alt+Tab titles.";
   g_menuTipText[IDM_CTX_MINIMIZE_TRAY]=L"Hide the launcher in the notification area when minimized. Click its tray icon to show it; Close still exits.";
+  g_menuTipText[IDM_TAB_LAYOUT_GLOBAL_BROWSER] =
+      L"Stop enforcing a tab layout. Each browser keeps its saved choice. "
+      L"Client overrides still apply; Firefox releases ctSpaces' layout override.";
+  g_menuTipText[IDM_TAB_LAYOUT_GLOBAL_VERTICAL] =
+      L"Start all clients and temporary browsers with vertical tabs, unless "
+      L"that client has its own choice. Applies on the next launch.";
+  g_menuTipText[IDM_TAB_LAYOUT_GLOBAL_HORIZONTAL] =
+      L"Turn vertical tabs off for all clients and temporary browsers, unless "
+      L"that client has its own choice. Applies on the next launch.";
+  g_menuTipText[IDM_TAB_LAYOUT_CLIENT_FOLLOW] =
+      L"Use the all-client tab-layout setting for every browser of this client. "
+      L"Applies on the next launch; open browsers are left alone.";
+  g_menuTipText[IDM_TAB_LAYOUT_CLIENT_VERTICAL] =
+      L"Start this client's browsers with vertical tabs, overriding the global "
+      L"setting. Applies on the next launch.";
+  g_menuTipText[IDM_TAB_LAYOUT_CLIENT_HORIZONTAL] =
+      L"Turn vertical tabs off for this client's browsers, overriding the global "
+      L"setting. Applies on the next launch.";
   g_menuTipText[IDM_CTX_EXPORT_ALL] =
       L"Create and verify a backup of every client profile.";
   g_menuTipText[IDM_CTX_RESTORE_ALL] =
@@ -22288,6 +25197,41 @@ static void UpdateConfigMenuEnabledState() {
                 MF_BYCOMMAND |
                     (g_bClientTitleFirst.load() ? MF_CHECKED
                                                 : MF_UNCHECKED));
+
+  if (g_hGlobalTabLayoutMenu) {
+    const auto layout = g_globalTabLayout.load();
+    const UINT selected = layout == client_tab_layout::Layout::Vertical
+                              ? IDM_TAB_LAYOUT_GLOBAL_VERTICAL
+                          : layout == client_tab_layout::Layout::Horizontal
+                              ? IDM_TAB_LAYOUT_GLOBAL_HORIZONTAL
+                              : IDM_TAB_LAYOUT_GLOBAL_BROWSER;
+    CheckMenuRadioItem(g_hGlobalTabLayoutMenu, IDM_TAB_LAYOUT_GLOBAL_BROWSER,
+                       IDM_TAB_LAYOUT_GLOBAL_HORIZONTAL, selected, MF_BYCOMMAND);
+  }
+  if (g_hClientTabLayoutMenu) {
+    client_tab_layout::Override choice{};
+    fs::path root;
+    const bool available = hasExistingClient &&
+        TryGetSafeClientProfilePath(name, root) &&
+        client_tab_layout::Read(root, choice);
+    en(IDM_TAB_LAYOUT_CLIENT, available);
+    for (UINT command : {IDM_TAB_LAYOUT_CLIENT_FOLLOW,
+                         IDM_TAB_LAYOUT_CLIENT_VERTICAL,
+                         IDM_TAB_LAYOUT_CLIENT_HORIZONTAL}) {
+      EnableMenuItem(g_hClientTabLayoutMenu, command, MF_BYCOMMAND |
+          (available ? MF_ENABLED : (MF_DISABLED | MF_GRAYED)));
+      CheckMenuItem(g_hClientTabLayoutMenu, command, MF_BYCOMMAND | MF_UNCHECKED);
+    }
+    if (available) {
+      const UINT selected = choice == client_tab_layout::Override::Vertical
+                                ? IDM_TAB_LAYOUT_CLIENT_VERTICAL
+                            : choice == client_tab_layout::Override::Horizontal
+                                ? IDM_TAB_LAYOUT_CLIENT_HORIZONTAL
+                                : IDM_TAB_LAYOUT_CLIENT_FOLLOW;
+      CheckMenuRadioItem(g_hClientTabLayoutMenu, IDM_TAB_LAYOUT_CLIENT_FOLLOW,
+                         IDM_TAB_LAYOUT_CLIENT_HORIZONTAL, selected, MF_BYCOMMAND);
+    }
+  }
 
   if (g_hBrowserSubMenu) {
     CheckMenuItem(g_hBrowserSubMenu, IDM_BROWSER_EDGE,
@@ -22500,10 +25444,22 @@ static bool HitTestPinnedOverflow(POINT point) {
 }
 
 static void ShowPinnedClientOptionsMenu(HWND hWnd,
-                                        const std::wstring &clientName,
+                                        std::wstring clientName,
                                         POINT screenPoint) {
+  // TrackPopupMenuEx pumps messages. Keep the chosen name independently of
+  // the pinned vector, which a client refresh can prune while the menu is open.
   if (!hWnd || !IsExistingClientProfile(clientName))
     return;
+
+  client_deletion_safety::BoundTree layoutNamespace;
+  fs::path layoutRoot;
+  std::wstring layoutError;
+  client_tab_layout::Override layoutChoice{};
+  const bool layoutAvailable =
+      !IsClientArchived(clientName) &&
+      TryGetSafeClientProfilePath(clientName, layoutRoot) &&
+      layoutNamespace.CaptureNamespace(layoutRoot, layoutError) &&
+      client_tab_layout::Read(layoutRoot, layoutChoice, &layoutError);
 
   HMENU menu = CreatePopupMenu();
   if (!menu)
@@ -22532,6 +25488,11 @@ static void ShowPinnedClientOptionsMenu(HWND hWnd,
   MenuItemData notesData;
   notesData.text = L"Client Notes";
   MenuItemData quickData;quickData.text=L"Quick note";
+  MenuItemData layoutData;layoutData.text=L"Tab layout";layoutData.isSubmenu=true;
+  MenuItemData layoutChoices[3];
+  layoutChoices[0].text=L"Follow global setting";
+  layoutChoices[1].text=L"Vertical tabs";
+  layoutChoices[2].text=L"Horizontal tabs";
   const auto clipboardUrl = GetClipboardWebUrl();
 
   auto addItem = [&](UINT id, MenuItemData &data, bool checked = false,
@@ -22569,6 +25530,33 @@ static void ShowPinnedClientOptionsMenu(HWND hWnd,
   addSeparator();
   addItem(commandRestoreTabs, restoreData,
           ShouldRestoreTabsForClient(clientName, g_selectedBrowser));
+  HMENU layoutMenu = CreatePopupMenu();
+  if (layoutMenu) {
+    SetMenuInfo(layoutMenu, &menuInfo);
+    const UINT commands[] = {IDM_TAB_LAYOUT_CLIENT_FOLLOW,
+                             IDM_TAB_LAYOUT_CLIENT_VERTICAL,
+                             IDM_TAB_LAYOUT_CLIENT_HORIZONTAL};
+    const auto selected = layoutChoice == client_tab_layout::Override::Vertical ? 1u
+                        : layoutChoice == client_tab_layout::Override::Horizontal ? 2u : 0u;
+    for (unsigned index=0; index<std::size(commands); ++index) {
+      MENUITEMINFOW item{sizeof(item)};
+      item.fMask=MIIM_ID|MIIM_FTYPE|MIIM_DATA|MIIM_STATE;
+      item.wID=commands[index];item.fType=MFT_OWNERDRAW;
+      item.dwItemData=reinterpret_cast<ULONG_PTR>(&layoutChoices[index]);
+      item.fState=(layoutAvailable ? MFS_ENABLED : MFS_DISABLED) |
+          (layoutAvailable && index==selected ? MFS_CHECKED : MFS_UNCHECKED);
+      InsertMenuItemW(layoutMenu, (UINT)-1, TRUE, &item);
+    }
+    MENUITEMINFOW item{sizeof(item)};
+    item.fMask=MIIM_ID|MIIM_FTYPE|MIIM_DATA|MIIM_STATE|MIIM_SUBMENU;
+    item.wID=IDM_TAB_LAYOUT_CLIENT;item.fType=MFT_OWNERDRAW;
+    item.hSubMenu=layoutMenu;item.dwItemData=reinterpret_cast<ULONG_PTR>(&layoutData);
+    item.fState=layoutAvailable ? MFS_ENABLED : MFS_DISABLED;
+    if (!InsertMenuItemW(menu, (UINT)-1, TRUE, &item)) {
+      DestroyMenu(layoutMenu);
+      layoutMenu=nullptr;
+    }
+  }
   addItem(commandCreateShortcut, shortcutData);
   addItem(commandClientNotes, notesData);
   addItem(commandQuickNote, quickData);
@@ -22599,6 +25587,14 @@ static void ShowPinnedClientOptionsMenu(HWND hWnd,
     ShowClientNotes(clientName);
   } else if (command == commandQuickNote) {
     ShowQuickCapture(clientName);
+  } else if (IsClientTabLayoutCommand(command) && layoutAvailable &&
+             layoutNamespace.Verify(layoutError)) {
+    const auto choice = command == IDM_TAB_LAYOUT_CLIENT_VERTICAL
+                            ? client_tab_layout::Override::Vertical
+                        : command == IDM_TAB_LAYOUT_CLIENT_HORIZONTAL
+                            ? client_tab_layout::Override::Horizontal
+                            : client_tab_layout::Override::FollowGlobal;
+    SetClientTabLayoutPreference(clientName, choice);
   }
 }
 
@@ -22639,22 +25635,42 @@ static void ShowPinnedOverflowMenu(HWND hWnd, bool selectOnly) {
   if (command >= commandBase) {
     const int index = (int)(command - commandBase);
     if (index >= MAX_VISIBLE_PINNED_CLIENTS &&
-        index < (int)g_pinnedClients.size()) {
+        index < (int)items.size()) {
       if (selectOnly)
-        SelectPinnedClient(g_pinnedClients[index]);
+        SelectPinnedClient(items[index].text);
       else
-        OpenPinnedClient(g_pinnedClients[index]);
+        OpenPinnedClient(items[index].text);
     }
   }
 }
 
+static int ResolveDraggedSessionTab() {
+  const auto session = std::find_if(g_sessions.begin(), g_sessions.end(),
+      [](const Session &item) { return item.identity == g_mainDragSessionIdentity; });
+  return session == g_sessions.end() ? -1 : static_cast<int>(session - g_sessions.begin()) + 1;
+}
+
+static bool PinnedDragChangedExternally() {
+  return g_bPinnedDragCancelled ||
+      (g_bPinnedDragSnapshotValid && g_pinnedClients != g_pinnedClientsExpectedDuringDrag);
+}
+
 static void StartMainDragCandidate(HWND hWnd, MainDragKind kind, int index,
                                    POINT point) {
+  g_mainDragSessionIdentity = 0;
+  if (kind == MainDragKind::SessionTab) {
+    if (index <= 0 || index > static_cast<int>(g_sessions.size()))
+      return;
+    g_mainDragSessionIdentity = g_sessions[index - 1].identity;
+  }
   g_pinnedClientsBeforeDrag.clear();
+  g_pinnedClientsExpectedDuringDrag.clear();
+  g_bPinnedDragCancelled = false;
   g_bPinnedDragSnapshotValid = false;
   if (kind == MainDragKind::PinnedClient) {
     try {
       g_pinnedClientsBeforeDrag = g_pinnedClients;
+      g_pinnedClientsExpectedDuringDrag = g_pinnedClients;
       g_bPinnedDragSnapshotValid = true;
     } catch (...) {
       return;
@@ -22669,20 +25685,25 @@ static void StartMainDragCandidate(HWND hWnd, MainDragKind kind, int index,
 }
 
 static void FinishPinnedDragPersistence(bool savePinnedOrder) {
+  const bool changedExternally = PinnedDragChangedExternally();
   const bool snapshotValid = g_bPinnedDragSnapshotValid;
   std::vector<std::wstring> originalPinnedClients =
       std::move(g_pinnedClientsBeforeDrag);
   g_pinnedClientsBeforeDrag.clear();
   g_bPinnedDragSnapshotValid = false;
+  g_pinnedClientsExpectedDuringDrag.clear();
+  g_bPinnedDragCancelled = false;
 
-  if (!savePinnedOrder)
-    return;
-  if (SavePinnedClients())
+  if (!savePinnedOrder || changedExternally)
     return;
   if (!snapshotValid)
     return;
+  ClientPreferenceSnapshot observedChanged;
+  if (SavePinnedClients(&originalPinnedClients, &observedChanged))
+    return;
 
-  g_pinnedClients = std::move(originalPinnedClients);
+  g_pinnedClients = observedChanged ? std::move(*observedChanged)
+                                   : std::move(originalPinnedClients);
   BuildPinnedClientRects();
   UpdatePinButtonState();
   if (g_hGui)
@@ -22702,6 +25723,8 @@ static void MovePinnedClientForDrag(int fromIndex, int toIndex) {
                          std::move(moved));
   g_iMainDragIndex = toIndex;
   g_bPinnedOrderChanged = true;
+  if (g_mainDragKind == MainDragKind::PinnedClient && g_bPinnedDragSnapshotValid)
+    g_pinnedClientsExpectedDuringDrag = g_pinnedClients;
   BuildPinnedClientRects();
   InvalidateRect(g_hGui, &g_rcPinnedArea, TRUE);
 }
@@ -22742,6 +25765,28 @@ static bool UpdateMainDrag(HWND hWnd, POINT point, WPARAM keyState) {
   if ((keyState & MK_LBUTTON) == 0) {
     FinishMainDrag(hWnd, point);
     return false;
+  }
+
+  if (g_mainDragKind == MainDragKind::PinnedClient && PinnedDragChangedExternally()) {
+    g_bPinnedDragCancelled = true;
+    g_iMainDragIndex = -1;
+    g_bMainDragActive = true;
+    g_bPinnedOrderChanged = false;
+    return true;
+  }
+
+  if (g_mainDragKind == MainDragKind::SessionTab) {
+    const int current = ResolveDraggedSessionTab();
+    if (current < 0) {
+      // Keep the canceled gesture consumed until button release, so it cannot
+      // turn into a click on the session that inherited the old tab position.
+      g_iMainDragIndex = -1;
+      g_bMainDragActive = true;
+      return true;
+    }
+    if (current != g_iMainDragIndex)
+      g_bMainDragActive = true;
+    g_iMainDragIndex = current;
   }
 
   if (!g_bMainDragActive) {
@@ -22792,10 +25837,13 @@ static bool FinishMainDrag(HWND hWnd, POINT point) {
   if (g_mainDragKind == MainDragKind::None)
     return false;
 
-  const bool consumed = g_bMainDragActive;
-  const bool savePinnedOrder = g_bPinnedOrderChanged;
+  const bool pinnedCancelled = g_mainDragKind == MainDragKind::PinnedClient && PinnedDragChangedExternally();
+  const bool consumed = g_bMainDragActive || pinnedCancelled ||
+      (g_mainDragKind == MainDragKind::SessionTab &&
+       ResolveDraggedSessionTab() != g_iMainDragIndex);
+  const bool savePinnedOrder = g_bPinnedOrderChanged && !pinnedCancelled;
   std::wstring desktopShortcutClient;
-  if (consumed && g_mainDragKind == MainDragKind::PinnedClient &&
+  if (consumed && !pinnedCancelled && g_mainDragKind == MainDragKind::PinnedClient &&
       g_iMainDragIndex >= 0 &&
       g_iMainDragIndex < (int)g_pinnedClients.size()) {
     POINT screenPoint = point;
@@ -22809,6 +25857,7 @@ static bool FinishMainDrag(HWND hWnd, POINT point) {
   }
   g_mainDragKind = MainDragKind::None;
   g_iMainDragIndex = -1;
+  g_mainDragSessionIdentity = 0;
   g_bMainDragActive = false;
   g_bPinnedOrderChanged = false;
   if (GetCapture() == hWnd)
@@ -22935,7 +25984,7 @@ static std::wstring GetSelectedClientNameSanitized(bool preferListSelection) {
   // Edit text (what the user typed)
   std::wstring editName = SanitizeName(GetClientInputText());
   for (const auto &name : g_allClientNames) {
-    if (_wcsicmp(name.c_str(), editName.c_str()) == 0) {
+    if (client_name_comparison::EqualIgnoringCase(name, editName)) {
       editName = name;
       break;
     }
@@ -23338,6 +26387,9 @@ static void UpdateCloseAllButtonState() {
 }
 
 static bool RequestSessionCloseNormally(DWORD pid) {
+  const auto process = GetTrackedProfileProcess(pid);
+  if (!process || WaitForSingleObject(process.get(), 0) != WAIT_TIMEOUT)
+    return false;
   EnumData data{pid};
   EnumWindows(EnumWindowsCallback, (LPARAM)&data);
   bool posted = false;
@@ -23393,10 +26445,9 @@ static void RequestCloseAllClientsNormally() {
   g_closeAllAwaitingWindows.clear();
   g_closeAllDeadline = GetTickCount64() + kBrowserShutdownGraceMs;
   for (DWORD pid : processIds) {
-    HANDLE handle=OpenProcess(SYNCHRONIZE,FALSE,pid);
-    if (!handle) continue;
-    std::shared_ptr<void> lifetime(handle,[](void *process) { CloseHandle(process); });
-    if (WaitForSingleObject(handle,0)==WAIT_TIMEOUT && !RequestSessionCloseNormally(pid))
+    auto lifetime = GetTrackedProfileProcess(pid);
+    if (!lifetime) continue;
+    if (WaitForSingleObject(lifetime.get(),0)==WAIT_TIMEOUT && !RequestSessionCloseNormally(pid))
       g_closeAllAwaitingWindows.push_back({pid,std::move(lifetime)});
   }
   if (!SetTimer(g_hGui, kCloseAllCheckTimer, 100,
@@ -23409,6 +26460,9 @@ static void RequestCloseAllClientsNormally() {
 }
 
 static bool RequestSessionClose(DWORD pid) {
+  const auto process = GetTrackedProfileProcess(pid);
+  if (!process || WaitForSingleObject(process.get(), 0) != WAIT_TIMEOUT)
+    return false;
   EnumData data{pid};
   EnumWindows(EnumWindowsCallback, (LPARAM)&data);
 
@@ -23423,15 +26477,14 @@ static bool RequestSessionClose(DWORD pid) {
   if (bPosted)
     return true;
 
-  HANDLE hProcess = OpenProcess(PROCESS_TERMINATE, FALSE, pid);
-  if (!hProcess)
-    return false;
-  const BOOL bTerminated = TerminateProcess(hProcess, 0);
-  CloseHandle(hProcess);
+  const BOOL bTerminated = TerminateProcess(process.get(), 0);
   return bTerminated != FALSE;
 }
 
 static bool RequestSessionShutdown(DWORD pid) {
+  const auto process = GetTrackedProfileProcess(pid);
+  if (!process || WaitForSingleObject(process.get(), 0) != WAIT_TIMEOUT)
+    return false;
   EnumData data{pid};
   EnumWindows(EnumWindowsCallback, (LPARAM)&data);
 
@@ -23474,18 +26527,24 @@ static void ShowSessionOverflowMenu(HWND hWnd) {
   if (g_overflowSessionTabs.empty())
     return;
 
+  std::vector<Session> targets;
+  for (int tab : g_overflowSessionTabs) {
+    if (tab > 0 && tab <= static_cast<int>(g_sessions.size()))
+      targets.push_back(g_sessions[tab - 1]);
+  }
+  if (targets.empty())
+    return;
+
   HMENU hMenu = CreatePopupMenu();
   if (!hMenu)
     return;
 
-  constexpr UINT kOverflowShowBase = 44000;
-  constexpr UINT kOverflowCloseBase = 45000;
   MENUINFO menuInfo{sizeof(menuInfo)};
   menuInfo.fMask = MIM_BACKGROUND;
   menuInfo.hbrBack = g_hbrThemeMenu;
   SetMenuInfo(hMenu, &menuInfo);
   std::vector<MenuItemData> items;
-  items.reserve(g_overflowSessionTabs.size() * 2 + 1);
+  items.reserve(targets.size() * 2 + 1);
   const auto append = [&](UINT command, const std::wstring &text, bool separator = false) {
     items.push_back({text, nullptr, separator});
     MENUITEMINFOW item{sizeof(item)};
@@ -23495,21 +26554,13 @@ static void ShowSessionOverflowMenu(HWND hWnd) {
     item.dwItemData = reinterpret_cast<ULONG_PTR>(&items.back());
     InsertMenuItemW(hMenu, static_cast<UINT>(-1), TRUE, &item);
   };
-  for (int iTab : g_overflowSessionTabs) {
-    std::wstring text = GetSessionTabText(iTab);
-    if (!text.empty()) {
-      append(kOverflowShowBase + iTab, text);
-    }
-  }
+  for (size_t index = 0; index < targets.size(); ++index)
+    append(static_cast<UINT>(index + 1), targets[index].clientName);
 
   append(0, L"", true);
-  for (int iTab : g_overflowSessionTabs) {
-    std::wstring text = GetSessionTabText(iTab);
-    if (!text.empty()) {
-      std::wstring closeText = L"Close " + text;
-      append(kOverflowCloseBase + iTab, closeText);
-    }
-  }
+  for (size_t index = 0; index < targets.size(); ++index)
+    append(static_cast<UINT>(targets.size() + index + 1),
+           L"Close " + targets[index].clientName);
 
   POINT pt{g_rcSessionOverflow.left, g_rcSessionOverflow.bottom};
   ClientToScreen(hWnd, &pt);
@@ -23519,13 +26570,19 @@ static void ShowSessionOverflowMenu(HWND hWnd) {
   DestroyMenu(hMenu);
   PostMessageW(hWnd, WM_NULL, 0, 0);
 
-  if (cmd >= kOverflowCloseBase) {
-    const int iTab = (int)(cmd - kOverflowCloseBase);
-    CloseSessionTab(iTab);
-  } else if (cmd >= kOverflowShowBase) {
-    const int iTab = (int)(cmd - kOverflowShowBase);
-    SelectSessionTab(iTab, true);
-  }
+  if (!cmd || cmd > targets.size() * 2)
+    return;
+  const bool close = cmd > targets.size();
+  const Session &target = targets[(cmd - 1) % targets.size()];
+  const auto current = std::find_if(g_sessions.begin(), g_sessions.end(),
+      [&](const Session &session) { return session.identity == target.identity; });
+  if (current == g_sessions.end())
+    return;
+  const int tab = static_cast<int>(current - g_sessions.begin()) + 1;
+  if (close)
+    CloseSessionTab(tab);
+  else
+    SelectSessionTab(tab, true);
 }
 
 static void BringSessionToFront(DWORD pid) {

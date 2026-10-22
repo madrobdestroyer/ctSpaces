@@ -1,9 +1,9 @@
 {
-  "version": "6.3.0.0",
+  "version": "6.3.3.0",
   "deferred": [
     "Images",
     "Attachments",
-    "Tables",
+    "Advanced table editing, including row/column commands and resizing",
     "Reminders",
     "Cloud sync",
     "Collaboration",
@@ -32,5 +32,13 @@
     "Move/copy between clients",
     "Optional checklist progress and always-on-top"
   ],
-  "status": "implemented in 6.3.0.0; deferred features retained for later"
+  "editingUpgrade": [
+    "Temporary inline Find/Replace with match case, whole word, wrap and counts",
+    "Remembered word wrap, logical Go to line and document/selection statistics",
+    "On-demand Windows spelling review with explicit corrections",
+    "Independent print copies and native printer/PDF selection",
+    "Previewed UTF-8 Markdown import/export with disclosed conversion limits",
+    "Simple native editable tables with existing-cell Tab/Shift+Tab navigation"
+  ],
+  "status": "Base notes features implemented in 6.3.0.0; editing upgrade in the unpublished 6.3.3.0 review build; deferred features retained for later"
 }

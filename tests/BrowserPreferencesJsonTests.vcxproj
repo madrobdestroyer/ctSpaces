@@ -44,6 +44,7 @@
   <ItemGroup>
     <ClCompile Include="BrowserPreferencesJsonTests.cpp" />
     <ClCompile Include="..\BrowserPreferencesJson.cpp" />
+    <ClCompile Include="..\ConfigPersistence.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="..\BrowserPreferencesJson.h" />

@@ -6,6 +6,7 @@
 #include <fstream>
 #include <iostream>
 #include <stdexcept>
+#include <exception>
 #include <string>
 #include <vector>
 
@@ -44,6 +45,9 @@ public:
   }
 
   ~TemporaryDirectory() {
+    if(std::uncaught_exceptions()) {
+      std::wcerr<<L"Failed configuration fixture retained: "<<path_<<L'\n';return;
+    }
     std::error_code cleanupError;
     fs::remove_all(path_, cleanupError);
   }
@@ -81,7 +85,7 @@ void WriteBytes(const fs::path &path, const std::string &contents) {
 
 std::string ReadBytes(const fs::path &path) {
   std::ifstream input(path, std::ios::binary);
-  Expect(static_cast<bool>(input), "Could not read test output");
+  if(!input)throw std::runtime_error("Could not read test output: "+path.string()+" (Windows error "+std::to_string(GetLastError())+")");
   return std::string(std::istreambuf_iterator<char>(input),
                      std::istreambuf_iterator<char>());
 }
@@ -113,7 +117,7 @@ std::wstring ReadIniValue(const fs::path &path, const wchar_t *section,
 void ExpectNoStagingFiles(const fs::path &directory) {
   for (const auto &entry : fs::directory_iterator(directory)) {
     const std::wstring name = entry.path().filename().wstring();
-    Expect(name.find(L".ctspaces-") == std::wstring::npos,
+    Expect(name.find(L".ctspaces-") == std::wstring::npos && !name.starts_with(L"~"),
            "A staged configuration file was leaked");
   }
 }
@@ -541,6 +545,83 @@ void TestIndeterminateProbeSupportsAllOrNothingPruning() {
          "Indeterminate filesystem state was allowed to prune preferences");
 }
 
+void TestExternalChangesRejectStaleCommit() {
+  TemporaryDirectory temporary;
+  const fs::path config = temporary.path() / L"config.ini";
+  const std::string original = "[user]\r\ntheme=2\r\nkeep=Original\r\n";
+  const std::string external = "[user]\r\ntheme=2\r\nkeep=External\r\n";
+  for (unsigned scenario = 0; scenario < 5; ++scenario) {
+    std::error_code ignored; fs::remove(config, ignored);
+    if (scenario != 4) WriteBytes(config, original);
+    std::wstring details;
+    const bool updated = config_persistence::MutateIniFileAtomically(config,
+        [&](const fs::path &stage, std::wstring &) {
+          Expect(WritePrivateProfileStringW(L"user", L"theme", L"3", stage.c_str()), "Stage conflict fixture mutation");
+          if (scenario == 0) WriteBytes(config, external);
+          if (scenario == 1) Expect(DeleteFileW(config.c_str()), "Delete existing config during staging");
+          if (scenario == 2 || scenario == 3) {
+            const fs::path replacement = temporary.path() / L"replacement.ini";
+            WriteBytes(replacement, scenario == 2 ? external : original);
+            Expect(MoveFileExW(replacement.c_str(), config.c_str(), MOVEFILE_REPLACE_EXISTING), "Replace config identity during staging");
+          }
+          if (scenario == 4) WriteBytes(config, external);
+          return true;
+        }, &details);
+    Expect(!updated, "A stale config transaction must reject changed existence, identity or contents");
+    if (scenario == 1) Expect(!fs::exists(config), "External deletion must not be undone by stale save");
+    else Expect(ReadBytes(config) == (scenario == 3 ? original : external), "Rejected stale save preserves exact external bytes");
+    ExpectNoStagingFiles(temporary.path());
+    Expect(config_persistence::ApplyIniMutationsAtomically(config,
+        {{L"user", std::wstring(L"theme"), std::wstring(L"3")}}, &details), "Fresh retry succeeds on the current snapshot");
+    Expect(ReadIniValue(config, L"user", L"theme") == L"3", "Fresh retry applies the desired setting");
+    if (scenario != 1) Expect(ReadIniValue(config, L"user", L"keep") == (scenario == 3 ? L"Original" : L"External"), "Retry preserves the external unrelated value");
+  }
+  std::wcout << L"External config snapshot conflict cases passed (5 scenarios).\n";
+}
+
+void TestBoundedConfigurationStageNames() {
+  TemporaryDirectory temporary;
+  const std::string original = "[user]\r\ntheme=2\r\nkeep=Original\r\n";
+  for (size_t length : {size_t{249}, size_t{259}}) {
+    const fs::path config = temporary.path() /
+        (std::wstring(length - temporary.path().native().size() - 5, L'x') + L".ini");
+    WriteBytes(config, original);
+    std::wstring details;
+    Expect(config_persistence::ApplyIniMutationsAtomically(config,
+        {{L"user", std::wstring(L"theme"), std::wstring(L"3")}}, &details), "Valid near-MAX_PATH config now stages within its filename budget");
+    Expect(ReadIniValue(config, L"user", L"theme") == L"3" && ReadIniValue(config, L"user", L"keep") == L"Original", "Long config update preserves unrelated values");
+    ExpectNoStagingFiles(temporary.path());
+  }
+  const fs::path tiny = temporary.path() / L"x";
+  WriteBytes(tiny, original);
+  std::wstring details;
+  Expect(config_persistence::ApplyIniMutationsAtomically(tiny,
+      {{L"user", std::wstring(L"theme"), std::wstring(L"4")}}, &details), "Single-character destination supports a separate bounded stage");
+  Expect(ReadIniValue(tiny, L"user", L"theme") == L"4", "Single-character target stores the setting");
+  const auto count = std::distance(fs::directory_iterator(temporary.path()), fs::directory_iterator{});
+  for (unsigned repeat = 0; repeat < 80; ++repeat)
+    Expect(config_persistence::ApplyIniMutationsAtomically(tiny,
+        {{L"user", std::wstring(L"theme"), std::to_wstring(repeat)}}, &details), "Repeated tiny filename staging remains collision-safe");
+  Expect(std::distance(fs::directory_iterator(temporary.path()), fs::directory_iterator{}) == count,
+      "Repeated bounded config commits leave no staging siblings");
+  const std::wstring_view alphabet = L"0123456789abcdefghijklmnopqrstuvwxyz_-~";
+  for (wchar_t character : alphabet) if (character != L'x')
+    WriteBytes(temporary.path() / std::wstring(1, character), "COLLISION SENTINEL");
+  const auto originalTiny = ReadBytes(tiny);
+  const auto filledCount = std::distance(fs::directory_iterator(temporary.path()), fs::directory_iterator{});
+  Expect(!config_persistence::ApplyIniMutationsAtomically(tiny,
+      {{L"user", std::wstring(L"theme"), std::wstring(L"999")}}, &details), "Exhausted tiny-name namespace rejects instead of overwriting another file");
+  Expect(ReadBytes(tiny) == originalTiny &&
+      std::distance(fs::directory_iterator(temporary.path()), fs::directory_iterator{}) == filledCount,
+      "Exhausted staging namespace preserves config bytes and every occupied file");
+  for (wchar_t character : alphabet) if (character != L'x')
+    Expect(ReadBytes(temporary.path() / std::wstring(1, character)) == "COLLISION SENTINEL",
+        "Failed stage creation never deletes or alters a collision sentinel");
+  std::wcout << L"Bounded config staging cases passed (249/259-character paths and 80 tiny-name commits).\n";
+}
+
+#include "ConfigPublicationTests.inl"
+
 } // namespace
 
 int wmain() {
@@ -556,6 +637,10 @@ int wmain() {
     TestRejectedMutationPreservesOriginalBytes();
     TestMissingFileCreationAndUnsafeTargetRejection();
     TestIndeterminateProbeSupportsAllOrNothingPruning();
+    TestExternalChangesRejectStaleCommit();
+    TestBoundedConfigurationStageNames();
+    TestProtectedConfigurationPublication();
+    TestPartialConfigurationPublication();
     std::wcout << L"Config persistence tests passed.\n";
     return 0;
   } catch (const std::exception &error) {

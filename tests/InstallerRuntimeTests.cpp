@@ -33,6 +33,16 @@ HANDLE WINAPI CreateFileW(LPCWSTR fileName, DWORD desiredAccess,
 HANDLE WINAPI CreateMutexW(LPSECURITY_ATTRIBUTES attributes,
                            BOOL initialOwner, LPCWSTR name);
 HWND WINAPI FindWindowW(LPCWSTR className, LPCWSTR windowName);
+HWND WINAPI CreateWindowExW(DWORD extendedStyle, LPCWSTR className,
+    LPCWSTR windowName, DWORD style, int x, int y, int width, int height,
+    HWND parent, HMENU menu, HINSTANCE instance, LPVOID parameter);
+BOOL WINAPI InvalidateRect(HWND window, const RECT *area, BOOL erase);
+BOOL WINAPI RedrawWindow(HWND window, const RECT *area, HRGN region, UINT flags);
+BOOL WINAPI ShowWindow(HWND window, int command);
+HWND WINAPI SetFocus(HWND window);
+BOOL WINAPI SetForegroundWindow(HWND window);
+HWND WINAPI SetActiveWindow(HWND window);
+BOOL WINAPI BringWindowToTop(HWND window);
 } // namespace installer_test_boundary
 
 // Compile the production translation unit into the harness. Only the explicitly
@@ -50,7 +60,23 @@ HWND WINAPI FindWindowW(LPCWSTR className, LPCWSTR windowName);
 #define CreateFileW installer_test_boundary::CreateFileW
 #define CreateMutexW installer_test_boundary::CreateMutexW
 #define FindWindowW installer_test_boundary::FindWindowW
+#define CreateWindowExW installer_test_boundary::CreateWindowExW
+#define InvalidateRect installer_test_boundary::InvalidateRect
+#define RedrawWindow installer_test_boundary::RedrawWindow
+#define ShowWindow installer_test_boundary::ShowWindow
+#define SetFocus installer_test_boundary::SetFocus
+#define SetForegroundWindow installer_test_boundary::SetForegroundWindow
+#define SetActiveWindow installer_test_boundary::SetActiveWindow
+#define BringWindowToTop installer_test_boundary::BringWindowToTop
 #include "../ctSpaces.cpp"
+#undef BringWindowToTop
+#undef SetActiveWindow
+#undef SetForegroundWindow
+#undef SetFocus
+#undef ShowWindow
+#undef RedrawWindow
+#undef InvalidateRect
+#undef CreateWindowExW
 #undef FindWindowW
 #undef CreateMutexW
 #undef CreateFileW
@@ -91,6 +117,10 @@ bool g_armLateClientDeleteLock = false;
 fs::path g_lateClientDeleteLockPath;
 HANDLE g_lateClientDeleteLock = nullptr;
 bool g_handoffMode = false;
+bool g_headlessOnly = false;
+unsigned g_headlessInvalidPaint = 0, g_headlessPresentation = 0;
+unsigned g_headlessWindowRequests = 0, g_headlessNativeShows = 0;
+unsigned g_headlessNativeFocus = 0, g_headlessNativeForeground = 0;
 std::wstring g_handoffToken;
 fs::path g_handoffLocalAppData;
 
@@ -132,6 +162,78 @@ void Check(bool condition, const std::string &message) {
   if (!condition)
     Fail(message);
 }
+
+bool HeadlessBoundaryActive() { return g_headlessOnly && !g_handoffMode; }
+
+void CALLBACK HeadlessNativeEvent(HWINEVENTHOOK, DWORD event, HWND,
+                                  LONG object, LONG, DWORD, DWORD) {
+  if (event == EVENT_SYSTEM_FOREGROUND) ++g_headlessNativeForeground;
+  else if (event == EVENT_OBJECT_FOCUS) ++g_headlessNativeFocus;
+  else if (event == EVENT_OBJECT_SHOW && object == OBJID_WINDOW)
+    ++g_headlessNativeShows;
+}
+
+LRESULT CALLBACK HeadlessCbt(int code, WPARAM w, LPARAM l) {
+  if (code == HCBT_CREATEWND) { ++g_headlessWindowRequests; return 1; }
+  if (code == HCBT_ACTIVATE || code == HCBT_SETFOCUS) {
+    ++g_headlessPresentation; return 1;
+  }
+  return CallNextHookEx(nullptr, code, w, l);
+}
+
+struct HeadlessDesktopBoundary {
+  std::vector<HWINEVENTHOOK> events;
+  HHOOK creation = nullptr;
+  void Start() {
+    for (DWORD event : {EVENT_OBJECT_SHOW, EVENT_OBJECT_FOCUS,
+                        EVENT_SYSTEM_FOREGROUND}) {
+      const auto hook = SetWinEventHook(event, event, nullptr,
+          HeadlessNativeEvent, GetCurrentProcessId(), 0, WINEVENT_OUTOFCONTEXT);
+      Check(hook != nullptr, "could not observe headless native GUI events");
+      events.push_back(hook);
+    }
+    creation = SetWindowsHookExW(WH_CBT, HeadlessCbt, nullptr,
+                                 GetCurrentThreadId());
+    Check(creation != nullptr, "could not prevent headless GUI creation/activation");
+  }
+  void Audit() {
+    MSG message{};
+    bool input = false;
+    while (PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE)) {
+      if ((message.message >= WM_KEYFIRST && message.message <= WM_KEYLAST) ||
+          (message.message >= WM_MOUSEFIRST && message.message <= WM_MOUSELAST)) {
+        input = true; continue;
+      }
+      DispatchMessageW(&message);
+    }
+    unsigned windows = 0;
+    EnumWindows([](HWND window, LPARAM count) -> BOOL {
+      DWORD pid = 0; GetWindowThreadProcessId(window, &pid);
+      if (pid == GetCurrentProcessId()) ++*reinterpret_cast<unsigned *>(count);
+      return TRUE;
+    }, reinterpret_cast<LPARAM>(&windows));
+    GUITHREADINFO gui{sizeof(gui)};
+    const bool threadSafe = GetGUIThreadInfo(GetCurrentThreadId(), &gui) &&
+        !gui.hwndActive && !gui.hwndFocus && !gui.hwndCapture;
+    std::cout << "Installer headless safety: invalid_paint=" << g_headlessInvalidPaint
+        << " presentation=" << g_headlessPresentation
+        << " window_requests=" << g_headlessWindowRequests
+        << " windows=" << windows << " native_show=" << g_headlessNativeShows
+        << " native_focus=" << g_headlessNativeFocus
+        << " native_foreground=" << g_headlessNativeForeground
+        << " device_input=" << input << '\n';
+    Check(!g_headlessInvalidPaint && !g_headlessPresentation &&
+        !g_headlessWindowRequests && !windows && !g_headlessNativeShows &&
+        !g_headlessNativeFocus && !g_headlessNativeForeground && !input &&
+        threadSafe && !g_hGui && !g_hClientEdit && !g_hComboClient &&
+        !g_hClientEditSurface,
+        "headless runtime refused unsafe paint, presentation or native GUI activity");
+  }
+  ~HeadlessDesktopBoundary() {
+    if (creation) UnhookWindowsHookEx(creation);
+    for (const auto hook : events) UnhookWinEvent(hook);
+  }
+};
 
 bool SamePath(const fs::path &left, const fs::path &right) {
   return _wcsicmp(fs::absolute(left).lexically_normal().c_str(),
@@ -572,16 +674,19 @@ void TestRealInstalledChildReadinessHandoff() {
       ReadEnvironment(L"CTSPACES_INSTALLER_TEST_LOCALAPPDATA");
   const std::wstring oldToken =
       ReadEnvironment(L"CTSPACES_INSTALLER_TEST_TOKEN");
+  const std::wstring oldDelay = ReadEnvironment(L"CTSPACES_INSTALLER_TEST_DELAY_CLIENT_EDIT");
   SetEnvironmentVariableW(L"CTSPACES_INSTALLER_TEST_LOCALAPPDATA",
                           localAppData.c_str());
   SetEnvironmentVariableW(L"CTSPACES_INSTALLER_TEST_TOKEN", token.c_str());
+  SetEnvironmentVariableW(L"CTSPACES_INSTALLER_TEST_DELAY_CLIENT_EDIT", L"1");
 
   HANDLE updaterProcess = nullptr;
   HANDLE childProcess = nullptr;
   DWORD childId = 0;
-  const auto cleanup = [&]() {
+  bool childIdentityVerified = false;
+  const auto cleanup = [&](bool removeFixture) {
     if (childProcess) {
-      if (WaitForSingleObject(childProcess, 0) == WAIT_TIMEOUT)
+      if (childIdentityVerified && WaitForSingleObject(childProcess, 0) == WAIT_TIMEOUT)
         TerminateProcess(childProcess, 197);
       WaitForSingleObject(childProcess, 5000);
       CloseHandle(childProcess);
@@ -598,6 +703,12 @@ void TestRealInstalledChildReadinessHandoff() {
                             oldRoot.empty() ? nullptr : oldRoot.c_str());
     SetEnvironmentVariableW(L"CTSPACES_INSTALLER_TEST_TOKEN",
                             oldToken.empty() ? nullptr : oldToken.c_str());
+    SetEnvironmentVariableW(L"CTSPACES_INSTALLER_TEST_DELAY_CLIENT_EDIT",
+                            oldDelay.empty() ? nullptr : oldDelay.c_str());
+    if (!removeFixture) {
+      std::wcerr << L"Failed installer handoff fixture retained: " << root << L'\n';
+      return;
+    }
     const fs::path checkedRoot = fs::absolute(root).lexically_normal();
     const DWORD attributes = GetFileAttributesW(checkedRoot.c_str());
     if (checkedRoot.parent_path() == tempBase &&
@@ -644,24 +755,54 @@ void TestRealInstalledChildReadinessHandoff() {
     pidFile.close();
     Check(!pidFile.fail(), "handoff child PID file could not be closed");
     Check(childId != 0, "handoff child PID was invalid");
-    childProcess = OpenProcess(SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION,
+    childProcess = OpenProcess(SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_TERMINATE,
                                FALSE, childId);
     Check(childProcess != nullptr, "could not open installed handoff child");
+    std::vector<wchar_t> childImage(32768, L'\0');DWORD imageLength=static_cast<DWORD>(childImage.size());
+    Check(QueryFullProcessImageNameW(childProcess,0,childImage.data(),&imageLength) &&
+          SamePath(fs::path(std::wstring(childImage.data(),imageLength)),
+              localAppData / L"InfinitySys" / L"ctSpaces" / L"ctSpaces.exe"),
+          "installed handoff child process identity escaped its copied fixture image");
+    childIdentityVerified = true;
 
     HWND mainWindow = nullptr;
-    for (unsigned attempt = 0; attempt < 300 && !mainWindow; ++attempt) {
+    bool ready = false;
+    const ULONGLONG readinessStarted = GetTickCount64();
+    const ULONGLONG readinessDeadline = readinessStarted + 30000;
+    while (GetTickCount64() < readinessDeadline && !ready) {
       Check(WaitForSingleObject(childProcess, 0) == WAIT_TIMEOUT,
             "installed handoff child exited before window readiness");
       mainWindow = FindMainWindowForProcess(childId);
-      if (!mainWindow)
+      const bool combo = mainWindow && GetDlgItem(mainWindow,102)!=nullptr;
+      const bool edit = mainWindow && GetDlgItem(mainWindow,IDC_CLIENT_EDIT)!=nullptr;
+      {
+        std::ofstream trace(root / L"parent-readiness.txt",std::ios::app);
+        trace << "elapsed=" << (GetTickCount64()-readinessStarted)
+              << " main=" << (mainWindow!=nullptr) << " combo=" << combo << " edit=" << edit << '\n';
+      }
+      if (combo && edit) {
+        DWORD_PTR response = 0;
+        const ULONGLONG remaining = readinessDeadline > GetTickCount64() ? readinessDeadline-GetTickCount64() : 0;
+        if (remaining != 0)
+          ready = SendMessageTimeoutW(mainWindow,WM_NULL,0,0,SMTO_ABORTIFHUNG|SMTO_BLOCK,
+              static_cast<UINT>((std::min)(remaining,ULONGLONG{300})),&response)!=0 &&
+              WaitForSingleObject(childProcess,0)==WAIT_TIMEOUT;
+      }
+      if (!ready)
         Sleep(100);
     }
     Check(mainWindow != nullptr,
           "installed handoff child did not create its production main window");
+    {
+      std::ofstream trace(root / L"parent-readiness.txt",std::ios::app);
+      trace << "observed-main combo=" << (GetDlgItem(mainWindow,102)!=nullptr)
+            << " edit=" << (GetDlgItem(mainWindow,IDC_CLIENT_EDIT)!=nullptr) << '\n';
+    }
     Check(GetDlgItem(mainWindow, 102) != nullptr,
           "installed handoff child did not create the client combo control");
     Check(GetDlgItem(mainWindow, IDC_CLIENT_EDIT) != nullptr,
           "installed handoff child did not create the client edit control");
+    Check(ready,"installed handoff child controls did not become alive and responsive within the 30-second readiness deadline");
     DWORD_PTR response = 0;
     Check(SendMessageTimeoutW(mainWindow, WM_NULL, 0, 0,
                               SMTO_ABORTIFHUNG | SMTO_BLOCK, 3000,
@@ -676,6 +817,13 @@ void TestRealInstalledChildReadinessHandoff() {
         localAppData / L"registry-write-attempted";
     Check(!fs::exists(registryEscape),
           "handoff attempted a forbidden registry mutation");
+    const auto childReadinessBytes = ReadBytes(localAppData / L"child-readiness.txt");
+    const std::string childReadiness(childReadinessBytes.begin(),childReadinessBytes.end());
+    Check(childReadiness.find("before-client-edit-create")!=std::string::npos &&
+          childReadiness.find("after-client-edit-create success=1")!=std::string::npos,
+          "controlled installed-child edit creation delay was not exercised");
+    std::cout << "Installed handoff readiness passed after " << (GetTickCount64()-readinessStarted)
+              << "ms with deterministic 350ms edit creation delay.\n";
 
     PostMessageW(mainWindow, WM_CLOSE, 0, 0);
     Check(WaitForSingleObject(childProcess, 10000) == WAIT_OBJECT_0,
@@ -683,12 +831,12 @@ void TestRealInstalledChildReadinessHandoff() {
     DWORD childExit = 0;
     Check(GetExitCodeProcess(childProcess, &childExit) && childExit == 0,
           "installed handoff child returned a failure exit code");
-    cleanup();
+    cleanup(true);
     Check(!fs::exists(root),
           "isolated installed-child handoff fixture was not removed after "
           "closing all harness handles");
   } catch (...) {
-    cleanup();
+    cleanup(false);
     throw;
   }
 }
@@ -927,6 +1075,46 @@ bool CtSpacesInstallerTestTryGetExeVersion(const fs::path &filePath,
 
 namespace installer_test_boundary {
 
+static bool RejectHeadlessPaintTarget(HWND window) {
+  if (!HeadlessBoundaryActive()) return false;
+  DWORD pid = 0;
+  if (window && IsWindow(window) &&
+      GetWindowThreadProcessId(window, &pid) && pid == GetCurrentProcessId())
+    return false;
+  ++g_headlessInvalidPaint;
+  SetLastError(ERROR_INVALID_WINDOW_HANDLE);
+  return true;
+}
+
+BOOL WINAPI InvalidateRect(HWND window, const RECT *area, BOOL erase) {
+  if (RejectHeadlessPaintTarget(window)) return FALSE;
+  return ::InvalidateRect(window, area, erase);
+}
+BOOL WINAPI RedrawWindow(HWND window, const RECT *area, HRGN region, UINT flags) {
+  if (RejectHeadlessPaintTarget(window)) return FALSE;
+  return ::RedrawWindow(window, area, region, flags);
+}
+BOOL WINAPI ShowWindow(HWND window, int command) {
+  if (HeadlessBoundaryActive()) { ++g_headlessPresentation; return FALSE; }
+  return ::ShowWindow(window, command);
+}
+HWND WINAPI SetFocus(HWND window) {
+  if (HeadlessBoundaryActive()) { ++g_headlessPresentation; return nullptr; }
+  return ::SetFocus(window);
+}
+BOOL WINAPI SetForegroundWindow(HWND window) {
+  if (HeadlessBoundaryActive()) { ++g_headlessPresentation; return FALSE; }
+  return ::SetForegroundWindow(window);
+}
+HWND WINAPI SetActiveWindow(HWND window) {
+  if (HeadlessBoundaryActive()) { ++g_headlessPresentation; return nullptr; }
+  return ::SetActiveWindow(window);
+}
+BOOL WINAPI BringWindowToTop(HWND window) {
+  if (HeadlessBoundaryActive()) { ++g_headlessPresentation; return FALSE; }
+  return ::BringWindowToTop(window);
+}
+
 BOOL WINAPI ShellExecuteExW(SHELLEXECUTEINFOW *executeInfo) {
   ++g_launchCalls;
   Check(executeInfo != nullptr, "ShellExecuteExW received null details");
@@ -1077,6 +1265,30 @@ HWND WINAPI FindWindowW(LPCWSTR className, LPCWSTR windowName) {
   return ::FindWindowW(className, windowName);
 }
 
+HWND WINAPI CreateWindowExW(DWORD extendedStyle, LPCWSTR className,
+    LPCWSTR windowName, DWORD style, int x, int y, int width, int height,
+    HWND parent, HMENU menu, HINSTANCE instance, LPVOID parameter) {
+  if (HeadlessBoundaryActive()) {
+    ++g_headlessWindowRequests;
+    SetLastError(ERROR_ACCESS_DENIED);
+    return nullptr;
+  }
+  const bool delayedEdit = g_handoffMode && reinterpret_cast<INT_PTR>(menu)==IDC_CLIENT_EDIT &&
+      className && wcscmp(className,L"EDIT")==0 &&
+      ReadEnvironment(L"CTSPACES_INSTALLER_TEST_DELAY_CLIENT_EDIT")==L"1";
+  if (delayedEdit) {
+    std::ofstream trace(g_handoffLocalAppData / L"child-readiness.txt",std::ios::app);
+    trace << "before-client-edit-create (delayed 350ms)\n";trace.flush();
+    Sleep(350);
+  }
+  HWND window=::CreateWindowExW(extendedStyle,className,windowName,style,x,y,width,height,parent,menu,instance,parameter);
+  if (delayedEdit) {
+    std::ofstream trace(g_handoffLocalAppData / L"child-readiness.txt",std::ios::app);
+    trace << "after-client-edit-create success=" << (window!=nullptr) << '\n';
+  }
+  return window;
+}
+
 HANDLE WINAPI CreateFileW(LPCWSTR fileName, DWORD desiredAccess,
                           DWORD shareMode,
                           LPSECURITY_ATTRIBUTES securityAttributes,
@@ -1122,6 +1334,11 @@ int wmain(int argc, wchar_t **argv) {
     const bool headlessOnly =
         argc == 2 &&
         wcscmp(argv[1], L"--installer-runtime-headless") == 0;
+    Check(argc == 1 || headlessOnly,
+          "unknown installer test arguments; refusing to run any scenarios");
+    g_headlessOnly = headlessOnly;
+    HeadlessDesktopBoundary desktopBoundary;
+    if (headlessOnly) desktopBoundary.Start();
     g_currentExecutable = GetCurrentExecutablePath();
     Check(!g_currentExecutable.empty(),
           "could not resolve installer harness executable path");
@@ -1146,6 +1363,7 @@ int wmain(int argc, wchar_t **argv) {
     TestFirefoxClientDeletionShape();
     if (!headlessOnly)
       TestRealInstalledChildReadinessHandoff();
+    if (headlessOnly) desktopBoundary.Audit();
 
     std::wcout << L"Installer runtime tests passed ("
                << (headlessOnly ? 20 : 21)

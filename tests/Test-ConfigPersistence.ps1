@@ -26,7 +26,22 @@ foreach ($requiredGuard in @(
     "converted.find(L'\0')",
     'WritePrivateProfileStringW(nullptr, nullptr, nullptr',
     'FlushFileBuffers',
-    'MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH',
+    'if(expected.missing)',
+    'MoveFileExW(stagedPath.c_str(),configPath.c_str(),MOVEFILE_WRITE_THROUGH)',
+    'PublishConfigReplacement',
+    'ReplaceFileW',
+    'SameConfigSnapshot(expected,previous)',
+    'SameConfigSnapshot(staged,installed)',
+    'RenameMatchingConfigSnapshot',
+    'DeleteMatchingConfigSnapshot',
+    'FILE_FLAG_DELETE_ON_CLOSE',
+    'ProtectConfigDirectoryContents',
+    'AllowConfigDirectoryWrites',
+    'RemoveStageFile(stagedPath,&stageIdentity)',
+    'CaptureConfigSnapshot',
+    'SameConfigSnapshot(expected, current)',
+    'NewConfigStageName',
+    'CREATE_NEW',
     'DirectChildDirectoryState::Indeterminate'
 )) {
     if (-not $moduleSource.Contains($requiredGuard)) {
@@ -37,9 +52,6 @@ foreach ($requiredGuard in @(
 foreach ($requiredIntegration in @(
     '#include "ConfigPersistence.h"',
     'config_persistence::ApplyIniMutationsAtomically(',
-    'static bool SavePinnedClients()',
-    'static bool SaveArchivedClients()',
-    'static bool SaveRestoreTabsPreferences()',
     'ProbeClientProfileForPruning',
     'HasReadableConfigFile()'
 )) {
@@ -48,8 +60,20 @@ foreach ($requiredIntegration in @(
     }
 }
 
-if ($appSource.Contains('WritePrivateProfileStringW(')) {
-    throw 'ctSpaces still writes directly to the live INI instead of the atomic module.'
+foreach ($saver in @('SavePinnedClients','SaveArchivedClients','SaveRestoreTabsPreferences')) {
+    if ($appSource -notmatch ('static\s+bool\s+' + $saver +
+        '\(\s*const\s+std::vector<std::wstring>\s*\*expectedOriginal')) {
+        throw "The $saver full-list path must accept its captured original snapshot."
+    }
+}
+if ($appSource -notmatch 'SaveClientListSnapshot\([^;{}]*\)\s*\{[\s\S]*?MutateIniFileAtomically\([\s\S]*?ReadStagedClientList\([\s\S]*?current\s*!=\s*expectedOriginal') {
+    throw 'Client-list updates must validate current staged settings against their captured original snapshot inside the atomic transaction.'
+}
+foreach ($nativeWrite in [regex]::Matches($appSource,'WritePrivateProfileStringW\([\s\S]*?;')) {
+    if ($nativeWrite.Value -notmatch 'stagedPath\.c_str\(\)' -or
+        $nativeWrite.Value -match 'g_sConfigPath|configPath\.c_str\(\)') {
+        throw 'An application INI write does not target its private atomic stage.'
+    }
 }
 
 foreach ($pruneFunction in @(

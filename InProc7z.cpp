@@ -28,10 +28,19 @@
 #include "3p/7zip/C/7zVersion.h"
 
 #include <cwctype>
+#include <atomic>
+#include <filesystem>
+#include <map>
+#include <memory>
+#include <mutex>
 #include <new>
+#include <optional>
 #include <set>
 #include <string>
+#include <tuple>
 #include <utility>
+#include <vector>
+#include "ClientNameComparison.h"
 
 #ifdef _WIN32
 extern HINSTANCE g_hInstance;
@@ -63,24 +72,80 @@ using namespace NDir;
 static thread_local _7zProgressCb g__7zProgressCb = nullptr;
 static thread_local void* g__7zProgressUser = nullptr;
 static thread_local _7zOp g__7zProgressOp = _7zOp::Extract;
+static thread_local _7zDetailedProgressCb g__7zDetailedCb = nullptr;
+static thread_local void *g__7zDetailedUser = nullptr;
+static thread_local _7zProgressPhase g__7zDetailedPhase = _7zProgressPhase::Verifying;
+#ifdef CTSPACES_BACKUP_TEST_HOOKS
+static thread_local unsigned g_cleanupDenied=0,g_cleanupObserved=0;
+static thread_local bool g_cleanupTargeted=false;
+void _7zDenyCleanupParentAttemptsForTest(unsigned attempts){
+    g_cleanupDenied=attempts;g_cleanupObserved=0;g_cleanupTargeted=false;
+}
+unsigned _7zCleanupParentAttemptsForTest(){return g_cleanupObserved;}
+#endif
 
 struct _7zScopedProgress {
     _7zProgressCb prevCb{};
     void* prevUser{};
     _7zOp prevOp{_7zOp::Extract};
-    _7zScopedProgress(_7zOp op, _7zProgressCb cb, void* user){
+    _7zDetailedProgressCb prevDetailed{};
+    void *prevDetailedUser{};
+    _7zProgressPhase prevPhase{};
+    _7zScopedProgress(_7zOp op, _7zProgressCb cb, void* user,
+        _7zDetailedProgressCb detailed = nullptr, void *detailedUser = nullptr){
         prevCb = g__7zProgressCb;
         prevUser = g__7zProgressUser;
         prevOp = g__7zProgressOp;
+        prevDetailed = g__7zDetailedCb;
+        prevDetailedUser = g__7zDetailedUser;
+        prevPhase = g__7zDetailedPhase;
         g__7zProgressCb = cb;
         g__7zProgressUser = user;
         g__7zProgressOp = op;
+        g__7zDetailedCb = detailed;
+        g__7zDetailedUser = detailedUser;
+        g__7zDetailedPhase = op == _7zOp::Compress ? _7zProgressPhase::Compressing : _7zProgressPhase::Verifying;
     }
     ~_7zScopedProgress(){
         g__7zProgressCb = prevCb;
         g__7zProgressUser = prevUser;
         g__7zProgressOp = prevOp;
+        g__7zDetailedCb = prevDetailed;
+        g__7zDetailedUser = prevDetailedUser;
+        g__7zDetailedPhase = prevPhase;
     }
+};
+
+static HRESULT ReportArchiveDetail(_7zProgressPhase phase, UInt64 completed,
+    UInt64 total, UInt64 items, UInt64 totalItems, bool known,
+    const wchar_t *current = nullptr) {
+    if(!g__7zDetailedCb)return S_OK;
+    const _7zProgressInfo info{phase,completed,total,items,totalItems,known,current};
+    try{g__7zDetailedCb(g__7zDetailedUser,info);return S_OK;}
+    catch(...){return E_ABORT;}
+}
+
+// Capture operation-local callbacks on the caller thread. 7-Zip can later
+// invoke the callback object on codec worker threads whose TLS is unrelated.
+struct COperationProgress {
+    struct State {std::recursive_mutex dispatch;std::atomic<bool> aborted{false};};
+    std::shared_ptr<State> Shared=std::make_shared<State>();
+    _7zProgressCb Callback=g__7zProgressCb;
+    void *User=g__7zProgressUser;
+    _7zOp Operation=g__7zProgressOp;
+    _7zDetailedProgressCb Detailed=g__7zDetailedCb;
+    void *DetailedUser=g__7zDetailedUser;
+    _7zProgressPhase Phase=g__7zDetailedPhase;
+    HRESULT Report(unsigned percent,const _7zProgressInfo &info) const {
+        std::lock_guard<std::recursive_mutex> dispatch(Shared->dispatch);
+        if(Shared->aborted.load())return E_ABORT;
+        try{
+            if(Callback)Callback(User,Operation,percent,info.currentItem);
+            if(Detailed)Detailed(DetailedUser,info);
+            return S_OK;
+        }catch(...){Shared->aborted.store(true);return E_ABORT;}
+    }
+    bool Aborted()const{return Shared->aborted.load();}
 };
 
 static void DebugPrintA(const char* s){ if(s) ::OutputDebugStringA(s); }
@@ -247,7 +312,72 @@ struct CDirItem{
     FILETIME CTime{};
     FILETIME ATime{};
     FILETIME MTime{};
+    // Keep the exact file object read-only for the entire archive transaction.
+    // Reopening a pathname later can otherwise follow a substituted ancestor.
+    CMyComPtr<IInStream> SourceStream;
+    UInt64 FileId=0;
+    UInt32 VolumeId=0;
 };
+
+struct CSourceDirectoryLease {
+    HANDLE Handle=INVALID_HANDLE_VALUE;
+    ~CSourceDirectoryLease(){if(Handle!=INVALID_HANDLE_VALUE)::CloseHandle(Handle);}
+};
+
+using CSourceDirectoryLeases=std::vector<std::unique_ptr<CSourceDirectoryLease>>;
+
+static HRESULT PinSourceDirectory(const std::filesystem::path& path,
+                                  CSourceDirectoryLeases& leases){
+    auto lease=std::make_unique<CSourceDirectoryLease>();
+    lease->Handle=::CreateFileW(path.c_str(),GENERIC_READ,
+        FILE_SHARE_READ,nullptr,OPEN_EXISTING,
+        FILE_FLAG_OPEN_REPARSE_POINT|FILE_FLAG_BACKUP_SEMANTICS,nullptr);
+    if(lease->Handle==INVALID_HANDLE_VALUE)return HRESULT_FROM_WIN32(::GetLastError());
+    BY_HANDLE_FILE_INFORMATION info{};
+    if(!::GetFileInformationByHandle(lease->Handle,&info) ||
+       !(info.dwFileAttributes&FILE_ATTRIBUTE_DIRECTORY) ||
+       (info.dwFileAttributes&FILE_ATTRIBUTE_REPARSE_POINT))
+        return HRESULT_FROM_WIN32(ERROR_CANT_ACCESS_FILE);
+    leases.push_back(std::move(lease));
+    return S_OK;
+}
+
+static HRESULT PinSourceAncestors(const std::filesystem::path& source,
+                                 CSourceDirectoryLeases& leases){
+    const auto absolute=std::filesystem::absolute(source).lexically_normal();
+    std::filesystem::path current=absolute.root_path();
+    RINOK(PinSourceDirectory(current,leases))
+    for(const auto& component:absolute.relative_path()){
+        current/=component;
+        RINOK(PinSourceDirectory(current,leases))
+    }
+    return S_OK;
+}
+
+static HRESULT BindSourceFile(CDirItem& item){
+    HANDLE first=::CreateFileW(item.FullPath.Ptr(),GENERIC_READ,FILE_SHARE_READ,
+        nullptr,OPEN_EXISTING,FILE_FLAG_OPEN_REPARSE_POINT,nullptr);
+    if(first==INVALID_HANDLE_VALUE)return HRESULT_FROM_WIN32(::GetLastError());
+    BY_HANDLE_FILE_INFORMATION identity{};
+    const bool regular=::GetFileInformationByHandle(first,&identity) &&
+        !(identity.dwFileAttributes&(FILE_ATTRIBUTE_DIRECTORY|FILE_ATTRIBUTE_REPARSE_POINT));
+    if(!regular){::CloseHandle(first);return HRESULT_FROM_WIN32(ERROR_CANT_ACCESS_FILE);}
+    CInFileStream* stream=new CInFileStream;
+    CMyComPtr<IInStream> owned(stream);
+    const bool opened=stream->OpenShared(item.FullPath,false);
+    CStreamFileProps props{};
+    const HRESULT properties=opened?stream->GetProps2(&props):HRESULT_FROM_WIN32(::GetLastError());
+    const UInt64 fileId=(static_cast<UInt64>(identity.nFileIndexHigh)<<32)|identity.nFileIndexLow;
+    const bool same=SUCCEEDED(properties) && props.VolID==identity.dwVolumeSerialNumber &&
+        props.FileID_Low==fileId && props.Size==item.Size &&
+        !(props.Attrib&(FILE_ATTRIBUTE_DIRECTORY|FILE_ATTRIBUTE_REPARSE_POINT));
+    ::CloseHandle(first);
+    if(!same)return FAILED(properties)?properties:HRESULT_FROM_WIN32(ERROR_FILE_INVALID);
+    item.FileId=fileId;
+    item.VolumeId=identity.dwVolumeSerialNumber;
+    item.SourceStream=owned;
+    return S_OK;
+}
 
 struct CEnumBudget{
     UInt64 ItemCount=0;
@@ -280,8 +410,21 @@ static HRESULT EnumDirRecursive(
     const UString& rootNameInArchive,
     unsigned currentDepth,
     CEnumBudget& budget,
-    CObjectVector<CDirItem>& outItems){
+    CObjectVector<CDirItem>& outItems,
+    CSourceDirectoryLeases& leases,
+    const std::vector<std::wstring> *selectedChildren=nullptr){
 #ifdef _WIN32
+    std::vector<bool> seen;
+    if(selectedChildren){
+        if(selectedChildren->empty())return E_INVALIDARG;
+        seen.resize(selectedChildren->size());
+        for(size_t i=0;i<selectedChildren->size();++i){
+            const auto &name=(*selectedChildren)[i];
+            std::wstring key;
+            if(name.find_first_of(L"\\/")!=std::wstring::npos || !GetArchivePathKey(UString(name.c_str()),key))return E_INVALIDARG;
+            for(size_t j=0;j<i;++j)if(client_name_comparison::EqualIgnoringCase(name,(*selectedChildren)[j]))return E_INVALIDARG;
+        }
+    }
     // pattern: current\*
     FString pattern=currentDirFull;
     if(!pattern.IsEmpty()){
@@ -304,6 +447,15 @@ static HRESULT EnumDirRecursive(
         const wchar_t* name=fd.cFileName;
         if(!name||!name[0]) continue;
         if(wcscmp(name,L".")==0||wcscmp(name,L"..")==0) continue;
+        if(selectedChildren){
+            size_t selected=selectedChildren->size();
+            for(size_t i=0;i<selectedChildren->size();++i)
+                if(client_name_comparison::EqualIgnoringCase(name,(*selectedChildren)[i])){selected=i;break;}
+            if(selected==selectedChildren->size())continue;
+            if(seen[selected]){CloseFind();return HRESULT_FROM_WIN32(ERROR_DUP_NAME);}
+            if(!(fd.dwFileAttributes&FILE_ATTRIBUTE_DIRECTORY)){CloseFind();return HRESULT_FROM_WIN32(ERROR_DIRECTORY);}
+            seen[selected]=true;
+        }
 
         if((fd.dwFileAttributes&FILE_ATTRIBUTE_REPARSE_POINT)!=0){
             CloseFind();
@@ -358,11 +510,15 @@ static HRESULT EnumDirRecursive(
 
         HRESULT hr=ChargeEnumerationBudget(budget,isDir,item.Size);
         if(FAILED(hr)){ CloseFind(); return hr; }
+        hr=isDir?PinSourceDirectory(std::filesystem::path(childFull.Ptr()),leases):BindSourceFile(item);
+        if(FAILED(hr)){CloseFind();return hr;}
         outItems.Add(item);
+        hr=ReportArchiveDetail(g__7zDetailedPhase,budget.SourceBytes,0,budget.ItemCount,0,false,arcPath.Ptr());
+        if(FAILED(hr)){CloseFind();return hr;}
 
         if(isDir){
             hr=EnumDirRecursive(rootDirFull,childFull,rootNameInArchive,
-                                childDepth,budget,outItems);
+                                childDepth,budget,outItems,leases);
             if(FAILED(hr)){ CloseFind(); return hr; }
         }
 
@@ -370,6 +526,7 @@ static HRESULT EnumDirRecursive(
 
     const DWORD last=::GetLastError();
     CloseFind();
+    if(selectedChildren && std::find(seen.begin(),seen.end(),false)!=seen.end())return HRESULT_FROM_WIN32(ERROR_PATH_NOT_FOUND);
     if(last!=ERROR_NO_MORE_FILES){
         return HRESULT_FROM_WIN32(last);
     }
@@ -385,6 +542,179 @@ static HRESULT EnumDirRecursive(
 // Extract callback (no password)
 // -------------------------
 static const wchar_t* const kEmptyFileAlias=L"[Content]";
+
+struct CExtractedObject {
+    std::filesystem::path Path;
+    HANDLE Handle=INVALID_HANDLE_VALUE;
+    BY_HANDLE_FILE_INFORMATION Identity{};
+    bool Directory=false;
+    ~CExtractedObject(){if(Handle!=INVALID_HANDLE_VALUE)::CloseHandle(Handle);}
+};
+
+struct CExtractionOwnership {
+    std::filesystem::path Root;
+    CSourceDirectoryLeases Ancestors;
+    std::vector<std::unique_ptr<CExtractedObject>> Created;
+    std::set<std::wstring,CArchivePathLess> Directories;
+    bool OwnRoot=false;
+    HRESULT VerifyInventory(const std::vector<_7zRestoreObjectIdentity>& sealed) const {
+        if(sealed.size()!=Created.size())return HRESULT_FROM_WIN32(ERROR_FILE_INVALID);
+        const auto key=[](const std::filesystem::path& path){
+            auto value=path.lexically_normal().native();
+            for(auto& character:value)if(character==L'/')character=L'\\';
+            if(value==L".")value.clear();
+            return value;
+        };
+        std::map<std::wstring,const _7zRestoreObjectIdentity*,CArchivePathLess> observed;
+        for(const auto& entry:sealed)
+            if(!observed.emplace(key(std::filesystem::path(entry.relativePath)),&entry).second)
+                return HRESULT_FROM_WIN32(ERROR_FILE_INVALID);
+        for(const auto& owned:Created){
+            const auto found=observed.find(key(owned->Path.lexically_relative(Root)));
+            if(found==observed.end())return HRESULT_FROM_WIN32(ERROR_FILE_INVALID);
+            const auto& entry=*found->second;
+            if(entry.directory!=owned->Directory || entry.volume!=owned->Identity.dwVolumeSerialNumber ||
+               entry.indexHigh!=owned->Identity.nFileIndexHigh || entry.indexLow!=owned->Identity.nFileIndexLow)
+                return HRESULT_FROM_WIN32(ERROR_FILE_INVALID);
+            observed.erase(found);
+        }
+        return observed.empty()?S_OK:HRESULT_FROM_WIN32(ERROR_FILE_INVALID);
+    }
+    HRESULT Bind(const std::filesystem::path& path,bool directory,
+                 const BY_HANDLE_FILE_INFORMATION* expected=nullptr){
+        auto object=std::make_unique<CExtractedObject>();object->Path=path;object->Directory=directory;
+        object->Handle=::CreateFileW(path.c_str(),(directory?DELETE|GENERIC_READ:GENERIC_READ),
+            FILE_SHARE_READ,nullptr,OPEN_EXISTING,
+            FILE_FLAG_OPEN_REPARSE_POINT|(directory?FILE_FLAG_BACKUP_SEMANTICS:0),nullptr);
+        if(object->Handle==INVALID_HANDLE_VALUE)return HRESULT_FROM_WIN32(::GetLastError());
+        if(!::GetFileInformationByHandle(object->Handle,&object->Identity) ||
+           (object->Identity.dwFileAttributes&FILE_ATTRIBUTE_REPARSE_POINT) ||
+           (((object->Identity.dwFileAttributes&FILE_ATTRIBUTE_DIRECTORY)!=0)!=directory) ||
+           (!directory && object->Identity.nNumberOfLinks!=1) ||
+           (expected && (expected->dwVolumeSerialNumber!=object->Identity.dwVolumeSerialNumber ||
+              expected->nFileIndexHigh!=object->Identity.nFileIndexHigh || expected->nFileIndexLow!=object->Identity.nFileIndexLow)))
+            return HRESULT_FROM_WIN32(ERROR_FILE_INVALID);
+        if(!directory)for(auto& recorded:Created) {
+            if(!recorded->Directory && recorded->Path==path && recorded->Handle==INVALID_HANDLE_VALUE &&
+               recorded->Identity.dwVolumeSerialNumber==object->Identity.dwVolumeSerialNumber &&
+               recorded->Identity.nFileIndexHigh==object->Identity.nFileIndexHigh && recorded->Identity.nFileIndexLow==object->Identity.nFileIndexLow) {
+                recorded->Handle=object->Handle;object->Handle=INVALID_HANDLE_VALUE;return S_OK;
+            }
+        }
+        if(directory)Directories.insert(path.native());
+        Created.push_back(std::move(object));return S_OK;
+    }
+    HRESULT Init(const std::filesystem::path& root,bool ownRoot,HANDLE protectedRoot){
+        Root=std::filesystem::absolute(root).lexically_normal();OwnRoot=ownRoot;
+        RINOK(PinSourceAncestors(Root.parent_path(),Ancestors))
+        if(protectedRoot==INVALID_HANDLE_VALUE){RINOK(Bind(Root,true))}
+        else {
+            auto object=std::make_unique<CExtractedObject>();object->Path=Root;object->Directory=true;
+            if(!::DuplicateHandle(::GetCurrentProcess(),protectedRoot,::GetCurrentProcess(),&object->Handle,0,FALSE,DUPLICATE_SAME_ACCESS) ||
+               !::GetFileInformationByHandle(object->Handle,&object->Identity) ||
+               !(object->Identity.dwFileAttributes&FILE_ATTRIBUTE_DIRECTORY) ||
+               (object->Identity.dwFileAttributes&FILE_ATTRIBUTE_REPARSE_POINT))return HRESULT_FROM_WIN32(ERROR_FILE_INVALID);
+            HANDLE named=::CreateFileW(Root.c_str(),FILE_READ_ATTRIBUTES,FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,nullptr,OPEN_EXISTING,
+                FILE_FLAG_BACKUP_SEMANTICS|FILE_FLAG_OPEN_REPARSE_POINT,nullptr);
+            BY_HANDLE_FILE_INFORMATION identity{};
+            const bool same=named!=INVALID_HANDLE_VALUE && ::GetFileInformationByHandle(named,&identity) &&
+                identity.dwVolumeSerialNumber==object->Identity.dwVolumeSerialNumber && identity.nFileIndexHigh==object->Identity.nFileIndexHigh &&
+                identity.nFileIndexLow==object->Identity.nFileIndexLow;
+            if(named!=INVALID_HANDLE_VALUE)::CloseHandle(named);
+            if(!same)return HRESULT_FROM_WIN32(ERROR_FILE_INVALID);
+            Directories.insert(Root.native());
+            Created.push_back(std::move(object));
+        }
+        return S_OK;
+    }
+    HRESULT EnsureDirectories(const std::filesystem::path& directory){
+        const auto relative=directory.lexically_relative(Root);
+        std::filesystem::path current=Root;
+        for(const auto& part:relative){
+            if(part.empty() || part==L".")continue;
+            if(part==L"..")return E_INVALIDARG;
+            current/=part;
+            if(Directories.contains(current.native()))continue;
+            // Existing unexpected objects belong to somebody else, even when
+            // their names happen to match an archive directory.
+            if(!::CreateDirectoryW(current.c_str(),nullptr))return HRESULT_FROM_WIN32(::GetLastError());
+            RINOK(Bind(current,true))
+        }
+        return S_OK;
+    }
+    bool Cleanup(){
+        bool complete=true;
+        for(size_t index=Created.size();index>0;--index){
+            auto& object=*Created[index-1];
+            if(index==1 && !OwnRoot)continue;
+            if(object.Handle==INVALID_HANDLE_VALUE && object.Directory){complete=false;continue;}
+            if(!object.Directory){
+                if(object.Handle!=INVALID_HANDLE_VALUE)::CloseHandle(object.Handle);
+                object.Handle=INVALID_HANDLE_VALUE;
+                object.Handle=::CreateFileW(object.Path.c_str(),DELETE|FILE_READ_ATTRIBUTES,
+                    FILE_SHARE_READ,nullptr,OPEN_EXISTING,FILE_FLAG_OPEN_REPARSE_POINT,nullptr);
+                BY_HANDLE_FILE_INFORMATION current{};
+                if(object.Handle==INVALID_HANDLE_VALUE || !::GetFileInformationByHandle(object.Handle,&current) ||
+                   current.dwVolumeSerialNumber!=object.Identity.dwVolumeSerialNumber ||
+                   current.nFileIndexHigh!=object.Identity.nFileIndexHigh || current.nFileIndexLow!=object.Identity.nFileIndexLow ||
+                   (current.dwFileAttributes&(FILE_ATTRIBUTE_DIRECTORY|FILE_ATTRIBUTE_REPARSE_POINT)) || current.nNumberOfLinks!=1){
+                    complete=false;continue;
+                }
+            }
+            // Set disposition on the bound original object; never recurse into
+            // a pathname whose contents may now include foreign data.
+            FILE_BASIC_INFO basic{};
+            if(::GetFileInformationByHandleEx(object.Handle,FileBasicInfo,&basic,sizeof(basic)) &&
+               (basic.FileAttributes&FILE_ATTRIBUTE_READONLY)){
+                HANDLE attributes=::CreateFileW(object.Path.c_str(),FILE_WRITE_ATTRIBUTES,
+                    FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,nullptr,OPEN_EXISTING,
+                    FILE_FLAG_OPEN_REPARSE_POINT|(object.Directory?FILE_FLAG_BACKUP_SEMANTICS:0),nullptr);
+                if(attributes!=INVALID_HANDLE_VALUE){
+                    BY_HANDLE_FILE_INFORMATION identity{};
+                    if(::GetFileInformationByHandle(attributes,&identity) &&
+                       identity.dwVolumeSerialNumber==object.Identity.dwVolumeSerialNumber &&
+                       identity.nFileIndexHigh==object.Identity.nFileIndexHigh && identity.nFileIndexLow==object.Identity.nFileIndexLow){
+                        basic.FileAttributes&=~FILE_ATTRIBUTE_READONLY;
+                        if(!basic.FileAttributes)basic.FileAttributes=FILE_ATTRIBUTE_NORMAL;
+                        ::SetFileInformationByHandle(attributes,FileBasicInfo,&basic,sizeof(basic));
+                    }
+                    ::CloseHandle(attributes);
+                }
+            }
+            FILE_DISPOSITION_INFO disposition{TRUE};
+            bool disposed=false;
+#ifdef CTSPACES_BACKUP_TEST_HOOKS
+            const bool targeted=object.Directory && !g_cleanupTargeted && g_cleanupDenied>0;
+            if(targeted)g_cleanupTargeted=true;
+#endif
+            for(unsigned attempt=0;attempt<8;++attempt){
+                BOOL removed=FALSE;
+#ifdef CTSPACES_BACKUP_TEST_HOOKS
+                if(targeted)++g_cleanupObserved;
+                if(targeted && g_cleanupDenied>0){--g_cleanupDenied;::SetLastError(ERROR_DIR_NOT_EMPTY);}
+                else
+#endif
+                removed=::SetFileInformationByHandle(object.Handle,FileDispositionInfo,&disposition,sizeof(disposition));
+                if(removed){disposed=true;break;}
+                const DWORD error=::GetLastError();
+                // NTFS can briefly report a parent nonempty while recently
+                // disposed children finish unlinking. Retry only disposition
+                // of this still-bound original object; foreign contents are
+                // never traversed or deleted.
+                if(!object.Directory || (error!=ERROR_DIR_NOT_EMPTY && error!=ERROR_ACCESS_DENIED) || attempt==7)break;
+                BY_HANDLE_FILE_INFORMATION identity{};
+                if(!::GetFileInformationByHandle(object.Handle,&identity) ||
+                   identity.dwVolumeSerialNumber!=object.Identity.dwVolumeSerialNumber ||
+                   identity.nFileIndexHigh!=object.Identity.nFileIndexHigh || identity.nFileIndexLow!=object.Identity.nFileIndexLow ||
+                   !(identity.dwFileAttributes&FILE_ATTRIBUTE_DIRECTORY) || (identity.dwFileAttributes&FILE_ATTRIBUTE_REPARSE_POINT))break;
+                ::Sleep(1u<<attempt);
+            }
+            if(!disposed)complete=false;
+            ::CloseHandle(object.Handle);object.Handle=INVALID_HANDLE_VALUE;
+        }
+        return complete;
+    }
+};
 
 class CArchiveExtractCallback Z7_final:
     public IArchiveExtractCallback,
@@ -407,9 +737,12 @@ class CArchiveExtractCallback Z7_final:
     COutFileStream* _outFileStreamSpec=nullptr;
     CMyComPtr<ISequentialOutStream> _outFileStream;
     std::set<std::wstring,CArchivePathLess> _seenPaths;
+    CExtractionOwnership* _ownership=nullptr;
+    BY_HANDLE_FILE_INFORMATION _outputIdentity{};
 
 public:
-    void Init(IInArchive* archiveHandler,const FString& outDir){
+    void Init(IInArchive* archiveHandler,const FString& outDir,CExtractionOwnership* ownership=nullptr){
+        Progress=COperationProgress{};
         NumErrors=0;
         TotalBytes=0;
         CompletedBytes=0;
@@ -417,23 +750,38 @@ public:
         LastTick=0;
 
         _archiveHandler=archiveHandler;
+        TotalItems=0;
+        UInt32 count=0;
+        if(archiveHandler && SUCCEEDED(archiveHandler->GetNumberOfItems(&count)))TotalItems=count;
+        CompletedItems=0;
         _outDir=outDir;
         _seenPaths.clear();
+        _ownership=ownership;
         NName::NormalizeDirPathPrefix(_outDir);
-        if(!_outDir.IsEmpty())
+        if(!_ownership && !_outDir.IsEmpty())
             CreateComplexDir(_outDir);
     }
     UInt64 NumErrors=0;
 
+    bool ProgressAborted()const{return Progress.Aborted();}
+
+    HRESULT ClosePendingOutput(){
+        const HRESULT result=_outFileStreamSpec?_outFileStreamSpec->Close():S_OK;
+        _outFileStream.Release();_outFileStreamSpec=nullptr;return result;
+    }
+
     void EndProgressLine();
 
 private:
+    std::mutex ProgressMutex;
+    COperationProgress Progress;
+    UInt64 CompletedItems=0,TotalItems=0;
     UInt64 TotalBytes=0;
     UInt64 CompletedBytes=0;
     UInt32 LastPercent=(UInt32)(Int32)-1;
     ULONGLONG LastTick=0;
 
-    void PrintProgress(bool force);
+    HRESULT PrintProgress(bool force);
     UString CurrentItem;
     unsigned LastLineLen=0;
 
@@ -441,45 +789,48 @@ private:
 };
 
 Z7_COM7F_IMF(CArchiveExtractCallback::SetTotal(UInt64 size)){
+    {
+    std::lock_guard<std::mutex> lock(ProgressMutex);
     TotalBytes=size;
     CompletedBytes=0;
     LastPercent=(UInt32)(Int32)-1;
     LastTick=0;
-    PrintProgress(true);
-    return S_OK;
+    }
+    return PrintProgress(true);
 }
 
 Z7_COM7F_IMF(CArchiveExtractCallback::SetCompleted(const UInt64* completeValue)){
+    {
+    std::lock_guard<std::mutex> lock(ProgressMutex);
     if(completeValue)
         CompletedBytes=*completeValue;
-    PrintProgress(false);
-    return S_OK;
+    }
+    return PrintProgress(false);
 }
 
-void CArchiveExtractCallback::PrintProgress(bool force){
-    if(!g__7zProgressCb) return;
-    if(TotalBytes==0){
-        if(force){
-            g__7zProgressCb(g__7zProgressUser, g__7zProgressOp, 0, CurrentItem.Ptr());
-        }
-        return;
+HRESULT CArchiveExtractCallback::PrintProgress(bool force){
+    _7zProgressInfo info;
+    std::wstring item;
+    unsigned percent=0;
+    {
+        std::lock_guard<std::mutex> lock(ProgressMutex);
+        if(!Progress.Callback && !Progress.Detailed)return S_OK;
+        const ULONGLONG tick=::GetTickCount64();
+        percent=TotalBytes?(CompletedBytes>=TotalBytes?100:static_cast<unsigned>((CompletedBytes*100)/TotalBytes)):0;
+        if(!force && percent==LastPercent && tick-LastTick<150)return S_OK;
+        LastPercent=percent;LastTick=tick;
+        item=CurrentItem.Ptr();
+        info={Progress.Phase,CompletedBytes,TotalBytes,CompletedItems,TotalItems,TotalBytes!=0,nullptr};
     }
-
-    const ULONGLONG tick=::GetTickCount64();
-    UInt32 percent=(UInt32)((CompletedBytes*100)/TotalBytes);
-    if(percent>100) percent=100;
-    if(!force){
-        if(percent==LastPercent&&(tick-LastTick)<150)
-            return;
-    }
-    LastPercent=percent;
-    LastTick=tick;
-
-    g__7zProgressCb(g__7zProgressUser, g__7zProgressOp, (unsigned)percent, CurrentItem.Ptr());
+    // User callbacks run without the state mutex. The snapshot owns its path;
+    // an SDK worker can update the next item without racing this report.
+    info.currentItem=item.empty()?nullptr:item.c_str();
+    return Progress.Report(percent,info);
 }
 
 
 void CArchiveExtractCallback::EndProgressLine(){
+    std::lock_guard<std::mutex> lock(ProgressMutex);
     TotalBytes=0;
     LastLineLen=0;
 }
@@ -506,7 +857,10 @@ Z7_COM7F_IMF(CArchiveExtractCallback::GetStream(UInt32 index,ISequentialOutStrea
                 _filePath=prop.bstrVal;
             }
     }
-    CurrentItem=_filePath;
+    {
+        std::lock_guard<std::mutex> lock(ProgressMutex);
+        CurrentItem=_filePath;
+    }
 
     std::wstring pathKey;
     if(!GetArchivePathKey(_filePath,pathKey)){
@@ -573,7 +927,7 @@ Z7_COM7F_IMF(CArchiveExtractCallback::GetStream(UInt32 index,ISequentialOutStrea
         int slashPos=_filePath.ReverseFind_PathSepar();
         if(slashPos>=0){
             const FString parent=_outDir+ArcPathToRelFsPath(_filePath.Left(slashPos));
-            if(!CreateComplexDir(parent)){
+            if(_ownership?FAILED(_ownership->EnsureDirectories(std::filesystem::path(parent.Ptr()))):!CreateComplexDir(parent)){
                 NumErrors++;
                 PrintError("WARNING: can't create directory (skipping)",parent);
                 return S_FALSE;
@@ -584,7 +938,7 @@ Z7_COM7F_IMF(CArchiveExtractCallback::GetStream(UInt32 index,ISequentialOutStrea
     _diskFilePath=_outDir+ArcPathToRelFsPath(_filePath);
 
     if(_processed.isDir){
-        if(!CreateComplexDir(_diskFilePath)){
+        if(_ownership?FAILED(_ownership->EnsureDirectories(std::filesystem::path(_diskFilePath.Ptr()))):!CreateComplexDir(_diskFilePath)){
             NumErrors++;
             PrintError("WARNING: can't create directory",_diskFilePath);
         }
@@ -592,7 +946,7 @@ Z7_COM7F_IMF(CArchiveExtractCallback::GetStream(UInt32 index,ISequentialOutStrea
     }
 
     // Replace if exists
-    {
+    if(!_ownership){
         NFind::CFileInfo fi;
         if(fi.Find(_diskFilePath)){
             if(!DeleteFileAlways(_diskFilePath)){
@@ -605,11 +959,19 @@ Z7_COM7F_IMF(CArchiveExtractCallback::GetStream(UInt32 index,ISequentialOutStrea
 
     _outFileStreamSpec=new COutFileStream;
     CMyComPtr<ISequentialOutStream> outLoc(_outFileStreamSpec);
-    if(!_outFileStreamSpec->Create_ALWAYS(_diskFilePath)){
+    if(_ownership?!_outFileStreamSpec->Create_NEW(_diskFilePath):!_outFileStreamSpec->Create_ALWAYS(_diskFilePath)){
         NumErrors++;
         PrintError("WARNING: cannot open output file (skipping)",_diskFilePath);
         _outFileStreamSpec=nullptr;
         return S_FALSE;
+    }
+    if(_ownership && !::GetFileInformationByHandle(_outFileStreamSpec->File.GetHandle(),&_outputIdentity)){
+        NumErrors++;_outFileStreamSpec=nullptr;return E_FAIL;
+    }
+    if(_ownership){
+        auto recorded=std::make_unique<CExtractedObject>();recorded->Path=std::filesystem::path(_diskFilePath.Ptr());
+        recorded->Identity=_outputIdentity;
+        _ownership->Created.push_back(std::move(recorded));
     }
 
     _outFileStream=outLoc;
@@ -641,7 +1003,16 @@ Z7_COM7F_IMF(CArchiveExtractCallback::SetOperationResult(Int32 operationResult))
     if(_extractMode&&_processed.Attrib_Defined){
         SetFileAttrib_PosixHighDetect(_diskFilePath,_processed.Attrib);
     }
-    return S_OK;
+    if(_ownership && _extractMode && !_processed.isDir){
+        if(FAILED(_ownership->Bind(std::filesystem::path(_diskFilePath.Ptr()),false,&_outputIdentity))){
+            NumErrors++;return HRESULT_FROM_WIN32(ERROR_FILE_INVALID);
+        }
+    }
+    {
+        std::lock_guard<std::mutex> lock(ProgressMutex);
+        ++CompletedItems;
+    }
+    return PrintProgress(false);
 }
 
 
@@ -659,6 +1030,7 @@ public:
     const CObjectVector<CDirItem>* Items=NULL;
 
     void Init(const CObjectVector<CDirItem>* items){
+        Progress=COperationProgress{};
         Items=items;
         FailedFiles.Clear();
         FailedCodes.Clear();
@@ -667,6 +1039,8 @@ public:
         CompletedBytes=0;
         LastPercent=(UInt32)(Int32)-1;
         LastTick=0;
+        CompletedItems=0;
+        TotalItems=items?items->Size():0;
     }
     FStringVector FailedFiles;
     CRecordVector<HRESULT> FailedCodes;
@@ -679,8 +1053,12 @@ public:
     void EndProgressLine();
 
     UInt64 NumErrors=0;
+    bool ProgressAborted()const{return Progress.Aborted();}
 private:
-    void PrintProgress(bool force);
+    std::mutex ProgressMutex;
+    COperationProgress Progress;
+    UInt64 CompletedItems=0,TotalItems=0;
+    HRESULT PrintProgress(bool force);
     UString CurrentItem;
     unsigned LastLineLen=0;
 
@@ -694,45 +1072,46 @@ private:
 };
 
 Z7_COM7F_IMF(CArchiveUpdateCallback::SetTotal(UInt64 size)){
+    {
+    std::lock_guard<std::mutex> lock(ProgressMutex);
     TotalBytes=size;
     CompletedBytes=0;
     LastPercent=(UInt32)(Int32)-1;
     LastTick=0;
-    PrintProgress(true);
-    return S_OK;
+    }
+    return PrintProgress(true);
 }
 
 Z7_COM7F_IMF(CArchiveUpdateCallback::SetCompleted(const UInt64* completeValue)){
+    {
+    std::lock_guard<std::mutex> lock(ProgressMutex);
     if(completeValue)
         CompletedBytes=*completeValue;
-    PrintProgress(false);
-    return S_OK;
+    }
+    return PrintProgress(false);
 }
 
-void CArchiveUpdateCallback::PrintProgress(bool force){
-    if(!g__7zProgressCb) return;
-    if(TotalBytes==0){
-        if(force){
-            g__7zProgressCb(g__7zProgressUser, g__7zProgressOp, 0, CurrentItem.Ptr());
-        }
-        return;
+HRESULT CArchiveUpdateCallback::PrintProgress(bool force){
+    _7zProgressInfo info;
+    std::wstring item;
+    unsigned percent=0;
+    {
+        std::lock_guard<std::mutex> lock(ProgressMutex);
+        if(!Progress.Callback && !Progress.Detailed)return S_OK;
+        const ULONGLONG tick=::GetTickCount64();
+        percent=TotalBytes?(CompletedBytes>=TotalBytes?100:static_cast<unsigned>((CompletedBytes*100)/TotalBytes)):0;
+        if(!force && percent==LastPercent && tick-LastTick<150)return S_OK;
+        LastPercent=percent;LastTick=tick;
+        item=CurrentItem.Ptr();
+        info={Progress.Phase,CompletedBytes,TotalBytes,CompletedItems,TotalItems,TotalBytes!=0,nullptr};
     }
-
-    const ULONGLONG tick=::GetTickCount64();
-    UInt32 percent=(UInt32)((CompletedBytes*100)/TotalBytes);
-    if(percent>100) percent=100;
-    if(!force){
-        if(percent==LastPercent&&(tick-LastTick)<150)
-            return;
-    }
-    LastPercent=percent;
-    LastTick=tick;
-
-    g__7zProgressCb(g__7zProgressUser, g__7zProgressOp, (unsigned)percent, CurrentItem.Ptr());
+    info.currentItem=item.empty()?nullptr:item.c_str();
+    return Progress.Report(percent,info);
 }
 
 
 void CArchiveUpdateCallback::EndProgressLine(){
+    std::lock_guard<std::mutex> lock(ProgressMutex);
     TotalBytes=0;
     LastLineLen=0;
 }
@@ -766,52 +1145,23 @@ Z7_COM7F_IMF(CArchiveUpdateCallback::GetProperty(UInt32 index,PROPID propID,PROP
 Z7_COM7F_IMF(CArchiveUpdateCallback::GetStream(UInt32 index,ISequentialInStream** inStream)){
     *inStream=NULL;
     const CDirItem& it=(*Items)[index];
-    CurrentItem=it.Path_For_Handler;
+    {
+        std::lock_guard<std::mutex> lock(ProgressMutex);
+        CurrentItem=it.Path_For_Handler;
+    }
 
     if(it.IsDir)
         return S_OK;
 
-    NFind::CFileInfo currentInfo;
-    DWORD validationError=ERROR_SUCCESS;
-    if(!currentInfo.Find(it.FullPath)){
-        validationError=::GetLastError();
-        if(validationError==ERROR_SUCCESS)
-            validationError=ERROR_FILE_NOT_FOUND;
-    } else if(currentInfo.IsDir() ||
-            (currentInfo.Attrib&FILE_ATTRIBUTE_REPARSE_POINT)!=0)
-        validationError=ERROR_CANT_ACCESS_FILE;
-    else if(currentInfo.Size!=it.Size)
-        validationError=ERROR_FILE_INVALID;
-    if(validationError!=ERROR_SUCCESS){
-        const HRESULT hr=HRESULT_FROM_WIN32(validationError);
+    if(!it.SourceStream || FAILED(it.SourceStream->Seek(0,STREAM_SEEK_SET,nullptr))){
+        const HRESULT hr=HRESULT_FROM_WIN32(ERROR_FILE_INVALID);
         FailedFiles.Add(it.FullPath);
         FailedCodes.Add(hr);
-        PrintError("WARNING: source file changed before backup",it.FullPath);
+        PrintError("WARNING: source snapshot is unavailable",it.FullPath);
         return S_FALSE;
     }
-
-    CInFileStream* inSpec=new CInFileStream;
-    CMyComPtr<ISequentialInStream> inLoc(inSpec);
-
-#ifdef _WIN32
-    if(!inSpec->OpenShared(it.FullPath,true))  // allow reading even if someone else has it open
-#else
-    if(!inSpec->Open(it.FullPath))
-#endif
-    {
-#ifdef _WIN32
-        const DWORD e=::GetLastError();
-#else
-        const DWORD e=::GetLastError();
-#endif
-        const HRESULT hr=HRESULT_FROM_WIN32(e);
-        FailedFiles.Add(it.FullPath);
-        FailedCodes.Add(hr);
-        PrintError("WARNING: can't open file (skipping)",it.FullPath);
-        return S_FALSE; // skip and continue
-    }
-
-    *inStream=inLoc.Detach();
+    *inStream=it.SourceStream;
+    (*inStream)->AddRef();
     return S_OK;
 
 }
@@ -819,7 +1169,11 @@ Z7_COM7F_IMF(CArchiveUpdateCallback::GetStream(UInt32 index,ISequentialInStream*
 Z7_COM7F_IMF(CArchiveUpdateCallback::SetOperationResult(Int32 operationResult)){
     if(operationResult!=0) // 0 == OK in 7-Zip update results
         NumErrors++;
-    return S_OK; // keep going
+    {
+        std::lock_guard<std::mutex> lock(ProgressMutex);
+        ++CompletedItems;
+    }
+    return PrintProgress(false);
 }
 
 Z7_COM7F_IMF(CArchiveUpdateCallback::GetVolumeSize(UInt32 /*index*/,UInt64* /*size*/)){ return S_FALSE; }
@@ -912,14 +1266,45 @@ static HRESULT AppendFileItem(const FString &filePath, const UString &archivePat
     HRESULT hr=ChargeEnumerationBudget(budget,false,item.Size);
     if(FAILED(hr))
         return hr;
+    RINOK(BindSourceFile(item))
     items.Add(item);
     return S_OK;
+}
+
+Z7_CLASS_IMP_COM_1(CBoundBackupOutput,IOutStream)
+    Z7_IFACE_COM7_IMP(ISequentialOutStream)
+public:
+    HANDLE File=INVALID_HANDLE_VALUE;
+    ~CBoundBackupOutput(){if(File!=INVALID_HANDLE_VALUE)::CloseHandle(File);}
+};
+Z7_COM7F_IMF(CBoundBackupOutput::Write(const void* data,UInt32 size,UInt32* processedSize)){
+    if(processedSize)*processedSize=0;
+    DWORD written=0;
+    if(!::WriteFile(File,data,size,&written,nullptr))return HRESULT_FROM_WIN32(::GetLastError());
+    if(processedSize)*processedSize=written;
+    return size && !written?HRESULT_FROM_WIN32(ERROR_WRITE_FAULT):S_OK;
+}
+Z7_COM7F_IMF(CBoundBackupOutput::Seek(Int64 offset,UInt32 origin,UInt64* newPosition)){
+    if(origin>FILE_END)return E_INVALIDARG;
+    LARGE_INTEGER distance{},position{};distance.QuadPart=offset;
+    if(!::SetFilePointerEx(File,distance,&position,origin))return HRESULT_FROM_WIN32(::GetLastError());
+    if(newPosition)*newPosition=static_cast<UInt64>(position.QuadPart);
+    return S_OK;
+}
+Z7_COM7F_IMF(CBoundBackupOutput::SetSize(UInt64 size)){
+    if(size>static_cast<UInt64>(INT64_MAX))return E_INVALIDARG;
+    FILE_END_OF_FILE_INFO end{};end.EndOfFile.QuadPart=static_cast<LONGLONG>(size);
+    return ::SetFileInformationByHandle(File,FileEndOfFileInfo,&end,sizeof(end))?S_OK:HRESULT_FROM_WIN32(::GetLastError());
 }
 
 static HRESULT CompressDirectory7zImpl(
     const FString& archivePath,const FString& folderPath,bool includeTopDirectory,
     const FString *extraFilePath=nullptr,const UString *extraArchivePath=nullptr,
-    bool useBackupProps=false){
+    bool useBackupProps=false,bool *outputCreated=nullptr,
+    BY_HANDLE_FILE_INFORMATION *outputIdentity=nullptr,HANDLE *outputLease=nullptr,
+    const std::vector<std::wstring> *selectedRootChildren=nullptr){
+    std::optional<std::vector<std::wstring>> capturedSelection;
+    if(selectedRootChildren){capturedSelection=*selectedRootChildren;selectedRootChildren=&*capturedSelection;}
     // Normalize folderPath: must exist and be directory
     NFind::CFileInfo fi;
     if(!fi.Find(folderPath))
@@ -930,6 +1315,10 @@ static HRESULT CompressDirectory7zImpl(
         return HRESULT_FROM_WIN32(ERROR_CANT_ACCESS_FILE);
 
     CObjectVector<CDirItem> items;
+    CSourceDirectoryLeases leases;
+    RINOK(PinSourceAncestors(std::filesystem::path(folderPath.Ptr()),leases))
+    if(extraFilePath)
+        RINOK(PinSourceAncestors(std::filesystem::path(extraFilePath->Ptr()).parent_path(),leases))
     CEnumBudget budget;
     HRESULT hr=S_OK;
 
@@ -961,8 +1350,10 @@ static HRESULT CompressDirectory7zImpl(
 
     // Enumerate children recursively
     const unsigned initialDepth=rootName.IsEmpty()?0:1;
+    g__7zDetailedPhase=_7zProgressPhase::Scanning;
+    RINOK(ReportArchiveDetail(g__7zDetailedPhase,0,0,0,0,false))
     hr=EnumDirRecursive(folderPath,folderPath,rootName,initialDepth,budget,
-                        items);
+                        items,leases,selectedRootChildren);
     if(FAILED(hr))
         return hr;
 
@@ -975,9 +1366,25 @@ static HRESULT CompressDirectory7zImpl(
     }
 
     // Create output archive stream
-    COutFileStream* outSpec=new COutFileStream;
-    CMyComPtr<IOutStream> outStream=outSpec;
-    if(!outSpec->Create_NEW(archivePath))
+    CMyComPtr<IOutStream> outStream;
+    HANDLE createdOutput=INVALID_HANDLE_VALUE;
+    if(outputLease){
+        CBoundBackupOutput* owned=new CBoundBackupOutput;outStream=owned;
+        owned->File=::CreateFileW(archivePath.Ptr(),GENERIC_READ|GENERIC_WRITE|DELETE,
+            FILE_SHARE_READ,nullptr,CREATE_NEW,FILE_ATTRIBUTE_NORMAL|FILE_FLAG_OPEN_REPARSE_POINT,nullptr);
+        if(owned->File==INVALID_HANDLE_VALUE)return HRESULT_FROM_WIN32(::GetLastError());
+        createdOutput=owned->File;
+    } else {
+        COutFileStream* ordinary=new COutFileStream;outStream=ordinary;
+        if(!ordinary->Create_NEW(archivePath))return HRESULT_FROM_WIN32(::GetLastError());
+        createdOutput=ordinary->File.GetHandle();
+    }
+    if(outputCreated)
+        *outputCreated=true;
+    if(outputIdentity && !::GetFileInformationByHandle(createdOutput,outputIdentity))
+        return HRESULT_FROM_WIN32(::GetLastError());
+    if(outputLease && !::DuplicateHandle(::GetCurrentProcess(),createdOutput,::GetCurrentProcess(),
+        outputLease,0,FALSE,DUPLICATE_SAME_ACCESS))
         return HRESULT_FROM_WIN32(::GetLastError());
 
     // Create 7z out archive handler
@@ -993,14 +1400,40 @@ static HRESULT CompressDirectory7zImpl(
         return hr;
 
     // Update callback
+    g__7zDetailedPhase=_7zProgressPhase::Compressing;
+    RINOK(ReportArchiveDetail(g__7zDetailedPhase,0,budget.SourceBytes,0,items.Size(),budget.SourceBytes!=0))
     CArchiveUpdateCallback* cbSpec=new CArchiveUpdateCallback;
     CMyComPtr<IArchiveUpdateCallback2> cb(cbSpec);
     cbSpec->Init(&items);
 
     hr=outArchive->UpdateItems(outStream,items.Size(),cb);
+    if(cbSpec->ProgressAborted())hr=E_ABORT;
     cbSpec->EndProgressLine();
     if(hr==S_FALSE || cbSpec->NumErrors!=0 || cbSpec->FailedFiles.Size()!=0)
         return E_FAIL;
+    if(SUCCEEDED(hr) && g__7zProgressCb)
+        g__7zProgressCb(g__7zProgressUser,_7zOp::Compress,100,nullptr);
+    if(FAILED(hr))return hr;
+    RINOK(ReportArchiveDetail(_7zProgressPhase::Compressing,budget.SourceBytes,budget.SourceBytes,items.Size(),items.Size(),budget.SourceBytes!=0))
+    // Directory leases prevent namespace substitutions; file streams deny
+    // writes/deletes throughout compression. Detect additions made meanwhile.
+    CObjectVector<CDirItem> after;
+    CEnumBudget afterBudget;
+    CSourceDirectoryLeases afterLeases;
+    g__7zDetailedPhase=_7zProgressPhase::CheckingSource;
+    RINOK(ReportArchiveDetail(g__7zDetailedPhase,0,0,0,0,false))
+    if(includeTopDirectory)after.Add(items[0]);
+    RINOK(EnumDirRecursive(folderPath,folderPath,rootName,initialDepth,afterBudget,after,afterLeases,selectedRootChildren))
+    if(extraFilePath && extraArchivePath)
+        RINOK(AppendFileItem(*extraFilePath,*extraArchivePath,afterBudget,after))
+    if(after.Size()!=items.Size())return HRESULT_FROM_WIN32(ERROR_FILE_INVALID);
+    using SourceKey=std::tuple<std::wstring,bool,UInt32,UInt64>;
+    std::multiset<SourceKey> originals,current;
+    for(unsigned i=0;i<items.Size();++i)
+        originals.emplace(items[i].Path_For_Handler.Ptr(),items[i].IsDir,items[i].VolumeId,items[i].FileId);
+    for(unsigned i=0;i<after.Size();++i)
+        current.emplace(after[i].Path_For_Handler.Ptr(),after[i].IsDir,after[i].VolumeId,after[i].FileId);
+    if(current!=originals)return HRESULT_FROM_WIN32(ERROR_FILE_INVALID);
     return hr;
 }
 
@@ -1026,19 +1459,22 @@ static HRESULT OpenArchive7z(const FString& archivePath,
 
 static HRESULT ExtractOrTestOpenedArchive7z(IInArchive* inArchive,
                                              const FString& outDir,
-                                             bool testMode){
+                                             bool testMode,CExtractionOwnership* ownership=nullptr){
     if(!inArchive)
         return E_INVALIDARG;
     // Ensure output directory exists
-    if(!outDir.IsEmpty())
+    if(!ownership && !outDir.IsEmpty())
         CreateComplexDir(outDir);
 
     // Extract callback
     CArchiveExtractCallback* cbSpec=new CArchiveExtractCallback;
     CMyComPtr<IArchiveExtractCallback> cb(cbSpec);
-    cbSpec->Init(inArchive,outDir);
+    cbSpec->Init(inArchive,outDir,ownership);
 
     HRESULT hr=inArchive->Extract(NULL,(UInt32)(Int32)(-1),testMode,cb);
+    if(cbSpec->ProgressAborted())hr=E_ABORT;
+    const HRESULT closed=cbSpec->ClosePendingOutput();
+    if(SUCCEEDED(hr) && FAILED(closed))hr=closed;
     cbSpec->EndProgressLine();
     if(hr==S_FALSE || cbSpec->NumErrors!=0)
         return E_FAIL;
@@ -1067,8 +1503,10 @@ static HRESULT InspectOpenedArchive7z(IInArchive *inArchive,
         std::wstring pathKey;
         if(!GetArchivePathKey(archivePath,pathKey))
             return E_INVALIDARG;
-        if(!seenPaths.insert(std::move(pathKey)).second)
+        const auto registered=seenPaths.insert(std::move(pathKey));
+        if(!registered.second)
             return HRESULT_FROM_WIN32(ERROR_ALREADY_EXISTS);
+        const auto& normalizedPath=*registered.first;
 
         bool isDir=false;
         NCOM::CPropVariant dirProp;
@@ -1078,10 +1516,18 @@ static HRESULT InspectOpenedArchive7z(IInArchive *inArchive,
         else if(dirProp.vt!=VT_EMPTY)
             return E_INVALIDARG;
 
+        const bool directSitesChild=normalizedPath.size()>6 && normalizedPath[5]==L'\\' &&
+            ::CompareStringOrdinal(normalizedPath.data(),5,L"Sites",5,TRUE)==CSTR_EQUAL &&
+            normalizedPath.find(L'\\',6)==std::wstring::npos;
         if(isDir){
             ++info.directoryCount;
+            if(directSitesChild){
+                ++info.sitesProfileCount;
+                info.sitesClientDirectoryNames.push_back(normalizedPath.substr(6));
+            }
         } else {
             ++info.fileCount;
+            if(directSitesChild)++info.sitesRootFileCount;
         }
 
         NCOM::CPropVariant attribProp;
@@ -1116,6 +1562,7 @@ static HRESULT InspectOpenedArchive7z(IInArchive *inArchive,
 struct _7zRestoreSession {
     CMyComPtr<IInStream> InStream;
     CMyComPtr<IInArchive> InArchive;
+    std::unique_ptr<CExtractionOwnership> Output;
 };
 
 
@@ -1142,9 +1589,13 @@ HRESULT _7zExtra_7z(
     _7zArchiveInfo info{};
     _7zRestoreSession *session=nullptr;
     HRESULT hr=_7zOpenRestoreSession(archivePath,&info,&session);
+    // Progress callbacks may throw while reporting completion. Retain the
+    // session owner before invoking one so archive/output/ancestor leases are
+    // released on every exit, including exception unwinding.
+    std::unique_ptr<_7zRestoreSession,decltype(&_7zCloseRestoreSession)>
+        owner(session,&_7zCloseRestoreSession);
     if(SUCCEEDED(hr))
         hr=_7zExtractRestoreSession(session,outDir,progressCb,progressUser);
-    _7zCloseRestoreSession(session);
     return hr;
 }
 
@@ -1152,7 +1603,8 @@ HRESULT _7zInspect7z(const wchar_t *archivePath,_7zArchiveInfo *info){
     if(!archivePath || !info) return E_INVALIDARG;
     _7zRestoreSession *session=nullptr;
     const HRESULT hr=_7zOpenRestoreSession(archivePath,info,&session);
-    _7zCloseRestoreSession(session);
+    std::unique_ptr<_7zRestoreSession,decltype(&_7zCloseRestoreSession)>
+        owner(session,&_7zCloseRestoreSession);
     return hr;
 }
 
@@ -1165,33 +1617,50 @@ HRESULT _7zOpenRestoreSession(const wchar_t *archivePath,
     NT_CHECK
 #endif
     const FString arc=us2fs(UString(archivePath));
-    _7zRestoreSession *candidate=new(std::nothrow) _7zRestoreSession;
+    std::unique_ptr<_7zRestoreSession,decltype(&_7zCloseRestoreSession)>
+        candidate(new(std::nothrow) _7zRestoreSession,&_7zCloseRestoreSession);
     if(!candidate)
         return E_OUTOFMEMORY;
     HRESULT hr=OpenArchive7z(arc,candidate->InStream,candidate->InArchive);
     if(SUCCEEDED(hr))
         hr=InspectOpenedArchive7z(candidate->InArchive,*info);
-    if(FAILED(hr)){
-        if(candidate->InArchive)
-            candidate->InArchive->Close();
-        delete candidate;
-        return hr;
-    }
-    *session=candidate;
+    if(FAILED(hr))return hr;
+    *session=candidate.release();
     return S_OK;
 }
 
 HRESULT _7zExtractRestoreSession(_7zRestoreSession *session,
                                  const wchar_t *outDir,
                                  _7zProgressCb progressCb,
-                                 void *progressUser){
+                                 void *progressUser,bool ownsEmptyOutputRoot,HANDLE protectedRoot){
     if(!session || !session->InArchive || !outDir) return E_INVALIDARG;
     _7zScopedProgress sp(_7zOp::Extract,progressCb,progressUser);
-    const FString out=us2fs(UString(outDir));
-    HRESULT hr=ExtractOrTestOpenedArchive7z(session->InArchive,out,false);
+    const FString out=us2fs(UString(std::filesystem::absolute(std::filesystem::path(outDir)).lexically_normal().c_str()));
+    if(session->Output)return HRESULT_FROM_WIN32(ERROR_ALREADY_EXISTS);
+    session->Output=std::make_unique<CExtractionOwnership>();
+    if(!CreateComplexDir(out))return HRESULT_FROM_WIN32(::GetLastError());
+    HRESULT hr=session->Output->Init(std::filesystem::path(outDir),ownsEmptyOutputRoot,protectedRoot);
+    if(SUCCEEDED(hr))hr=ExtractOrTestOpenedArchive7z(session->InArchive,out,false,session->Output.get());
     if(SUCCEEDED(hr) && progressCb)
         progressCb(progressUser,_7zOp::Extract,100,nullptr);
     return hr;
+}
+
+bool _7zCleanupRestoreOutput(_7zRestoreSession *session){
+    if(!session)return true;
+    // A failed codec may retain its last output stream/callback until Close.
+    // Release those writer handles before dispositioning owned files/parents.
+    if(session->InArchive){session->InArchive->Close();session->InArchive.Release();}
+    session->InStream.Release();
+    return !session->Output || session->Output->Cleanup();
+}
+
+HRESULT _7zVerifyRestoreOutputInventory(_7zRestoreSession *session,
+    const std::vector<_7zRestoreObjectIdentity>& sealedObjects){
+    if(!session || !session->Output)return E_INVALIDARG;
+    try{return session->Output->VerifyInventory(sealedObjects);}
+    catch(const std::bad_alloc&){return E_OUTOFMEMORY;}
+    catch(...){return E_FAIL;}
 }
 
 void _7zCloseRestoreSession(_7zRestoreSession *session){
@@ -1208,13 +1677,59 @@ HRESULT _7zTest7z(const wchar_t *archivePath,_7zProgressCb progressCb,
     _7zArchiveInfo info{};
     _7zRestoreSession *session=nullptr;
     HRESULT hr=_7zOpenRestoreSession(archivePath,&info,&session);
+    std::unique_ptr<_7zRestoreSession,decltype(&_7zCloseRestoreSession)>
+        owner(session,&_7zCloseRestoreSession);
     _7zScopedProgress sp(_7zOp::Extract,progressCb,progressUser);
     if(SUCCEEDED(hr))
         hr=ExtractOrTestOpenedArchive7z(session->InArchive,FString(),true);
     if(SUCCEEDED(hr) && progressCb)
         progressCb(progressUser,_7zOp::Extract,100,nullptr);
-    _7zCloseRestoreSession(session);
     return hr;
+}
+
+Z7_CLASS_IMP_COM_1(CBoundBackupInput,IInStream)
+    Z7_IFACE_COM7_IMP(ISequentialInStream)
+public:
+    HANDLE File=INVALID_HANDLE_VALUE;
+    ~CBoundBackupInput(){if(File!=INVALID_HANDLE_VALUE)::CloseHandle(File);}
+};
+Z7_COM7F_IMF(CBoundBackupInput::Read(void *data,UInt32 size,UInt32 *processedSize)){
+    DWORD read=0;if(processedSize)*processedSize=0;
+    if(!::ReadFile(File,data,size,&read,nullptr))return HRESULT_FROM_WIN32(::GetLastError());
+    if(processedSize)*processedSize=read;return S_OK;
+}
+Z7_COM7F_IMF(CBoundBackupInput::Seek(Int64 offset,UInt32 origin,UInt64 *position)){
+    if(origin>FILE_END)return E_INVALIDARG;
+    LARGE_INTEGER distance{},actual{};distance.QuadPart=offset;
+    if(!::SetFilePointerEx(File,distance,&actual,origin))return HRESULT_FROM_WIN32(::GetLastError());
+    if(position)*position=static_cast<UInt64>(actual.QuadPart);return S_OK;
+}
+HRESULT _7zInspectAndTest7zHandle(HANDLE archive,_7zArchiveInfo *info,
+                                  _7zProgressCb progressCb,void *progressUser,
+                                  _7zDetailedProgressCb detailedCb,void *detailedUser){
+    if(archive==INVALID_HANDLE_VALUE || !archive || !info)return E_INVALIDARG;
+    BY_HANDLE_FILE_INFORMATION identity{};
+    if(!::GetFileInformationByHandle(archive,&identity) || ::GetFileType(archive)!=FILE_TYPE_DISK ||
+       (identity.dwFileAttributes&(FILE_ATTRIBUTE_DIRECTORY|FILE_ATTRIBUTE_REPARSE_POINT)) || identity.nNumberOfLinks!=1)
+        return HRESULT_FROM_WIN32(ERROR_FILE_INVALID);
+    auto* input=new(std::nothrow) CBoundBackupInput;
+    if(!input)return E_OUTOFMEMORY;
+    CMyComPtr<IInStream> stream=input;
+    if(!::DuplicateHandle(::GetCurrentProcess(),archive,::GetCurrentProcess(),&input->File,0,FALSE,DUPLICATE_SAME_ACCESS))
+        return HRESULT_FROM_WIN32(::GetLastError());
+    RINOK(stream->Seek(0,STREAM_SEEK_SET,nullptr))
+    CMyComPtr<IInArchive> handler;
+    HRESULT hr=CreateArchiver(&CLSID_Format,&IID_IInArchive,(void**)&handler);
+    if(FAILED(hr)||!handler)return FAILED(hr)?hr:E_FAIL;
+    _7zScopedProgress progress(_7zOp::Extract,progressCb,progressUser,detailedCb,detailedUser);
+    RINOK(ReportArchiveDetail(_7zProgressPhase::Verifying,0,0,0,0,false))
+    const UInt64 scanSize=(UInt64)1<<23;
+    hr=handler->Open(stream,&scanSize,nullptr);
+    if(SUCCEEDED(hr))hr=InspectOpenedArchive7z(handler,*info);
+    if(SUCCEEDED(hr))hr=ExtractOrTestOpenedArchive7z(handler,FString(),true);
+    if(SUCCEEDED(hr) && progressCb)progressCb(progressUser,_7zOp::Extract,100,nullptr);
+    if(SUCCEEDED(hr))hr=ReportArchiveDetail(_7zProgressPhase::Verifying,info->totalUncompressedBytes,info->totalUncompressedBytes,info->itemCount,info->itemCount,info->totalUncompressedBytes!=0);
+    handler->Close();return hr;
 }
 
 HRESULT _7zCompress7z(
@@ -1232,9 +1747,6 @@ HRESULT _7zCompress7z(
     const FString arc = us2fs(UString(archivePath));
     const FString dir = us2fs(UString(folderPath));
     HRESULT hr = CompressDirectory7zImpl(arc, dir, includeTopDirectory);
-    if(SUCCEEDED(hr) && progressCb){
-        progressCb(progressUser, _7zOp::Compress, 100, nullptr);
-    }
     return hr;
 }
 
@@ -1243,20 +1755,23 @@ HRESULT _7zCompress7zWithExtraFile(
     const wchar_t *archivePath,const wchar_t *folderPath,
     bool includeTopDirectory,const wchar_t *extraFilePath,
     const wchar_t *extraArchivePath,_7zProgressCb progressCb,
-    void *progressUser){
+    void *progressUser,bool *outputCreated,BY_HANDLE_FILE_INFORMATION *outputIdentity,HANDLE *outputLease,
+    _7zDetailedProgressCb detailedCb,void *detailedUser,const std::vector<std::wstring> *selectedRootChildren){
+    if(outputCreated)
+        *outputCreated=false;
+    if(outputIdentity)*outputIdentity={};
+    if(outputLease)*outputLease=INVALID_HANDLE_VALUE;
     if(!archivePath || !folderPath || !extraFilePath || !extraArchivePath)
         return E_INVALIDARG;
 #ifdef _WIN32
     NT_CHECK
 #endif
-    _7zScopedProgress sp(_7zOp::Compress,progressCb,progressUser);
+    _7zScopedProgress sp(_7zOp::Compress,progressCb,progressUser,detailedCb,detailedUser);
     const FString arc=us2fs(UString(archivePath));
     const FString dir=us2fs(UString(folderPath));
     const FString extra=us2fs(UString(extraFilePath));
     const UString extraArc(extraArchivePath);
     HRESULT hr=CompressDirectory7zImpl(arc,dir,includeTopDirectory,&extra,
-                                       &extraArc,true);
-    if(SUCCEEDED(hr) && progressCb)
-        progressCb(progressUser,_7zOp::Compress,100,nullptr);
+                                        &extraArc,true,outputCreated,outputIdentity,outputLease,selectedRootChildren);
     return hr;
 }

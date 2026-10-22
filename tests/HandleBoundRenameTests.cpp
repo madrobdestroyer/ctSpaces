@@ -2,6 +2,7 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#include "../ClientDeletionSafety.h"
 
 #include <cstddef>
 #include <cstring>
@@ -238,14 +239,20 @@ public:
   ~ScopedTestDirectory() {
     if (path_.empty())
       return;
+    if (!succeeded_) {
+      std::wcerr << L"Failed handle-rename fixture retained: " << path_ << L'\n';
+      return;
+    }
     std::error_code ignored;
     fs::remove_all(path_, ignored);
   }
 
   const fs::path &Path() const noexcept { return path_; }
+  void MarkSuccess() noexcept { succeeded_ = true; }
 
 private:
   fs::path path_;
+  bool succeeded_ = false;
 };
 
 bool TestRenameTargetsOpenedObjectAfterPathReplacement(const fs::path &root) {
@@ -464,6 +471,39 @@ bool TestNoReplacePreservesExistingDestination(const fs::path &root) {
                  L"A rejected collision changed the destination content.");
 }
 
+bool TestProductionDirectoryNamespace(const fs::path &root) {
+  const auto source=root/L"namespace-source";
+  const auto target=root/L"namespace-target";
+  const auto other=root/L"namespace-other-client";
+  const auto parked=root/L"namespace-displaced";
+  if(!fs::create_directory(source) || !fs::create_directory(other) ||
+      !WriteNewFile(source/L"note","ORIGINAL CLIENT NOTE") ||
+      !WriteNewFile(other/L"note","OTHER CLIENT NOTE")) return false;
+  client_deletion_safety::BoundTree original;
+  std::wstring error;
+  if(!Require(original.CaptureNamespace(source,error),L"Production namespace binding could not capture the original directory.")) {
+    std::wcerr<<error<<L'\n';return false;
+  }
+  BOOL replaced=TRUE;
+  std::thread racer([&]{replaced=MoveFileExW(source.c_str(),parked.c_str(),0);});racer.join();
+  if(!Require(!replaced && !fs::exists(parked),L"Production directory binding allowed the original source to be exchanged."))return false;
+  if(!fs::create_directory(target) || !WriteNewFile(target/L"note","FOREIGN TARGET"))return false;
+  if(!Require(!original.MoveRoot(target,error),L"Production no-replace directory move overwrote another target."))return false;
+  std::string bytes;
+  if(!Require(ReadFileContents(target/L"note",bytes) && bytes=="FOREIGN TARGET",L"Rejected production move changed foreign target content."))return false;
+  if(!DeleteFileW((target/L"note").c_str()) || !RemoveDirectoryW(target.c_str()))return false;
+  if(!Require(original.MoveRoot(target,error) && original.MoveRoot(source,error),L"Production forward and rollback did not move the same original directory.")) {
+    std::wcerr<<error<<L'\n';return false;
+  }
+  const auto stage=root/L"namespace-case-stage";
+  const auto upper=root/L"NAMESPACE-SOURCE";
+  if(!Require(original.MoveRoot(stage,error) && original.MoveRoot(upper,error) &&
+      original.MoveRoot(stage,error) && original.MoveRoot(source,error),L"Production case-only staging/rollback did not retain the original directory handle.")) {
+    std::wcerr<<error<<L'\n';return false;
+  }
+  return Require(ReadFileContents(source/L"note",bytes) && bytes=="ORIGINAL CLIENT NOTE",L"Production directory round trip changed the selected notebook.") &&
+      Require(ReadFileContents(other/L"note",bytes) && bytes=="OTHER CLIENT NOTE",L"Production directory round trip changed another client's notebook.");
+}
 } // namespace
 
 int wmain() {
@@ -477,10 +517,12 @@ int wmain() {
           testDirectory.Path()) ||
       !TestProductionStyleLockRejectsSourceReplacement(
           testDirectory.Path()) ||
-      !TestNoReplacePreservesExistingDestination(testDirectory.Path())) {
+      !TestNoReplacePreservesExistingDestination(testDirectory.Path()) ||
+      !TestProductionDirectoryNamespace(testDirectory.Path())) {
     return 1;
   }
 
   std::wcout << L"Handle-bound no-replace rename tests passed.\n";
+  testDirectory.MarkSuccess();
   return 0;
 }

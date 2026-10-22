@@ -425,6 +425,63 @@ try {
         (Join-Path $sourceDefault 'Bookmarks'), $bookmarkJson,
         (New-Object Text.UTF8Encoding($false)))
 
+    $bookmarksPath = Join-Path $sourceDefault 'Bookmarks'
+    try {
+        foreach ($validRoots in @(
+            [pscustomobject]@{ Name = 'EmptyObject'; Json = '{"roots":{}}'; Urls = 0 },
+            [pscustomobject]@{
+                Name = 'OptionalRoots'
+                Json = '{"roots":{"bookmark_bar":{"children":[]},"other":{"children":[]},"synced":{"children":[]},"managed":{"children":[{"url":"https://example.test/"}]},"account_bookmark_bar":{"children":[]},"account_other":{"children":[]},"account_mobile":{"children":[]}}}'
+                Urls = 1
+            }
+        )) {
+            [IO.File]::WriteAllText($bookmarksPath, $validRoots.Json,
+                (New-Object Text.UTF8Encoding($false)))
+            $sourceBytes = [Convert]::ToBase64String(
+                [IO.File]::ReadAllBytes($bookmarksPath))
+            $validOutput = Join-Path $testRoot ($validRoots.Name + 'Output')
+            $validResult = & $sanitizer -SourceProfile $sourceRoot `
+                -OutputRoot $validOutput
+            Assert-SanitizerCheck ($validResult.BookmarkUrls -eq $validRoots.Urls) `
+                "A valid $($validRoots.Name) roots object was rejected or lost bookmarks."
+            Assert-SanitizerCheck `
+                ([Convert]::ToBase64String([IO.File]::ReadAllBytes(
+                    (Join-Path $validOutput 'Default\Bookmarks'))) -ceq $sourceBytes) `
+                'A valid optional roots object was altered in the output.'
+            Assert-SanitizerCheck `
+                ([Convert]::ToBase64String([IO.File]::ReadAllBytes($bookmarksPath)) `
+                    -ceq $sourceBytes) 'A valid roots source was modified.'
+        }
+
+        foreach ($invalidRoots in @('4', 'null', '[]', '[{}]', '"not an object"', 'true')) {
+            [IO.File]::WriteAllText($bookmarksPath,
+                ('{"roots":' + $invalidRoots + ',"version":1}'),
+                (New-Object Text.UTF8Encoding($false)))
+            $sourceBytes = [Convert]::ToBase64String(
+                [IO.File]::ReadAllBytes($bookmarksPath))
+            $invalidOutput = Join-Path $testRoot `
+                ('InvalidRoots-' + [guid]::NewGuid().ToString('N'))
+            $rootsRejected = $false
+            try {
+                & $sanitizer -SourceProfile $sourceRoot `
+                    -OutputRoot $invalidOutput | Out-Null
+            }
+            catch {
+                $rootsRejected = $_.Exception.Message -match 'roots object'
+            }
+            Assert-SanitizerCheck $rootsRejected `
+                "Malformed Bookmarks roots $invalidRoots was accepted."
+            Assert-SanitizerCheck `
+                ([Convert]::ToBase64String([IO.File]::ReadAllBytes($bookmarksPath)) `
+                    -ceq $sourceBytes) 'Rejecting malformed roots modified source bytes.'
+        }
+        Write-Host 'Bookmarks roots shape checks passed (2 valid variants, 6 malformed variants).'
+    }
+    finally {
+        [IO.File]::WriteAllText($bookmarksPath, $bookmarkJson,
+            (New-Object Text.UTF8Encoding($false)))
+    }
+
     $sourceFavicons = Join-Path $sourceDefault 'Favicons'
     $faviconsBackup = Join-Path $testRoot 'Favicons.good'
     [IO.File]::Copy($sourceFavicons, $faviconsBackup)
