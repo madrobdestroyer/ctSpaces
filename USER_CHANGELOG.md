@@ -20,9 +20,12 @@ This is the change list for coworkers moving from their last shared version,
   profiles. Right-click a link to copy its complete address.
 - Choose global Vertical, Horizontal or Keep browser's choice, with a per-client
   Follow global/Vertical/Horizontal override for new windows. Horizontal sets
-  the vertical-tab preference to off. **Edge Restore tabs can retain a saved
-  window's old layout.** Set that layout in Edge before closing the window if
-  using session restore; ctSpaces does not force restored windows to change.
+  the vertical-tab preference to off. To change Edge's layout from ctSpaces,
+  bookmark needed old tabs and close the client window normally, turn Restore
+  tabs off for the same client/browser, choose Vertical or Horizontal in the
+  app, then open it. Restore off starts a new session instead of reopening old
+  tabs; other profile data remains. Restore on reopens the saved layout. After
+  closing the new window normally, you can enable it for that newly saved session.
 - Exclude clients from an all-client backup and follow scanning, compression
   and verification progress. Restore replaces the active collection rather
   than merging it and retains the previous collection in a safety folder.

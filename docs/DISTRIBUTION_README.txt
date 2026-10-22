@@ -23,10 +23,16 @@ Settings offers global Vertical, Horizontal and Keep browser's choice, with a
 client-wide override for new windows. Horizontal explicitly sets the vertical
 tab preference to off. Running browsers are not changed.
 
-Known Edge limitation: Restore tabs can restore the saved window's old layout
-despite the ctSpaces choice. To retain the desired layout with Restore tabs on,
-set it in Edge before closing that window. ctSpaces preserves saved sessions;
-this release does not force a restored Edge window to change layout.
+Change Edge's layout using ctSpaces:
+1. Bookmark old tabs you need, then close the client browser window normally.
+2. Select that same client and Edge in ctSpaces and turn Restore tabs OFF.
+3. Choose Vertical or Horizontal in the global/client Tab layout menu, then Open.
+4. After closing this new window normally, you can turn Restore tabs ON to
+   request that newly saved session.
+
+Restore OFF starts a new session; the older saved tabs are not reopened.
+Cookies, sign-ins and other profile data remain. With Restore ON, Edge reopens
+the saved session's layout rather than changing that old window's layout.
 
 Back Up All Client Data now lets you leave clients out and shows progress by
 stage. Restore replaces the active client collection; it does not merge it.

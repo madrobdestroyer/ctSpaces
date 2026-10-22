@@ -206,7 +206,17 @@ To make an exception, select an existing client and choose Settings > **Tab layo
 
 ctSpaces prepares the new-window layout preference the next time that browser profile launches. Open browsers are not restarted or edited. Temporary browsers use the global choice; the Default profile editor keeps its own layout. Normal PC browsers used outside ctSpaces, including the regular browser used for Notes links, are unaffected. This setting does not clear sessions, sign-ins, bookmarks, extensions or notes.
 
-**Known Edge Restore tabs limitation:** Edge can restore the previous window's vertical/horizontal layout instead of using this preference. Live checks reproduced this in both directions. If you want session restore to keep a particular layout, change the layout in Edge itself before closing that window, then leave **Restore tabs** on. The ctSpaces setting does not force an already-running or restored window to change layout. Session files and saved tabs remain intact; no forced override is provided.
+**To apply a new Edge layout from ctSpaces:**
+
+1. Bookmark any currently open tabs you need, then close that client's Edge window normally.
+2. In ctSpaces, select the same client and **Microsoft Edge**.
+3. Turn **Restore tabs off**.
+4. Choose **Vertical tabs** or **Horizontal tabs** in ctSpaces, using the global setting or that client's override.
+5. Open the client. The new session opens with the selected layout.
+
+After closing that new window normally, you can turn **Restore tabs on** again. Edge restores the most recently saved session, including its layout. Open any tabs you want that new session to restore before closing it. No layout change inside Edge is required.
+
+**Why turn Restore tabs off first?** With it on, Edge can restore an already saved window's previous vertical/horizontal layout instead of the new ctSpaces choice. Turning it off starts a new session instead of reopening those old tabs; it keeps sign-ins, bookmarks, history, extensions and other profile data. The layout setting does not convert the earlier saved window in place or change an already-running browser.
 
 The override is stored with the client, so it follows client rename, archive, backup and restore and disappears when that entire client is deleted. Keep browser's choice stops enforcement; it does not restore a historical layout that a previous choice replaced. For Firefox, ctSpaces also removes its own layout override from `user.js`, while preserving the user's other preference text.
 

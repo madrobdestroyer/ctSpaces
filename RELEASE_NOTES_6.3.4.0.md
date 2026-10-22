@@ -12,8 +12,8 @@ choices and reliability work from the 6.2 and 6.3 series.
   spelling, printing/PDF and Markdown support.
 - Notes stays available when the launcher is minimized or closed to the tray.
   Ticket and note links use a chosen regular PC browser outside client profiles.
-- Global vertical/horizontal preferences for new browser windows, with a
-  client-wide override. **Edge session restore can retain the old window layout.**
+- Global vertical/horizontal browser layout choices, with a client-wide
+  override. **Turn Restore tabs off when applying a new layout in Edge.**
 - Client exclusions and clearer progress for backups, plus stronger checks
   around client identity, lifecycle actions and saving.
 
@@ -84,12 +84,25 @@ Temp follows global and the Default editor keeps its layout. Keep stops
 enforcement rather than restoring a historical choice; Firefox also removes
 only ctSpaces's own `user.js` override.
 
-**Known Edge limitation:** with **Restore tabs** on, Edge can restore a saved
-window's previous layout instead of using the new-window preference. This was
-observed in both directions; changing the ctSpaces choice does not force a
-restored Edge window to change layout. To keep the desired layout with session
-restore, change it in Edge itself before closing that window. ctSpaces keeps
-Restore tabs and saved session data intact; no forced-override fix is claimed.
+**Applying the layout in Edge:** the selection in ctSpaces works when opening
+a new session. To use it:
+
+1. Bookmark any currently open tabs you need, then close that client's Edge
+   window normally.
+2. Select the same client and Microsoft Edge in ctSpaces, then turn **Restore
+   tabs off**.
+3. Choose **Vertical tabs** or **Horizontal tabs** in ctSpaces, then open the
+   client. It opens with the selected layout.
+
+After closing that new window normally, you can turn **Restore tabs on** again
+for later launches. Edge restores the most recently saved session, including
+its layout. You do not need to change the layout inside Edge.
+
+**The limitation concerns already saved windows:** with Restore tabs on, Edge
+can bring back their previous layout despite a different ctSpaces selection.
+Turning Restore tabs off starts a new session instead of reopening the old
+tabs, so bookmark any old tabs you need before doing this. It keeps the client's
+sign-ins, bookmarks and other profile data.
 
 **Back Up All Client Data** now starts with a searchable selection, including
 archived clients. Uncheck clients to leave them out. Progress explains scanning,
@@ -118,8 +131,8 @@ that every browser version, organization policy or SSO setup was tested. Native
 vertical tabs depend on browser support/policy. Browser-protected sign-ins may
 remain tied to their Windows user or computer after backup/restore.
 
-See the [user guide](https://github.com/madrobdestroyer/ctSpaces/blob/v6.3.4.0/docs/USER_GUIDE.md),
-[shareable change list](https://github.com/madrobdestroyer/ctSpaces/blob/v6.3.4.0/docs/CHANGES_SINCE_6.1.1.0.md) and
+See the [user guide](https://github.com/madrobdestroyer/ctSpaces/blob/cpp/docs/USER_GUIDE.md),
+[shareable change list](https://github.com/madrobdestroyer/ctSpaces/blob/cpp/docs/CHANGES_SINCE_6.1.1.0.md) and
 [release validation](https://github.com/madrobdestroyer/ctSpaces/blob/v6.3.4.0/docs/RELEASE_VALIDATION_6.3.4.0.md) for instructions, browsers
 actually exercised and remaining test boundaries. Native automated checks do
 not establish continuous compositor behavior or certify SSO compatibility.

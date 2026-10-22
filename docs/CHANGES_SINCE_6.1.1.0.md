@@ -55,10 +55,13 @@ change your Windows default. Right-click links to copy their full addresses.
   choice applies to all its browser slots on the next launch. Temp follows
   global; the Default editor keeps its own choice. Keep stops enforcement; it
   does not undo a layout the browser has already adopted.
-- **Edge Restore tabs limitation:** a restored window can keep its previous
-  vertical/horizontal layout despite the ctSpaces choice. With Restore tabs on,
-  set the desired layout in Edge before closing the window. Session data is
-  preserved; this release does not force a restored window to change layout.
+- **Change Edge's layout using ctSpaces:** first bookmark old tabs you need and
+  close the client window normally. Select that same client and Edge, turn
+  Restore tabs off, choose Vertical or Horizontal in ctSpaces, then open it.
+  Restore on reopens the saved session's layout. After closing the new window
+  normally, you can enable Restore tabs to request that newly saved session.
+  The Restore-off launch starts a new session rather than reopening the old
+  tabs; cookies, sign-ins and other profile data remain.
 - Exclude clients from an all-client backup using its searchable selection.
   Progress now explains scanning, compression, verification and final saving.
 - Restore validates the backup and keeps the old collection in a safety folder.

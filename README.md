@@ -4,7 +4,16 @@ ctSpaces is a small Windows launcher for opening client-specific browser spaces.
 
 The current **6.3.4.0** release brings together the changes since the team's 6.1.1.0 baseline. Client Notes is a complete local notebook with saved notes separate from open tabs, All notes search, archive and Trash, snapshots, version history, templates, import/export and explicit cross-client transfer. Its full-width editor has one searchable client picker, on-demand Details and More panels, editable template/snippet libraries, status, tags, work logs, code boxes and handovers. It keeps theme colors, slim tabs, remembered size and quiet autosave. Notes stays available when the launcher is minimized or closed to the tray. Note links open in a chosen regular PC browser, outside client profiles.
 
-Everyday editing includes temporary Find/Replace rows with match options and counts, remembered word wrap, Go to line, document/selection statistics, on-demand Windows spelling review, printing/PDF, previewed Markdown interchange and simple editable tables. Global and per-client browser layout choices request vertical or horizontal tabs for new windows. **Edge with Restore tabs can retain the saved window's previous layout:** set the desired layout in Edge before closing that window when using session restore. Backups offer client exclusions and progress by stage. Search More for note tools; shortcuts and conversion limits are described in the [user guide](docs/USER_GUIDE.md).
+Everyday editing includes temporary Find/Replace rows with match options and counts, remembered word wrap, Go to line, document/selection statistics, on-demand Windows spelling review, printing/PDF, previewed Markdown interchange and simple editable tables. Global and per-client browser layout choices request vertical or horizontal tabs for new windows. Backups offer client exclusions and progress by stage. Search More for note tools; shortcuts and conversion limits are described in the [user guide](docs/USER_GUIDE.md).
+
+**Change Edge's layout from ctSpaces:** bookmark any old tabs you need, then
+close that client's Edge window normally. Select the same client and Edge,
+turn **Restore tabs off**, choose **Vertical** or **Horizontal** in ctSpaces's
+global or client Tab layout menu, then open the client. With Restore tabs on,
+Edge instead reopens the saved session's layout. After closing the new window
+normally, you can re-enable Restore tabs to request that newly saved session.
+The Restore-off launch starts a new session and does not reopen the old tabs;
+cookies, sign-ins and other profile data remain.
 
 See [what changed since 6.1.1.0](docs/CHANGES_SINCE_6.1.1.0.md),
 [release notes](RELEASE_NOTES_6.3.4.0.md),
@@ -61,7 +70,7 @@ The app itself installs and stores shared settings under:
 - Close All Clients requests normal closure of tracked client browsers while keeping ctSpaces open.
 - Persistent sign-ins, cookies, bookmarks, history, site data, and sessions for each saved client.
 - Per-client/browser `Restore tabs` switch. Leave it on to reopen that browser slot's previous tabs, or turn it off to start that slot on a normal new tab while keeping sign-ins and other profile data.
-- Global and per-client native tab layout: Keep browser's choice, Vertical or Horizontal. Horizontal explicitly sets the new-window vertical-tab preference to off. Edge can restore the old layout with Restore tabs on; this setting does not force restored windows. Temp follows global, while the Default editor keeps its own layout.
+- Global and per-client native tab layout: Keep browser's choice, Vertical or Horizontal. Horizontal explicitly sets the new-window vertical-tab preference to off. To change an Edge window's layout through ctSpaces, use Restore tabs off for that launch; Restore tabs on reopens the saved session's layout. Temp follows global, while the Default editor keeps its own layout.
 - Browser selector for Microsoft Edge, Google Chrome, Brave, and Mozilla Firefox. Choosing another browser opens that client's independent slot rather than reusing another browser's data.
 - Pinned favorite clients with customer logos, one-click open/switch behavior, and saved drag ordering.
 - Pinned-client right-click actions for selection, tab restore, opening a copied website link, and creating one customer-icon Desktop shortcut per client. Its visible label is exactly the client name (`Client.lnk`), it records the browser selected when created, and recreating it updates that managed link.

@@ -151,10 +151,17 @@ ctSpaces-owned Firefox `user.js` block.
 
 **Edge session-restore limitation:** live checks in both directions showed the
 stored new-window preference and restored window layout disagreeing. Edge can
-retain the saved window's layout with Restore tabs on. Changing layout in Edge
-before closing that session retains the desired native state. No supported
-forced override is claimed, and ctSpaces preserves session files and restore
-behavior. An [Edge engineer's explanation of session-restored layout](https://techcommunity.microsoft.com/discussions/edgeinsiderdiscussions/vertical-tabs-prevents-edge-canary-103-0-1250-0-from-launching/3344208/replies/3348593)
+retain the saved window's layout with Restore tabs on. The app-only workflow is
+to preserve needed old tabs first, close the existing client window normally,
+select the same client/browser, turn Restore tabs off, choose Vertical or
+Horizontal in ctSpaces, and launch. This establishes a new window using the
+startup layout preference. After closing the new window normally, Restore tabs
+can be re-enabled to request that newly saved session. This final re-enable
+transition is guidance, not an additional claimed live-test pass.
+
+Restore-off starts a new session rather than reopening the old saved tabs;
+cookies, sign-ins and other profile data remain. No in-place conversion of an
+old saved window or binary-session rewrite is claimed. An [Edge engineer's explanation of session-restored layout](https://techcommunity.microsoft.com/discussions/edgeinsiderdiscussions/vertical-tabs-prevents-edge-canary-103-0-1250-0-from-launching/3344208/replies/3348593)
 also describes that distinction; it is historical context, while the current
 limitation is supported by the separately recorded live checks.
 
