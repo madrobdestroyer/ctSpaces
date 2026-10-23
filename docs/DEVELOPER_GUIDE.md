@@ -21,17 +21,29 @@ same-executable launch requests restore the launcher and its active popup using
 Windows' foreground APIs without making either window always on top.
 
 All Notes HTTP/HTTPS links use `ShellExecuteW` with the `open` verb and no client
-profile arguments. RichEdit's right mouse-button release and keyboard context
+profile arguments. `[notes_window] link_browser` chooses System default or a
+specific installed Edge, Chrome, Brave or Firefox for every notebook. Details >
+Open links in and More > Link browser expose the same preference. An unavailable
+chosen browser fails with guidance instead of falling back to a different
+browser. RichEdit's right mouse-button release and keyboard context
 menu messages share the themed editing menu. Closing Notes captures the editor
 before pruning pristine, automatically named empty drafts, then commits the
 notebook before destroying the window. Renamed, edited, or metadata-bearing
 notes are retained.
 
+Notes is a modeless ownerless taskbar window. Client switching swaps only the
+notebook state after a successful save; it preserves the actual window, its
+bounds and maximized state. Normal autosave emits no Saved/Saving message.
+`SetNotesStatus` exposes only save/load problems or invalid Details drafts.
+Reusable template and snippet libraries instead have explicit Save actions.
+Client notebooks allow 10,000 pages and 256 MiB including history; each shared
+library retains its independent 256-entry limit.
+
 | Path | Responsibility |
 |---|---|
 | `ctSpaces.cpp` | Startup, installer/update flow, launcher UI, themes, profile lifecycle, browser launch/tracking, icons, backup/restore, and dialogs |
 | `ctSpaces.rc` | Icons, dialog resources, embedded `Default.7z`, embedded runtime sanitizer, and Windows version metadata |
-| `ClientNotes.h` / `NotesWorkspaceUi.inl` | Validated atomic notebook v1/v2/v3 storage and native notes workflows |
+| `ClientNotes.h` / `NotesWorkspaceUi.inl` | Validated atomic notebook storage: reads formats 1–5, writes 2–5 as required by the data, and owns native notes workflows |
 | `NotesFindModel.h` / `NotesFindUi.inl` | Native-position search, bounded match counts, atomic replacement and temporary search rows |
 | `NotesTextTools.h` / `NotesEditingExtras.inl` | Logical-line statistics/navigation, remembered wrapping and independent RichEdit print copies |
 | `NotesSpelling.h` / `NotesSpellingUi.inl` | On-demand Windows spelling dictionaries, technical-text exclusions and explicit corrections |
@@ -41,7 +53,7 @@ notes are retained.
 | `Resource.h` | Resource identifiers |
 | `version.h` | Single version source for app, About, file, and product versions |
 | `theme.h` | Built-in named theme catalog |
-| `InProc7z.*` | In-process extraction/compression wrapper for the starter template |
+| `InProc7z.*` | In-process starter/backup compression and protected restore extraction, ownership tracking, CRC verification and error reporting |
 | `BrowserPreferencesJson.*` | Bounded Chromium Preferences parsing and staged startup-preference mutation |
 | `ConfigPersistence.*` | Tri-state configuration inspection and atomic sibling-stage mutations |
 | `ProgressUI.*` | Themed progress-window helpers |
@@ -167,7 +179,7 @@ limitation is supported by the separately recorded live checks.
 
 The active-profile map and tab list use case-insensitive `(client, browser)` identity. One slot cannot be launched twice from one launcher, but different browser slots for the same client may run simultaneously. Each tab deliberately displays only `session.clientName`, so simultaneous slots for one client have matching visible labels without collapsing their internal identities. The session reaper detects browser-process exit and removes the corresponding tab.
 
-Closed clients can be renamed with `MoveFileExW(..., MOVEFILE_WRITE_THROUGH)`. The operation preserves the complete client container, including every browser slot, and replaces the client name in the pinned vector, browser-qualified Restore tabs exceptions, archive records, icon cache, and verified ctSpaces-created client Desktop shortcut. Closed clients can also be archived by adding their name to `[archived]`; every profile slot and its Restore tabs entries remain in place while list and pin views filter the archived name.
+Closed clients are renamed through retained client-namespace and directory handles; case-only changes use a unique sibling stage. The operation preserves the complete client container, including every browser slot, and migrates the pinned entry, browser-qualified Restore tabs exceptions, archive records, icon cache and verified ctSpaces-created client Desktop shortcut. Settings use one staged atomic configuration commit before the prepared memory lists are published. Failure triggers an identity-bound rollback and reports an indeterminate location rather than claiming success if rollback cannot be verified. Closed clients can also be archived by adding their name to `[archived]`; every profile slot and its Restore tabs entries remain in place while list and pin views filter the archived name.
 
 Reset remains disabled and fail-closed pending separate authorization for its selected-browser destructive behavior. Whole-client Delete is independently implemented: it resolves and validates the client root twice, accepts only the exact v2 or recognized hybrid legacy layout, excludes transient roots, rejects reparse points anywhere in the tree, checks all browser slots for activity both before and after confirmation, proves post-delete absence, and removes only exact verified ctSpaces-managed shortcuts.
 
@@ -262,7 +274,7 @@ Explorer caches `PKEY_AppUserModel_RelaunchIconResource`. Do not point different
 - Block whole-client destructive tools while any browser slot for that client is open.
 - Revalidate exact client path, layout, transient exclusion, and full-tree reparse absence immediately before Delete; prove absence before reporting success.
 - Stage Default archive replacement before moving the prior data.
-- Keep browser databases closed during all-client export and restore. Probe supported OS browser processes against the whole `Sites` scope, fail closed on indeterminate inspection, and repeat the check immediately before export/archive creation or restore commit work.
+- Keep selected clients' browser databases closed during export; probe supported OS browser processes against the selected client scope and repeat the check immediately before archive creation. Excluded clients can remain open. Restore probes the whole `Sites` scope and repeats that check before commit. Both operations fail closed on indeterminate relevant process inspection.
 - Treat client names case-insensitively and reject internal or Windows-reserved names.
 - Request normal browser close before considering forced cleanup.
 - Keep client tabs icon-free; the selected icon is already displayed in the launcher.
@@ -403,7 +415,7 @@ version once for that release; never increment it for each build, test attempt,
 or user-reported issue. Review builds must use a separate output directory so
 published packages remain intact.
 
-1. Update the four-part Windows version and short display version together in `version.h`.
+1. Set the four-part Windows release version consistently in the numeric, narrow and wide definitions in `version.h`. The short display label can remain `6.3` across patch releases; change it only when the intended visible release label changes.
 2. Update `README.md`, `USER_CHANGELOG.md`, this developer guide, and the versioned release-validation report.
 3. Build `Release|x64` and confirm zero warnings and errors.
 4. Run the full non-browser test block above, including both Default sanitizers, BrowserPreferencesJson, ConfigPersistence, archive round-trip, workflow, rename/shortcut transactions, shortcut filename boundaries, Restore-tabs, and external-profile-use checks.
@@ -462,11 +474,16 @@ User-visible behavior, data handling, installation prompts, profile cleanup, and
 
 Run `tests/Test-NotesWorkspace.ps1` after a Release x64 app build. This compiles production notes code into an isolated native test process, redirects only confirmation/input/file-picker boundaries, and exercises actual RichEdit and tab controls. It never runs the application startup or reads live client data. Fixtures are retained below `build/notes-workspace-test-*` for inspection. `tests/Test-ClientNotes.ps1` covers notebook storage/migration and unsafe path boundaries. Finish with a live disposable `--qa-instance` / `--qa-data-dir` visual review; native assertions do not establish visual quality or flicker behavior.
 
-The notes workspace is modeless, with one client notebook open at a time. Cached native editors preserve Undo for the active note and the 15 most recently visited open notes; eviction, closing a tab or closing the window releases that editor's Undo queue. Client lifecycle operations flush/close the relevant notebook before proceeding. V2 notebooks keep bounded revisions and optional crash snapshots; all writes retain stale-snapshot and safe-path checks. Deferred work is tracked in `docs/notes-roadmap.json`.
+The notes workspace is modeless, with one client notebook open at a time. Cached native editors preserve Undo for the active note and the 15 most recently visited open notes; eviction, closing a tab or closing the window releases that editor's Undo queue. Client lifecycle operations flush/close the relevant notebook before proceeding. Notebooks keep bounded revisions and optional crash snapshots; all writes retain stale-snapshot and safe-path checks. Deferred work is tracked in `docs/notes-roadmap.json`.
 
 Notes productivity helpers live in `NotesProductivityUi.inl`, included by the
-workspace after its text/date helpers. Status and tags opt notebooks into V3;
-V1/V2 and legacy content remain readable, and unused metadata retains V2 output.
+workspace after its text/date helpers. `ParseNotebook` accepts V1–V5 and legacy
+content remains readable. `SerializeNotebook` chooses the minimum required
+output: V2 for the base notebook, V3 for status/tags, V4 for revision link maps,
+and V5 for exact native UTF-16 link occurrences in current notes or history.
+Absence of status/tags alone does not imply V2 output. Older builds reject
+unsupported formats; retain a notebook backup before downgrading and use
+document exports when an older application needs readable content.
 Shared snippets use a separate `NotesSnippets` notebook with the same atomic and
 stale-snapshot protections as templates. Quick capture closes a same-client
 editor first, debounces its plain-text draft, and blocks closing after a save
@@ -481,12 +498,19 @@ document mutations during resize. Code insertion is a TOM edit collection for
 one-step undo; nested table insertion is rejected. Source is never executed.
 Readable export normalizes native soft-line/cell separators to ordinary whitespace.
 
-Ticket commands use Windows' URL association through ShellExecuteW, without
-client/browser-profile arguments. A matching saved ticket URL clicked in the
-active note follows the same route. All notes passes the owning editor when
+Ticket commands use `ShellExecuteW` with only the URL argument and no managed
+client/browser-profile arguments. System default uses Windows' URL association;
+an explicit Notes link-browser choice invokes that installed browser's regular
+session. A matching saved ticket URL clicked in the active note follows the same
+route. All notes passes the owning editor when
 flushing pending content before launch. Native tests replace the shell boundary
 and cover cancellation, invalid URLs, launch failure, both ticket buttons, and
 the body-link route without visiting an external site.
+
+Friendly links bind native RichEdit cookies to immutable URLs, so Undo restores
+the correct target. V5 persists exact occurrence ranges rather than reattaching
+URLs by caption text. Repeated captions can retain independent targets; editing
+or removing one occurrence does not rewrite the other occurrences' links.
 
 Notebooks permit 10,000 pages within the unchanged 256 MiB byte limit. Templates
 and snippets retain a separate 256-entry guard. Name and identity validation use
@@ -520,7 +544,7 @@ and ordinary tabs reorder only within their own group. Reopening a closed note
 appends it to its group; selecting an open note does not move it. All note-opening
 routes share the save-before-switch helper. No notebook schema change is needed.
 
-## Whole-app review for 6.3.1.0
+## Historical whole-app review for 6.3.1.0
 
 See FULL_APP_STRESS_REVIEW_6.3.1.0.md for the 12 core and 16 integration suites,
 531 native Notes checks, actual Edge/Chrome coverage, retained failures, harness

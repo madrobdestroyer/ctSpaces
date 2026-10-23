@@ -1,6 +1,8 @@
 # ctSpaces Feature Reference
 
-Applies to ctSpaces 6.1.1.0.
+Applies to ctSpaces 6.3.5.0. The [User Guide](USER_GUIDE.md) explains everyday
+workflows; [release validation](RELEASE_VALIDATION_6.3.5.0.md) records completed
+checks and known limits. Historical release reports retain their original scope.
 
 ## Core Purpose
 
@@ -43,6 +45,7 @@ Each new client root carries the v2 client marker and can hold separate `edge`, 
 | Pinned overflow | Lists pinned clients beyond the four compact visible shortcuts. Right-click selects a hidden favorite for editing without opening it. |
 | Client combo | Filters existing names by a case insensitive substring without completing or replacing typed text. Explicitly selecting a match fills its full name. Enter runs the primary action for the exact current name. |
 | Close all | Requests normal closure of tracked client browsers while keeping the launcher open. Delayed or refused closes remain tracked and are not silently forced. |
+| Notes | Opens the selected client's notebook or returns to the remembered notebook without launching a browser. Its independent window has one searchable client picker. |
 | Integrated client logo | Displays the selected client's `client.ico` inside the editable selector; clicking the logo opens the profile folder. |
 | Pushpin toggle | Adds or removes an existing client from the Pinned row and is disabled for a new client name. |
 | `Create` | Creates and launches a new client. |
@@ -85,7 +88,8 @@ Dropping a visible pinned client on the Windows Desktop creates one `.lnk` launc
 | Set Profile Icon | Yes | Yes | Copies an ICO or converts another supported image into `client.ico`. |
 | Remove Custom Icon | Yes | Yes | Deletes the custom client icon. |
 | Create Desktop Shortcut | Existing client | Yes | Creates or updates the client-named Desktop link for the browser currently selected, using the customer icon when available. |
-| Client Notes | Existing client | Yes | Opens a themed editor with formatted notes and user-named ticket tabs. Existing notes open in Notes. Changes autosave; the top-right X finishes pending saves. The window remembers its size and maximized state. Notes follow rename, archive, and full backup. Whole client deletion removes notes. |
+| Client Notes | Existing client | Yes | Opens that client's themed notebook without requiring a browser launch. Blank Untitled notes are usable immediately; ticket metadata is optional. Changes autosave quietly, with problems reported. The independent window remembers its bounds and maximized state. |
+| Tab layout - all clients / this client | A client is needed only for an override | Yes, for the next idle launch | Keeps the browser's choice, requests vertical tabs, or explicitly requests horizontal tabs. A client override follows that client through its lifecycle. Restored Edge windows can retain their saved layout. |
 | Rename Client | Existing client | No | Renames the complete client container and migrates its pinned entry, browser-specific Restore tabs choices, shared icon, and ctSpaces-managed client shortcut. |
 | Archive Client | Existing client | No | Hides the client from the normal list without removing profile data. |
 | Archived Clients | No | Yes | Restores a hidden client to the normal list. |
@@ -99,10 +103,64 @@ Dropping a visible pinned client on the Windows Desktop creates one `.lnk` launc
 | Themes | No | Yes | Previews and saves the launcher theme. |
 | Client name first in window titles | No | Yes | Toggles whether ctSpaces browser titles begin with the client name for easier Alt+Tab identification and refreshes already-open client windows. |
 | Browser Selection | No | Yes | Changes the saved default browser for the next launch; each client/browser slot remains independent. |
-| Back Up All Client Data | No | No supported browser process may be using a profile below `Sites`; indeterminate inspection also blocks it | Creates and verifies a manifested `.7z` backup of every standard client. |
+| Back Up All Client Data | No | Selected client profiles must be closed; indeterminate relevant process inspection also blocks it | Starts with every client checked, including archived clients. Choose which clients to include in the verified manifested `.7z` backup. Excluded clients may remain open. |
 | Restore Client Data | No | No supported browser process may be using a profile below `Sites`; indeterminate inspection also blocks it | Validates and stages a backup before transactionally replacing `Sites`; older ZIP backups remain supported. |
 | Quick tour | No | Yes | Highlights real launcher controls in a read-only, manually navigated overlay without performing their actions. |
 | About | No | Yes | Shows product, version, author, and project information. |
+
+## Client Notes
+
+The launcher **Notes** button sits beside **Close all**. Notes has its own
+taskbar window and remains usable when the launcher is minimized or sent to the
+tray. Switching clients saves the original notebook and reuses the same window,
+preserving its position, size and maximized state. Each notebook stays with its
+client through rename, client archive and backup; whole-client deletion removes
+that client's notes without merging them with another client's notebook.
+
+The editor has slim reorderable tabs and one compact row for **Find**,
+**Snippets**, **Templates**, **Add update**, **Format** and **Details**. Text
+selection or Format opens an on-demand formatting palette. There is no permanent
+formatting toolbar, Save/Cancel footer, or normal Saved/Saving indicator. Save,
+load and invalid-details problems remain visible until resolved.
+
+**Details** edits optional ticket information, local work status and tags.
+The small status icon and label beside it are read-only, and No status hides
+them. Status does not synchronize with a ticket system. Templates and snippets
+each combine creation, editing, saving and use in their own shared library;
+they use explicit Save buttons while client notes autosave.
+
+All note and ticket URLs open, after confirmation, in the chosen regular PC
+browser session outside client profiles. Choose **Details > Open links in** or
+**More > Link browser**: System default, or an installed Edge, Chrome, Brave or
+Firefox. This one Notes preference applies to every client notebook and does not
+change the launcher browser or Windows default. An unavailable chosen browser
+is reported instead of silently falling back.
+
+The notebook limit is **10,000 notes per client**, counting closed, archived and
+trashed notes, and **256 MiB** including history. Shared template and snippet
+libraries have separate **256-entry** limits. Trash has no automatic expiry;
+Restore recovers a note, while Delete forever and Empty trash require explicit
+confirmation. See the [Notes walkthrough](NOTES_WALKTHROUGH.md) and
+[productivity guide](NOTES_PRODUCTIVITY.md) for recovery, reusable content,
+search, sorting, bulk actions and handover exports.
+
+## Browser Tab Layout
+
+Settings > **Tab layout - all clients** offers Keep browser's choice (the
+default), Vertical tabs and Horizontal tabs. The selected client's **Tab layout
+- this client** menu, also available from its pinned context menu, offers Follow
+global setting or an explicit vertical/horizontal override. Horizontal explicitly
+requests vertical tabs off. Keep releases enforcement; it does not restore an
+earlier layout. Temporary profiles follow the global setting; the Default editor
+is excluded. Firefox also removes only ctSpaces' own `user.js` override when
+enforcement is released.
+
+These are next-launch native preferences, not commands to change an open or
+restored browser window. Edge can retain a saved session's layout when Restore
+tabs is on. To establish a new layout, preserve needed tabs, close that client's
+Edge window normally, select the same client/browser, turn Restore tabs off,
+choose the desired layout and launch. See the [User Guide's layout workflow](USER_GUIDE.md#choose-vertical-or-horizontal-browser-tabs)
+for the restore boundary and the scope of completed checks.
 
 ## Inactive Client Cleanup
 
@@ -234,10 +292,11 @@ ctSpaces includes:
 
 ### Export
 
-- Requires every supported browser process using a profile below `Sites` to be closed. An unreadable or indeterminate relevant process blocks export.
-- Repeats the external profile-use check immediately before archive creation.
+- Starts with every client selected, including archived clients. Search and Select shown/Clear shown make a smaller backup possible without changing any client's data.
+- Requires the selected clients' browser profiles to be closed. An unreadable or indeterminate relevant process blocks export; excluded clients may remain open.
+- Repeats the selected clients' external profile-use check immediately before archive creation.
 - Uses the bundled in-process 7-Zip engine.
-- Adds a root manifest and the complete top-level `Sites` folder.
+- Adds a root manifest and top-level `Sites` folder containing the selected complete client containers, including their Notes and browser data.
 - Fails if any source file is skipped, then inspects and CRC-tests the staged archive before saving it atomically.
 - Suggests a timestamped `ctSpaces_Backup_...7z` filename.
 
@@ -255,7 +314,7 @@ ctSpaces includes:
 
 - Per-user install under `%LOCALAPPDATA%`; administrator rights are not required for the normal path.
 - Optional Start Menu, Desktop, and current-user startup entries.
-- A short release label such as `6.1`, backed by the current four part Windows version `6.1.0.0`.
+- A short display label `6.3`, backed by the current four-part Windows version `6.3.5.0` used for install/update comparisons.
 - Newer, same-version, and older external copies have distinct prompts.
 - Updates stage the new executable beside the installed copy and retry replacement.
 - Relaunch waits for the updater process to exit before acquiring the single-instance mutex.
@@ -272,7 +331,7 @@ ctSpaces includes:
 ## Current Boundaries
 
 - The browser selector is a saved global default for the next launch, while every client keeps independent per-browser profile slots.
-- Backup and restore are all-clients operations, not selective.
+- Backup can include all or selected clients. Restore replaces the complete current `Sites` collection with the archive's contents; it does not merge selected clients into the live collection. Current data is retained in a pre-restore recovery folder first.
 - There is no built-in uninstaller or automatic internet update checker.
 - There is no profile search, tagging, or size display. Client activity dates are recorded for manual three-month cleanup; the normal selector does not display them.
 - Profile separation is organizational browser-profile isolation, not an operating-system sandbox, encryption boundary, or malware isolation.

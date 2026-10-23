@@ -86,7 +86,7 @@ Temporary browsing is not guaranteed secure deletion. Browser processes, antivir
 
 `Back Up All Client Data` creates a validated 7-Zip archive containing the selected clients below `Sites` and a ctSpaces manifest.
 
-- Every supported browser process using a profile below `Sites` must be closed first, including one started manually with a ctSpaces profile path. An unreadable or indeterminate relevant process blocks export, and ctSpaces repeats the check immediately before archive creation.
+- Every supported browser process using a selected client's profile must be closed first, including one started manually with that ctSpaces profile path. Excluded clients may remain open. An unreadable or indeterminate relevant process blocks export, and ctSpaces repeats the selected-client check immediately before archive creation. Restore checks the whole `Sites` collection instead.
 - The searchable client selection includes archived clients. Select all clients for a complete backup, or uncheck clients to exclude them.
 - Hidden profile files and files larger than 2 GB are supported by the built-in archive engine.
 - ctSpaces rejects skipped or unsafe source items, verifies the completed archive's paths, item types, sizes, and CRCs, and atomically installs the finished destination file.

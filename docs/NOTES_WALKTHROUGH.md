@@ -1,12 +1,17 @@
 # Using Client Notes, step by step
 
-The in-app guide has fourteen topics, including quick capture, searchable Actions,
+Applies to ctSpaces 6.3.5.0. See the [User Guide](USER_GUIDE.md) for current
+controls and [release validation](RELEASE_VALIDATION_6.3.5.0.md) for test scope.
+
+The in-app guide has fourteen topics, including quick capture, searchable More actions,
 status/tags and sorting, snippets/work logs, and selecting/exporting several notes.
 See the [Notes productivity guide](NOTES_PRODUCTIVITY.md) for the complete new flows.
 
-Open an existing client in ctSpaces, then choose **Settings > Client Notes**.
+Click **Notes** beside **Close all**. Select an existing client or return to the
+remembered notebook; no client browser needs to be open. **Settings > Client
+Notes** and the client's context menu offer another route.
 You can replay these steps inside the notes window through **Help > Step-by-step
-walkthrough** or **Actions > Notes walkthrough**. Use **Next**, **Back**, or the topic
+walkthrough** or **More > Notes walkthrough**. Use **Next**, **Back**, or the topic
 selector. Reading the walkthrough does not change your notes.
 
 The screenshots show a disposable example client in a dark theme. Your notes
@@ -17,22 +22,28 @@ use your selected app theme. Notes save locally with their client.
 1. Click **+**, or press **Ctrl+T**. An **Untitled** tab opens immediately.
 2. Start typing. You can name the note later; no title is required before writing.
 3. Pause briefly to let autosave run. Switching tabs or closing the notes window
-   also saves pending edits. There is no Save button or permanent footer.
+   also saves pending edits. There is no Save button, Saved/Saving label or permanent
+   footer. A save, load or invalid-details problem is shown until resolved.
 4. Resize the window to suit your screen. Its size and maximized state are remembered.
+   Switching clients reuses this same window and keeps its position and size.
 
 ![Client Notes with tabs, formatting controls, headings and a checklist](screenshots/notes-workspace.jpg)
 
 ## 2. Format text, highlights and checklists
 
-1. Select words, then choose a heading, font size, **Bold**, **Italic**, or **Underline**.
+1. Select words to show the formatting palette, or click **Format** to open it at
+   the typing position. Choose a heading, font size, **Bold**, **Italic**, or **Underline**.
 2. Click the highlighter's arrow to select a color. Use the marker button to apply
    or remove the chosen highlight.
 3. Choose the checklist button to create tasks. Click a task's box to mark it done;
    its text is struck through. **Enter** adds an unchecked item. **Enter** on an
    empty item ends the list. **Tab / Shift+Tab** change list indentation.
 4. Select text and choose **Link** to add a label and web address. Detected HTTP/HTTPS
-   URLs also work. All note links ask before opening in your PC's default browser,
-   outside client profiles.
+   URLs also work. All note links ask before opening in your chosen regular PC
+   browser, outside client profiles. **Details > Open links in** or **More > Link
+   browser** selects System default or an installed Edge, Chrome, Brave or Firefox
+   once for every client notebook. An unavailable chosen browser is reported
+   rather than silently replaced with another browser.
 5. Use Undo/Redo for editing mistakes. Right-click for Cut, Copy, Paste, and Select
    all. Pasting inserts plain text.
 
@@ -95,7 +106,7 @@ messages, import ticket data, or synchronize with a ticket system. Both are opti
 
 ## 6. Use or customize a template
 
-1. Click the top **Templates** button, or choose **Actions > Templates**.
+1. Click the top **Templates** button, or choose **More > Templates**.
    Select a saved starter to read or edit its name, hint and formatted content.
 2. Click **New template** to write your own starter directly in this window.
    Enter a name and hint, then write its content. Use the formatting row for
@@ -116,7 +127,7 @@ the shared template library.
 
 ## 7. Copy or move a note to another client
 
-1. Open the note. Choose **Actions > Copy to another client** or **Move to another client**.
+1. Open the note. Choose **More > Copy to another client** or **Move to another client**.
 2. Choose another active client from the dropdown, or type part of its name to
    filter suggestions. Select the destination and click **OK**.
 3. Check the client named in the confirmation before proceeding.
@@ -130,7 +141,7 @@ source in the original client's Trash view. It does not merge notebooks.
 ## 8. Archive, use trash, and restore a note
 
 The **Trash** button beside **All notes** opens deleted notes directly. Trash is
-also available from Help and searchable Actions. It replaces the old
+also available from Help and searchable More actions. It replaces the old
 "Recently deleted" label; retention and restore behavior are unchanged.
 
 1. In All notes, select a current note. **Archive** keeps it but hides it from
@@ -170,9 +181,9 @@ trash is empty, and it works even when your current search has no matching resul
    document. Search **More** for Word wrap, Go to line (**Ctrl+G**), Document
    information, Check spelling (**F7**), Print/PDF (**Ctrl+P**), Markdown
    import/export or Insert table. These tools appear on demand.
-2. **Actions > Version history** previews earlier text and formatting before restoring
+2. **More > Version history** previews earlier text and formatting before restoring
    them. It is a bounded recovery history, not a complete record of every keystroke.
-3. If the title reports a failed save, keep the window open. Use **Actions > Retry
+3. If the title reports a failed save, keep the window open. Use **More > Retry
    saving**, **Copy entire note**, or **Export this note** to preserve your draft.
    **Resolve save conflict** handles a notebook changed elsewhere.
 4. **Export this note** writes TXT or RTF. **Export client notebook** writes a `.ctn`

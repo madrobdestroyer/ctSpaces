@@ -1,22 +1,27 @@
 # Notes productivity guide
 
-These controls extend the existing client notebook. The editor keeps its slim
-tabs, formatting toolbar, theme colors, autosave, and remembered window size.
-Find, Snippets, Templates, Status, and Add update have direct buttons at the top.
-They share the title row on wide windows and wrap into one compact row below the
-tabs on narrower windows. The document has no footer controls.
+Applies to ctSpaces 6.3.5.0. The [User Guide](USER_GUIDE.md) describes the complete
+Notes workspace; [release validation](RELEASE_VALIDATION_6.3.5.0.md) records test scope.
+
+The editor keeps its slim tabs, theme colors, quiet autosave and remembered
+window bounds. One compact row contains Find, Snippets, Templates, Add update,
+Format and Details. Selecting text or clicking Format opens the formatting
+palette on demand. The small status icon and label beside Details are read-only;
+No status hides them. There is no permanent formatting toolbar or footer.
+Normal saving shows no Saved/Saving label; only save/load or invalid-details
+problems stay visible. Switching clients keeps the same Notes window in place.
 
 | Feature | Where to find it | What it does |
 | --- | --- | --- |
 | Quick capture | Select a client, Settings > Quick note; or right-click a pinned client > Quick note | Opens a small plain-text capture window with an optional title. Autosaves a closed note into that client's notebook. |
-| Searchable actions | Actions, or Ctrl+K in the editor | Search command names and descriptions, read the selected hint, then press Enter or Open action. |
+| Searchable actions | More, or Ctrl+K in the editor | Search command names and descriptions, read the selected hint, then press Enter or Open action. |
 | Reusable snippets | Snippets | Create, edit and save shared text blocks, then insert one at the cursor in the current note. |
-| Simple note status | Top Status button, or Actions > Status and tags | Choose No status, Investigating, Waiting on client, Follow-up needed, or Resolved. The top button displays the current status. |
-| Tags | Actions > Status and tags | Add comma-separated tags, up to 16 tags of 32 characters each. |
+| Simple note status | Details, or More > Status and tags | Choose No status, Investigating, Waiting on client, Follow-up needed, or Resolved. The read-only icon and label beside Details show the current status; use Details to change it. |
+| Tags | Details, or More > Status and tags | Add comma-separated tags, up to 16 tags of 32 characters each. |
 | Sorting | All notes > Sort | Recently edited, newest created, title, or ticket number. Sorting changes the results view, not the notebook's tab order. |
-| Ongoing work log | Actions > Add work log update | Append a dated update section to the current note and continue writing. Earlier updates remain. |
+| Ongoing work log | Add update, or More > Add work log update | Append a dated update section to the current note and continue writing. Earlier updates remain. |
 | Bulk actions | All notes > Select notes | Tick several notes, select all visible results, clear selection, or finish selecting. Archive, Restore, To trash, and Delete forever apply to ticked notes. |
-| Readable handover | Actions > Export handover, or All notes > Export handover | Write one standalone HTML document with the selected notes, client, titles, status, tags, dates, ticket links, and readable text. |
+| Readable handover | More > Export handover, or All notes > Export handover | Write one standalone HTML document with the selected notes, client, titles, status, tags, dates, ticket links, and readable text. |
 
 **Templates** combines creation, editing and use in one window. Select a saved
 starter or click **New template**, edit its name, hint and formatted content, then
@@ -33,9 +38,14 @@ with the ticketing system.
 ## Ticket sign-in and note capacity
 
 **All note links**, including **Open ticket link**, saved ticket URLs, pasted
-URLs, and labeled links, use Windows' default web browser and your regular
-browser session. They do not use a client's isolated browser profile. The
-confirmation explains which browser session will be used.
+URLs, and labeled links, use your chosen regular PC browser session. Choose
+**Details > Open links in**, below the ticket URL, or **More > Link browser**.
+System default follows Windows; alternatively choose an installed Microsoft Edge,
+Google Chrome, Brave or Firefox for work links while leaving your personal
+Windows default unchanged. This preference applies to every client notebook.
+Links never use a client's isolated browser profile. The confirmation names the
+destination browser; an unavailable chosen browser is reported without silently
+opening another browser.
 
 The former 256-note cap was an implementation guard, not a storage-format
 requirement. It is now **10,000 notes per client**, including closed, archived,
@@ -46,7 +56,7 @@ and snippet libraries retain a separate 256-entry limit. Older builds with the
 
 ## Keep code separate from prose
 
-Choose **Code** in the text-style dropdown, or **Actions > Insert code block**.
+Open **Format** and choose **Code** in the text-style dropdown, or use **More > Insert code block**.
 A dialog appears with a language dropdown and a source editor. Choose a label
 such as PowerShell, Python, SQL, JSON, C#, or Log output, then paste or type code
 and click **Insert code block**. Selected prose pre-fills the source editor and
@@ -82,7 +92,7 @@ first saves and closes that editor to avoid competing writes.
 
 ## Find commands without memorizing a menu
 
-Click **Actions** or press **Ctrl+K** in the Notes workspace. Type words such as
+Click **More** or press **Ctrl+K** in the Notes workspace. Type words such as
 `tags`, `snippet`, `work log`, or `export`. The list searches command names and
 hints. Commands requiring a note are hidden when no note is open. An empty
 result disables Open action.
@@ -104,7 +114,7 @@ the note you are editing. They have separate shared libraries.
 4. To create your own snippet, choose **New snippet**, give it a unique name and optional
    hint, write directly in its editor, then **Save snippet**. This works without an open note.
 5. **From selection** starts a new editable draft from selected text in your current
-   note, or the whole note when nothing is selected. **Actions > Save selection as snippet**
+   note, or the whole note when nothing is selected. **More > Save selection as snippet**
    opens the same editor with this draft already prepared.
 6. Deleting or updating a snippet leaves previously inserted text unchanged.
 
@@ -158,11 +168,18 @@ For a restorable notebook with history and metadata, use **Export client noteboo
 
 ## Compatibility and storage
 
-Status and tags use notebook format 3 when present. Existing format 1, format 2,
-TXT, and RTF notebooks still open; notebooks with no status or tags continue to
-save in format 2. Older app builds that do not understand format 3 refuse to
-read it safely rather than overwriting it. Keep a notebook export before using
-an older build. Shared snippets are stored separately in `NotesSnippets` under
-the app's data folder; templates remain in `NotesTemplates`.
+Current ctSpaces reads notebook formats 1–5 and legacy TXT/RTF notes. Saving uses
+the format required by the data: format 2 for the base notebook, 3 for status and
+tags, 4 for revision link targets, or 5 for exact labeled-link occurrences in
+notes or history. A notebook without status or tags can still need a newer
+format because of its links. Each labeled-link occurrence keeps its own target;
+the same visible caption does not force links to share one address.
+
+Older builds refuse notebook formats they do not understand instead of
+overwriting them. Keep a full notebook export or backup before downgrading, and
+export individual notes as TXT/RTF for use in older applications; these document
+exports do not retain all notebook metadata or history. Shared snippets are
+stored separately in `NotesSnippets` under the app's data folder; templates
+remain in `NotesTemplates`.
 
 Replay **Help > Step-by-step walkthrough** for the 14-topic in-app guide.

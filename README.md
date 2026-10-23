@@ -28,6 +28,10 @@ See [what changed since 6.1.1.0](docs/CHANGES_SINCE_6.1.1.0.md),
 [validation report](docs/RELEASE_VALIDATION_6.0.0.0.md) remain available as
 historical records.
 
+Maintainers continuing work should start with the
+[current project handoff](docs/PROJECT_HANDOFF.md) for the exact release and local
+review paths, validation scope, retained limitations and workspace status.
+
 This is a maintained fork of the
 [original ctSpaces project](https://github.com/BiatuAutMiahn/ctSpaces) by
 BiatuAutMiahn. Fork maintenance does not imply changes to or endorsement by the

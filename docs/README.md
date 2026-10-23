@@ -1,7 +1,9 @@
 # ctSpaces Documentation
 
-These documents describe ctSpaces 6.3, including the Notes design review on the
-`cpp` branch. Local review reports distinguish unpublished builds from releases.
+These documents describe ctSpaces **6.3.5.0** on the `cpp` branch. Start with the
+[current project handoff](PROJECT_HANDOFF.md) for release identity, local review
+paths, tested coverage, known limitations, standing decisions and continuation
+instructions. Versioned local review reports describe their historical binaries.
 
 ## For People Using ctSpaces
 
@@ -16,6 +18,9 @@ These documents describe ctSpaces 6.3, including the Notes design review on the
 
 ## For Maintainers
 
+- [Current Project Handoff](PROJECT_HANDOFF.md): start here before continuing work; current release, evidence, boundaries, product decisions and housekeeping receipts.
+- [6.3.5.0 Release Validation](RELEASE_VALIDATION_6.3.5.0.md): exact backup-restore repair, fresh checks and version-only provenance from the preceding broader scan.
+- [Changes Since 6.1.1.0](CHANGES_SINCE_6.1.1.0.md): cumulative coworker-facing changes, update cautions and the accepted Edge Restore tabs limitation.
 - [Notes Tab Order Review](NOTES_TAB_ORDER_REVIEW.md): native drag handling, explicit move controls, reopening order and adversarial testing of the 6.3.0.0 review branch.
 - [Notes Inspector Review](NOTES_INSPECTOR_REVIEW.md): local 6.3.0.0 Inspector on Demand design, temporary panels, searchable clients, isolated notebooks, native resize validation and package evidence.
 - [Notes Spacing Review](NOTES_SPACING_REVIEW.md): compact 12-point Normal text, existing-note spacing correction, and local package validation.
@@ -33,8 +38,9 @@ These documents describe ctSpaces 6.3, including the Notes design review on the
 
 When documentation and behavior disagree, use this order:
 
-1. The current release code and automated tests.
-2. The applicable release or local review report for tested behavior and known boundaries.
-3. The other documents in this folder.
+1. The latest user instructions and the current handoff for task scope, permissions and candidate identity.
+2. The identified release/candidate's code and automated tests for implemented behavior.
+3. Its applicable validation report and exact artifact identity for coverage and known boundaries.
+4. The current guides; dated design reviews and older memory are historical context.
 
 Update the affected document whenever a user-visible behavior, storage rule, installer prompt, or release step changes.
