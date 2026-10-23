@@ -46,5 +46,5 @@ $guard=$match.Groups[1].Value|ConvertFrom-Json
 foreach($field in 'forbiddenClipboard','forbiddenKeyboard','forbiddenRedraw','nativeVisibleEvents','nativeForegroundEvents','nativeFocusEvents'){
  if($null-eq$guard.$field -or $guard.$field-ne0){throw ('Background guard did not remain zero: '+$field)}
 }
-@{Version='6.3.3.0';Checks=42;Scenarios=8;Build=$build;Native=$native;SourceFencePassed=$true;NativeGuard=$guard}|ConvertTo-Json -Depth 6|Set-Content -LiteralPath (Join-Path $artifacts 'result.json')
+@{Checks=42;Scenarios=8;Build=$build;Native=$native;SourceFencePassed=$true;NativeGuard=$guard}|ConvertTo-Json -Depth 6|Set-Content -LiteralPath (Join-Path $artifacts 'result.json')
 Write-Output 'Notes launcher lifetime: 42 checks, 8 scenarios, 0 failures; actual visible/focus/foreground/clipboard/input=0.'

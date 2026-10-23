@@ -57,5 +57,5 @@ $modalGuard=$modalMatch.Groups[1].Value|ConvertFrom-Json
 foreach($field in 'forbiddenClipboard','forbiddenKeyboard','forbiddenRedraw','nativeVisibleEvents','nativeForegroundEvents','nativeFocusEvents'){
  if($null-eq$modalGuard.$field -or $modalGuard.$field-ne0){throw ('Owned-modal background guard did not remain zero: '+$field)}
 }
-@{Version='6.3.3.0';Checks=90;Scenarios=6;Build=$build;Native=$native;ModalNative=$modal;SourceFencePassed=$true;NativeGuard=$guard;ModalGuard=$modalGuard}|ConvertTo-Json -Depth 6|Set-Content -LiteralPath (Join-Path $artifacts 'result.json')
+@{Checks=90;Scenarios=6;Build=$build;Native=$native;ModalNative=$modal;SourceFencePassed=$true;NativeGuard=$guard;ModalGuard=$modalGuard}|ConvertTo-Json -Depth 6|Set-Content -LiteralPath (Join-Path $artifacts 'result.json')
 Write-Output 'Backup selection: 90 checks, 6 groups, 0 failures; actual visible/focus/foreground/clipboard/input=0.'

@@ -59,5 +59,5 @@ foreach($lane in $(if($Mode -eq 'All'){@('Core','Native')}else{@($Mode)})) {
  }
  $results+=[pscustomobject]@{Lane=$lane;Checks=$count;Groups=$groups;Build=$build;Native=$native;Guard=$guard}
 }
-@{Version='6.3.3.0';Mode=$Mode;SourceFencePassed=$true;Lanes=$results}|ConvertTo-Json -Depth 8|Set-Content -LiteralPath (Join-Path $artifacts 'result.json')
+@{Mode=$Mode;SourceFencePassed=$true;Lanes=$results}|ConvertTo-Json -Depth 8|Set-Content -LiteralPath (Join-Path $artifacts 'result.json')
 Write-Output ('Markdown '+$Mode+': '+(($results|Measure-Object Checks -Sum).Sum)+' checks passed; actual foreground/input/clipboard=0.')

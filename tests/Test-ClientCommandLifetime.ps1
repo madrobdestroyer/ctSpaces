@@ -77,4 +77,4 @@ Assert-SourceUnchanged
 Invoke-HiddenClientCommandTool (Join-Path $outputDirectory 'ClientCommandLifetimeTests.exe') @() (Join-Path $artifacts 'native.log')
 Assert-SourceUnchanged
 $native=Get-Content (Join-Path $artifacts 'native.log') -Raw
-if($native-notmatch 'Client command lifetime: 28 checks, 12 scenarios, 0 failures; native input/foreground/launches=0') {throw 'Complete background client command lifetime evidence was not recorded.'}
+if($native-notmatch 'Client command lifetime: 27 checks, 12 scenarios, 0 failures; native input/foreground/launches=0') {throw 'Complete background client command lifetime evidence was not recorded.'}

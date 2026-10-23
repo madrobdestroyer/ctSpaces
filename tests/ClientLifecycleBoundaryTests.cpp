@@ -184,8 +184,6 @@ int wmain() {
       (L"clb-" + std::to_wstring(GetCurrentProcessId()) + L"-" +
        std::to_wstring(GetTickCount64()));
   try {
-    Check(CTSPACES_VERSION_TEXT == std::string("6.3.3.0"),
-          "Focused audit keeps version 6.3.3.0");
     CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
     g_hInst = GetModuleHandleW(nullptr); g_bQaInstance = true;
     g_sExeDir = GetCurrentExecutablePath().parent_path();

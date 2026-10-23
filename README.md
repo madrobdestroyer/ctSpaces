@@ -2,9 +2,14 @@
 
 ctSpaces is a small Windows launcher for opening client-specific browser spaces. Each client can have an independent Microsoft Edge, Google Chrome, Brave, and Mozilla Firefox profile, so browser data stays separated both between clients and between browsers for the same client.
 
-The current **6.3.4.0** release brings together the changes since the team's 6.1.1.0 baseline. Client Notes is a complete local notebook with saved notes separate from open tabs, All notes search, archive and Trash, snapshots, version history, templates, import/export and explicit cross-client transfer. Its full-width editor has one searchable client picker, on-demand Details and More panels, editable template/snippet libraries, status, tags, work logs, code boxes and handovers. It keeps theme colors, slim tabs, remembered size and quiet autosave. Notes stays available when the launcher is minimized or closed to the tray. Note links open in a chosen regular PC browser, outside client profiles.
+The current **6.3.5.0** release brings together the changes since the team's 6.1.1.0 baseline. Client Notes is a complete local notebook with saved notes separate from open tabs, All notes search, archive and Trash, snapshots, version history, templates, import/export and explicit cross-client transfer. Its full-width editor has one searchable client picker, on-demand Details and More panels, editable template/snippet libraries, status, tags, work logs, code boxes and handovers. It keeps theme colors, slim tabs, remembered size and quiet autosave. Notes stays available when the launcher is minimized or closed to the tray. Note links open in a chosen regular PC browser, outside client profiles.
 
 Everyday editing includes temporary Find/Replace rows with match options and counts, remembered word wrap, Go to line, document/selection statistics, on-demand Windows spelling review, printing/PDF, previewed Markdown interchange and simple editable tables. Global and per-client browser layout choices request vertical or horizontal tabs for new windows. Backups offer client exclusions and progress by stage. Search More for note tools; shortcuts and conversion limits are described in the [user guide](docs/USER_GUIDE.md).
+
+**6.3.5.0 restore fix:** a valid backup can now restore when its temporary
+extraction path is longer than its final client path. Extraction errors retain
+their actual cause instead of reporting every failure as an integrity error.
+Existing backups do not need a format conversion for this fix.
 
 **Change Edge's layout from ctSpaces:** bookmark any old tabs you need, then
 close that client's Edge window normally. Select the same client and Edge,
@@ -16,9 +21,9 @@ The Restore-off launch starts a new session and does not reopen the old tabs;
 cookies, sign-ins and other profile data remain.
 
 See [what changed since 6.1.1.0](docs/CHANGES_SINCE_6.1.1.0.md),
-[release notes](RELEASE_NOTES_6.3.4.0.md),
+[release notes](RELEASE_NOTES_6.3.5.0.md),
 [guide help](docs/GUIDED_WALKTHROUGH.md), and the
-[current release validation](docs/RELEASE_VALIDATION_6.3.4.0.md). The
+[current release validation](docs/RELEASE_VALIDATION_6.3.5.0.md). The
 [6.0.0.0 release notes](RELEASE_NOTES_6.0.0.0.md) and
 [validation report](docs/RELEASE_VALIDATION_6.0.0.0.md) remain available as
 historical records.
@@ -30,8 +35,8 @@ original project.
 
 ## Download
 
-Download the application ZIP [`ctSpaces6.3.4.0.zip`](https://github.com/madrobdestroyer/ctSpaces/releases/download/v6.3.4.0/ctSpaces6.3.4.0.zip)
-from [ctSpaces 6.3.4.0 / tag v6.3.4.0](https://github.com/madrobdestroyer/ctSpaces/releases/tag/v6.3.4.0),
+Download the application ZIP [`ctSpaces6.3.5.0.zip`](https://github.com/madrobdestroyer/ctSpaces/releases/download/v6.3.5.0/ctSpaces6.3.5.0.zip)
+from [ctSpaces 6.3.5.0 / tag v6.3.5.0](https://github.com/madrobdestroyer/ctSpaces/releases/tag/v6.3.5.0),
 extract it to a folder, and run `ctSpaces.exe`. The runtime ZIP contains only
 `ctSpaces.exe`; documentation, release history, source, and license notices
 remain available in this GitHub repository.
@@ -113,7 +118,7 @@ The `New` tab is the launcher view. Each open-session tab displays only the clie
 ## Documentation
 
 - [User Guide](docs/USER_GUIDE.md): everyday use and profile tools.
-- [Changes since 6.1.1.0](docs/CHANGES_SINCE_6.1.1.0.md): cumulative coworker-facing changes in 6.3.4.0.
+- [Changes since 6.1.1.0](docs/CHANGES_SINCE_6.1.1.0.md): cumulative coworker-facing changes in 6.3.5.0.
 - [Guided Walkthrough](docs/GUIDED_WALKTHROUGH.md): skippable onboarding, replay and new-feature guidance.
 - [Feature Reference](docs/FEATURE_REFERENCE.md): complete current behavior.
 - [Installation and Updates](docs/INSTALLATION_AND_UPDATES.md): setup, updating, and removal.

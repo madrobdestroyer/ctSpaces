@@ -83,7 +83,8 @@ HRESULT _7zExtractRestoreSession(_7zRestoreSession *session,
                                  _7zProgressCb progressCb,
                                  void *progressUser,
                                  bool ownsEmptyOutputRoot = false,
-                                 HANDLE protectedRoot = INVALID_HANDLE_VALUE);
+                                 HANDLE protectedRoot = INVALID_HANDLE_VALUE,
+                                 std::wstring *errorDetails = nullptr);
 // Identity-only inventory of a completed validation seal. The relative root
 // entry is empty. The session still holds its created objects while this is
 // compared; unrelated additions must never become owned merely by being seen.
@@ -100,6 +101,8 @@ bool _7zCleanupRestoreOutput(_7zRestoreSession *session);
 #ifdef CTSPACES_BACKUP_TEST_HOOKS
 void _7zDenyCleanupParentAttemptsForTest(unsigned attempts);
 unsigned _7zCleanupParentAttemptsForTest();
+void _7zFailNextOutputOwnershipAllocationForTest();
+bool _7zOutputOwnershipAllocationFailureHitForTest();
 #endif
 void _7zCloseRestoreSession(_7zRestoreSession *session);
 

@@ -1,5 +1,19 @@
 # ctSpaces 6.3 What's New
 
+## 6.3.5.0 — backup restore repair
+
+- Fix valid `.7z` backups failing during temporary extraction when the restore
+  folder adds enough characters to exceed ordinary Windows path limits. Final
+  client-folder limits remain checked before existing data is replaced.
+- Report the actual extraction operation, Windows error and archive item when
+  available; file-creation failures are no longer labeled as checksum failures.
+- Handle an extraction allocation failure safely, preserve existing data, and
+  allow a fresh restore attempt.
+- Existing backup format, client isolation, Notes layout and browser tab-layout
+  behavior remain as in 6.3.4.0. See the
+  [patch release notes](RELEASE_NOTES_6.3.5.0.md) and
+  [validation record](docs/RELEASE_VALIDATION_6.3.5.0.md).
+
 ## 6.3.4.0 — cumulative update since 6.1.1.0
 
 This is the change list for coworkers moving from their last shared version,

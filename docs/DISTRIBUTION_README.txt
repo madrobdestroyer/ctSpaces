@@ -1,8 +1,12 @@
-ctSpaces 6.3.4.0 - Coworker release
+ctSpaces 6.3.5.0 - Coworker release
 Cumulative changes since the team's 6.1.1.0 version
 
 The runtime ZIP contains exactly one file: ctSpaces.exe. This readme, guides,
 release history, source and license notices remain in the GitHub repository.
+
+6.3.5.0 fixes valid backups failing when temporary extraction paths are longer
+than their final client locations. It improves extraction error details and
+handles an extraction allocation failure safely. The backup format is unchanged.
 
 1. Make a full client backup before updating, then close the old application.
 2. Extract the ZIP to a folder.
@@ -56,7 +60,7 @@ Repository starting points:
 - docs/CHANGES_SINCE_6.1.1.0.md - Shareable team change list
 - docs/USER_GUIDE.md - Everyday use, notes, browser settings and backup/restore
 - docs/COLLEAGUE_QUICK_START.md - First steps
-- RELEASE_NOTES_6.3.4.0.md - Cumulative release notes
-- docs/RELEASE_VALIDATION_6.3.4.0.md - Completed checks and retained boundaries
+- RELEASE_NOTES_6.3.5.0.md - Cumulative release notes
+- docs/RELEASE_VALIDATION_6.3.5.0.md - Completed checks and retained boundaries
 - LICENSE - Application license
 - 3p/7zip/DOC/ - Bundled 7-Zip notices

@@ -68,4 +68,4 @@ $guard=$match.Groups[1].Value|ConvertFrom-Json
 foreach($field in 'forbiddenClipboard','forbiddenKeyboard','forbiddenRedraw','nativeVisibleEvents','nativeForegroundEvents','nativeFocusEvents'){
  if($null-eq$guard.$field -or $guard.$field-ne0){throw ('Background guard did not remain zero: '+$field)}
 }
-@{Version='6.3.3.0';Checks=18;Scenarios=10;SourceFencePassed=$true;NativeGuard=$guard;NativeLog=(Join-Path $artifacts 'native.log')}|ConvertTo-Json -Depth 6|Set-Content -LiteralPath (Join-Path $artifacts 'result.json')
+@{Checks=18;Scenarios=10;SourceFencePassed=$true;NativeGuard=$guard;NativeLog=(Join-Path $artifacts 'native.log')}|ConvertTo-Json -Depth 6|Set-Content -LiteralPath (Join-Path $artifacts 'result.json')

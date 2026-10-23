@@ -1,6 +1,7 @@
 #pragma comment(linker,"/manifestdependency:\"type='win32' name='Microsoft.Windows.Common-Controls' version='6.0.0.0' processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'\"")
 
 #include "InProc7z.h"
+#include "RestoreIoPath.h"
 
 #include "3p/7zip/CPP/7zip/UI/Client7z/StdAfx.h"
 
@@ -78,10 +79,15 @@ static thread_local _7zProgressPhase g__7zDetailedPhase = _7zProgressPhase::Veri
 #ifdef CTSPACES_BACKUP_TEST_HOOKS
 static thread_local unsigned g_cleanupDenied=0,g_cleanupObserved=0;
 static thread_local bool g_cleanupTargeted=false;
+static thread_local bool g_failOutputOwnershipAllocation=false,g_outputOwnershipAllocationFailureHit=false;
 void _7zDenyCleanupParentAttemptsForTest(unsigned attempts){
     g_cleanupDenied=attempts;g_cleanupObserved=0;g_cleanupTargeted=false;
 }
 unsigned _7zCleanupParentAttemptsForTest(){return g_cleanupObserved;}
+void _7zFailNextOutputOwnershipAllocationForTest(){
+    g_failOutputOwnershipAllocation=true;g_outputOwnershipAllocationFailureHit=false;
+}
+bool _7zOutputOwnershipAllocationFailureHitForTest(){return g_outputOwnershipAllocationFailureHit;}
 #endif
 
 struct _7zScopedProgress {
@@ -162,6 +168,27 @@ static void PrintError(const char* message,const FString& name){
     DebugPrintA(" : ");
     DebugPrintF(name);
     DebugPrintA("\n");
+}
+
+static HRESULT LastExtractIoError() noexcept {
+    const DWORD error=::GetLastError();
+    return HRESULT_FROM_WIN32(error?error:ERROR_GEN_FAILURE);
+}
+
+// Called only inside a catch handler. This translation does not allocate or
+// touch callback state, so SDK progress worker threads can use it safely.
+static HRESULT CurrentExtractExceptionCode() noexcept {
+    try{throw;}
+    catch(const std::bad_alloc&){return E_OUTOFMEMORY;}
+    catch(const std::filesystem::filesystem_error& error){
+        const auto& code=error.code();
+        if(code==std::errc::filename_too_long)return HRESULT_FROM_WIN32(ERROR_FILENAME_EXCED_RANGE);
+        if(code==std::errc::invalid_argument)return E_INVALIDARG;
+        if(code.category()==std::system_category() && code.value()>0)
+            return HRESULT_FROM_WIN32(static_cast<DWORD>(code.value()));
+        return E_FAIL;
+    }
+    catch(...){return E_FAIL;}
 }
 
 static bool IsReservedWindowsComponent(const std::wstring &component) {
@@ -583,12 +610,14 @@ struct CExtractionOwnership {
     HRESULT Bind(const std::filesystem::path& path,bool directory,
                  const BY_HANDLE_FILE_INFORMATION* expected=nullptr){
         auto object=std::make_unique<CExtractedObject>();object->Path=path;object->Directory=directory;
-        object->Handle=::CreateFileW(path.c_str(),(directory?DELETE|GENERIC_READ:GENERIC_READ),
+        const auto ioPath=CtRestoreIo::Path(path);
+        object->Handle=::CreateFileW(ioPath.c_str(),(directory?DELETE|GENERIC_READ:GENERIC_READ),
             FILE_SHARE_READ,nullptr,OPEN_EXISTING,
             FILE_FLAG_OPEN_REPARSE_POINT|(directory?FILE_FLAG_BACKUP_SEMANTICS:0),nullptr);
         if(object->Handle==INVALID_HANDLE_VALUE)return HRESULT_FROM_WIN32(::GetLastError());
-        if(!::GetFileInformationByHandle(object->Handle,&object->Identity) ||
-           (object->Identity.dwFileAttributes&FILE_ATTRIBUTE_REPARSE_POINT) ||
+        if(!::GetFileInformationByHandle(object->Handle,&object->Identity))
+            return LastExtractIoError();
+        if((object->Identity.dwFileAttributes&FILE_ATTRIBUTE_REPARSE_POINT) ||
            (((object->Identity.dwFileAttributes&FILE_ATTRIBUTE_DIRECTORY)!=0)!=directory) ||
            (!directory && object->Identity.nNumberOfLinks!=1) ||
            (expected && (expected->dwVolumeSerialNumber!=object->Identity.dwVolumeSerialNumber ||
@@ -614,7 +643,8 @@ struct CExtractionOwnership {
                !::GetFileInformationByHandle(object->Handle,&object->Identity) ||
                !(object->Identity.dwFileAttributes&FILE_ATTRIBUTE_DIRECTORY) ||
                (object->Identity.dwFileAttributes&FILE_ATTRIBUTE_REPARSE_POINT))return HRESULT_FROM_WIN32(ERROR_FILE_INVALID);
-            HANDLE named=::CreateFileW(Root.c_str(),FILE_READ_ATTRIBUTES,FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,nullptr,OPEN_EXISTING,
+            const auto ioRoot=CtRestoreIo::Path(Root);
+            HANDLE named=::CreateFileW(ioRoot.c_str(),FILE_READ_ATTRIBUTES,FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,nullptr,OPEN_EXISTING,
                 FILE_FLAG_BACKUP_SEMANTICS|FILE_FLAG_OPEN_REPARSE_POINT,nullptr);
             BY_HANDLE_FILE_INFORMATION identity{};
             const bool same=named!=INVALID_HANDLE_VALUE && ::GetFileInformationByHandle(named,&identity) &&
@@ -637,7 +667,8 @@ struct CExtractionOwnership {
             if(Directories.contains(current.native()))continue;
             // Existing unexpected objects belong to somebody else, even when
             // their names happen to match an archive directory.
-            if(!::CreateDirectoryW(current.c_str(),nullptr))return HRESULT_FROM_WIN32(::GetLastError());
+            const auto ioCurrent=CtRestoreIo::Path(current);
+            if(!::CreateDirectoryW(ioCurrent.c_str(),nullptr))return HRESULT_FROM_WIN32(::GetLastError());
             RINOK(Bind(current,true))
         }
         return S_OK;
@@ -648,10 +679,13 @@ struct CExtractionOwnership {
             auto& object=*Created[index-1];
             if(index==1 && !OwnRoot)continue;
             if(object.Handle==INVALID_HANDLE_VALUE && object.Directory){complete=false;continue;}
+            std::filesystem::path ioPath;
+            try{ioPath=CtRestoreIo::Path(object.Path);}
+            catch(...){complete=false;continue;} // Cleanup must never throw from a failure-path destructor.
             if(!object.Directory){
                 if(object.Handle!=INVALID_HANDLE_VALUE)::CloseHandle(object.Handle);
                 object.Handle=INVALID_HANDLE_VALUE;
-                object.Handle=::CreateFileW(object.Path.c_str(),DELETE|FILE_READ_ATTRIBUTES,
+                object.Handle=::CreateFileW(ioPath.c_str(),DELETE|FILE_READ_ATTRIBUTES,
                     FILE_SHARE_READ,nullptr,OPEN_EXISTING,FILE_FLAG_OPEN_REPARSE_POINT,nullptr);
                 BY_HANDLE_FILE_INFORMATION current{};
                 if(object.Handle==INVALID_HANDLE_VALUE || !::GetFileInformationByHandle(object.Handle,&current) ||
@@ -666,7 +700,7 @@ struct CExtractionOwnership {
             FILE_BASIC_INFO basic{};
             if(::GetFileInformationByHandleEx(object.Handle,FileBasicInfo,&basic,sizeof(basic)) &&
                (basic.FileAttributes&FILE_ATTRIBUTE_READONLY)){
-                HANDLE attributes=::CreateFileW(object.Path.c_str(),FILE_WRITE_ATTRIBUTES,
+                HANDLE attributes=::CreateFileW(ioPath.c_str(),FILE_WRITE_ATTRIBUTES,
                     FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,nullptr,OPEN_EXISTING,
                     FILE_FLAG_OPEN_REPARSE_POINT|(object.Directory?FILE_FLAG_BACKUP_SEMANTICS:0),nullptr);
                 if(attributes!=INVALID_HANDLE_VALUE){
@@ -739,11 +773,15 @@ class CArchiveExtractCallback Z7_final:
     std::set<std::wstring,CArchivePathLess> _seenPaths;
     CExtractionOwnership* _ownership=nullptr;
     BY_HANDLE_FILE_INFORMATION _outputIdentity{};
+    HRESULT _firstFailure=S_OK;
+    std::wstring _firstFailureDetails;
 
 public:
     void Init(IInArchive* archiveHandler,const FString& outDir,CExtractionOwnership* ownership=nullptr){
         Progress=COperationProgress{};
         NumErrors=0;
+        _firstFailure=S_OK;
+        _firstFailureDetails.clear();
         TotalBytes=0;
         CompletedBytes=0;
         LastPercent=(UInt32)(Int32)-1;
@@ -764,6 +802,44 @@ public:
     UInt64 NumErrors=0;
 
     bool ProgressAborted()const{return Progress.Aborted();}
+
+    HRESULT FirstFailure()const{return _firstFailure;}
+    const std::wstring& FirstFailureDetails()const{return _firstFailureDetails;}
+    HRESULT RecordFailure(HRESULT code,const wchar_t* message,Int32 operationResult=-1,
+                          const wchar_t* reason=nullptr) noexcept {
+        ++NumErrors;
+        if(SUCCEEDED(code))code=E_FAIL;
+        if(SUCCEEDED(_firstFailure)){
+            _firstFailure=code;
+            try{
+                _firstFailureDetails=message?message:L"Archive extraction failed.";
+                if(reason){_firstFailureDetails+=L"\n";_firstFailureDetails+=reason;}
+                if(operationResult>=0){
+                    _firstFailureDetails+=L"\n7-Zip operation result: ";
+                    _firstFailureDetails+=std::to_wstring(operationResult);
+                }
+                if(!_filePath.IsEmpty()){
+                    _firstFailureDetails+=L"\nArchive item: ";
+                    constexpr unsigned detailPathLimit=4096;
+                    const unsigned count=_filePath.Len()>detailPathLimit?detailPathLimit:_filePath.Len();
+                    _firstFailureDetails.append(_filePath.Ptr(),count);
+                    if(count<_filePath.Len())_firstFailureDetails+=L"... [truncated]";
+                }
+            }catch(...){/* Preserve the native cause even if details cannot allocate. */}
+        }
+        return code;
+    }
+
+    HRESULT ExceptionFailure(const wchar_t* context) noexcept {
+        const HRESULT code=CurrentExtractExceptionCode();
+        const wchar_t* reason=L"The extraction callback failed unexpectedly.";
+        if(code==E_OUTOFMEMORY)reason=L"There was not enough memory to continue archive extraction.";
+        else if(code==HRESULT_FROM_WIN32(ERROR_FILENAME_EXCED_RANGE))
+            reason=L"The restore staging path exceeds the supported Windows path length.";
+        else if(code==E_INVALIDARG)reason=L"The restore staging path is invalid or uses an unsupported namespace.";
+        else if(HRESULT_FACILITY(code)==FACILITY_WIN32)reason=L"A Windows operation failed during archive extraction.";
+        return RecordFailure(code,context,-1,reason);
+    }
 
     HRESULT ClosePendingOutput(){
         const HRESULT result=_outFileStreamSpec?_outFileStreamSpec->Close():S_OK;
@@ -789,6 +865,7 @@ private:
 };
 
 Z7_COM7F_IMF(CArchiveExtractCallback::SetTotal(UInt64 size)){
+    try{
     {
     std::lock_guard<std::mutex> lock(ProgressMutex);
     TotalBytes=size;
@@ -797,15 +874,18 @@ Z7_COM7F_IMF(CArchiveExtractCallback::SetTotal(UInt64 size)){
     LastTick=0;
     }
     return PrintProgress(true);
+    }catch(...){return CurrentExtractExceptionCode();}
 }
 
 Z7_COM7F_IMF(CArchiveExtractCallback::SetCompleted(const UInt64* completeValue)){
+    try{
     {
     std::lock_guard<std::mutex> lock(ProgressMutex);
     if(completeValue)
         CompletedBytes=*completeValue;
     }
     return PrintProgress(false);
+    }catch(...){return CurrentExtractExceptionCode();}
 }
 
 HRESULT CArchiveExtractCallback::PrintProgress(bool force){
@@ -837,22 +917,24 @@ void CArchiveExtractCallback::EndProgressLine(){
 
 
 Z7_COM7F_IMF(CArchiveExtractCallback::GetStream(UInt32 index,ISequentialOutStream** outStream,Int32 askExtractMode)){
+    try{
     *outStream=NULL;
     _outFileStream.Release();
     _outFileStreamSpec=nullptr;
     _processed={};
+    _filePath.Empty();
 
     // Path
     {
         NCOM::CPropVariant prop;
-        RINOK(_archiveHandler->GetProperty(index,kpidPath,&prop))
+        const HRESULT property=_archiveHandler->GetProperty(index,kpidPath,&prop);
+        if(property!=S_OK)return RecordFailure(property,L"The archive entry path could not be read.");
             if(prop.vt==VT_EMPTY)
                 _filePath=kEmptyFileAlias;
             else{
                 if(prop.vt!=VT_BSTR){
-                    NumErrors++;
                     PrintError("WARNING: bad kpidPath type (skipping)");
-                    return S_FALSE; // skip this item, continue
+                    return RecordFailure(E_INVALIDARG,L"The archive entry has an invalid path type.");
                 }
                 _filePath=prop.bstrVal;
             }
@@ -864,14 +946,12 @@ Z7_COM7F_IMF(CArchiveExtractCallback::GetStream(UInt32 index,ISequentialOutStrea
 
     std::wstring pathKey;
     if(!GetArchivePathKey(_filePath,pathKey)){
-        NumErrors++;
         PrintError("Unsafe archive path",ArcPathToRelFsPath(_filePath));
-        return E_INVALIDARG;
+        return RecordFailure(E_INVALIDARG,L"The archive contains an unsafe item path.");
     }
     if(!_seenPaths.insert(std::move(pathKey)).second){
-        NumErrors++;
         PrintError("Duplicate archive path",ArcPathToRelFsPath(_filePath));
-        return HRESULT_FROM_WIN32(ERROR_ALREADY_EXISTS);
+        return RecordFailure(HRESULT_FROM_WIN32(ERROR_ALREADY_EXISTS),L"The archive contains a duplicate item path.");
     }
 
     if(askExtractMode!=NArchive::NExtract::NAskMode::kExtract)
@@ -880,17 +960,17 @@ Z7_COM7F_IMF(CArchiveExtractCallback::GetStream(UInt32 index,ISequentialOutStrea
     // Attrib
     {
         NCOM::CPropVariant prop;
-        RINOK(_archiveHandler->GetProperty(index,kpidAttrib,&prop))
+        const HRESULT property=_archiveHandler->GetProperty(index,kpidAttrib,&prop);
+        if(property!=S_OK)return RecordFailure(property,L"The archive entry attributes could not be read.");
 
             if(prop.vt==VT_EMPTY){
                 _processed.Attrib=0;
                 _processed.Attrib_Defined=false;
             } else if(prop.vt==VT_UI4){
                 if(IsUnsafeArchiveAttrib(prop.ulVal)){
-                    NumErrors++;
                     PrintError("Unsafe archive attributes",
                                ArcPathToRelFsPath(_filePath));
-                    return E_INVALIDARG;
+                    return RecordFailure(E_INVALIDARG,L"The archive contains unsafe item attributes.");
                 }
                 _processed.Attrib=prop.ulVal;
                 _processed.Attrib_Defined=true;
@@ -898,8 +978,8 @@ Z7_COM7F_IMF(CArchiveExtractCallback::GetStream(UInt32 index,ISequentialOutStrea
                 // was: return E_FAIL;
                 _processed.Attrib=0;
                 _processed.Attrib_Defined=false;
-                NumErrors++;
                 PrintError("WARNING: unexpected kpidAttrib type (continuing)");
+                RecordFailure(E_INVALIDARG,L"The archive entry has an invalid attribute type.");
             }
     }
 
@@ -907,7 +987,8 @@ Z7_COM7F_IMF(CArchiveExtractCallback::GetStream(UInt32 index,ISequentialOutStrea
     // IsDir
     {
         NCOM::CPropVariant prop;
-        RINOK(_archiveHandler->GetProperty(index,kpidIsDir,&prop))
+        const HRESULT property=_archiveHandler->GetProperty(index,kpidIsDir,&prop);
+        if(property!=S_OK)return RecordFailure(property,L"The archive entry type could not be read.");
 
             if(prop.vt==VT_BOOL){
                 _processed.isDir=VARIANT_BOOLToBool(prop.boolVal);
@@ -916,8 +997,8 @@ Z7_COM7F_IMF(CArchiveExtractCallback::GetStream(UInt32 index,ISequentialOutStrea
             } else{
                 // was: return E_FAIL;
                 _processed.isDir=false;
-                NumErrors++;
                 PrintError("WARNING: unexpected kpidIsDir type (continuing)");
+                RecordFailure(E_INVALIDARG,L"The archive entry has an invalid directory type.");
             }
     }
 
@@ -927,10 +1008,11 @@ Z7_COM7F_IMF(CArchiveExtractCallback::GetStream(UInt32 index,ISequentialOutStrea
         int slashPos=_filePath.ReverseFind_PathSepar();
         if(slashPos>=0){
             const FString parent=_outDir+ArcPathToRelFsPath(_filePath.Left(slashPos));
-            if(_ownership?FAILED(_ownership->EnsureDirectories(std::filesystem::path(parent.Ptr()))):!CreateComplexDir(parent)){
-                NumErrors++;
+            const HRESULT created=_ownership?_ownership->EnsureDirectories(std::filesystem::path(parent.Ptr())):
+                (CreateComplexDir(parent)?S_OK:LastExtractIoError());
+            if(FAILED(created)){
                 PrintError("WARNING: can't create directory (skipping)",parent);
-                return S_FALSE;
+                return RecordFailure(created,L"A restore staging parent directory could not be created or protected.");
             }
         }
     }
@@ -938,9 +1020,11 @@ Z7_COM7F_IMF(CArchiveExtractCallback::GetStream(UInt32 index,ISequentialOutStrea
     _diskFilePath=_outDir+ArcPathToRelFsPath(_filePath);
 
     if(_processed.isDir){
-        if(_ownership?FAILED(_ownership->EnsureDirectories(std::filesystem::path(_diskFilePath.Ptr()))):!CreateComplexDir(_diskFilePath)){
-            NumErrors++;
+        const HRESULT created=_ownership?_ownership->EnsureDirectories(std::filesystem::path(_diskFilePath.Ptr())):
+            (CreateComplexDir(_diskFilePath)?S_OK:LastExtractIoError());
+        if(FAILED(created)){
             PrintError("WARNING: can't create directory",_diskFilePath);
+            return RecordFailure(created,L"A restore staging directory could not be created or protected.");
         }
         return S_OK;
     }
@@ -950,33 +1034,44 @@ Z7_COM7F_IMF(CArchiveExtractCallback::GetStream(UInt32 index,ISequentialOutStrea
         NFind::CFileInfo fi;
         if(fi.Find(_diskFilePath)){
             if(!DeleteFileAlways(_diskFilePath)){
-                NumErrors++;
+                const HRESULT error=LastExtractIoError();
                 PrintError("WARNING: cannot delete output file (skipping)",_diskFilePath);
-                return S_FALSE;
+                return RecordFailure(error,L"An existing extraction output file could not be replaced.");
             }
         }
     }
 
+    const FString ioOutput=_ownership?us2fs(UString(CtRestoreIo::Path(std::filesystem::path(_diskFilePath.Ptr())).c_str())):_diskFilePath;
     _outFileStreamSpec=new COutFileStream;
     CMyComPtr<ISequentialOutStream> outLoc(_outFileStreamSpec);
-    if(_ownership?!_outFileStreamSpec->Create_NEW(_diskFilePath):!_outFileStreamSpec->Create_ALWAYS(_diskFilePath)){
-        NumErrors++;
+    // SDK exception handlers can return here after owned-record allocation
+    // fails. Keep the raw pending-close pointer backed by a member reference.
+    _outFileStream=outLoc;
+    if(_ownership?!_outFileStreamSpec->Create_NEW(ioOutput):!_outFileStreamSpec->Create_ALWAYS(ioOutput)){
+        const HRESULT error=LastExtractIoError();
         PrintError("WARNING: cannot open output file (skipping)",_diskFilePath);
         _outFileStreamSpec=nullptr;
-        return S_FALSE;
+        return RecordFailure(error,L"A restore staging output file could not be created.");
     }
     if(_ownership && !::GetFileInformationByHandle(_outFileStreamSpec->File.GetHandle(),&_outputIdentity)){
-        NumErrors++;_outFileStreamSpec=nullptr;return E_FAIL;
+        const HRESULT error=LastExtractIoError();_outFileStreamSpec=nullptr;
+        return RecordFailure(error,L"The created restore staging file identity could not be read.");
     }
     if(_ownership){
+#ifdef CTSPACES_BACKUP_TEST_HOOKS
+        if(g_failOutputOwnershipAllocation){
+            g_failOutputOwnershipAllocation=false;g_outputOwnershipAllocationFailureHit=true;
+            throw std::bad_alloc();
+        }
+#endif
         auto recorded=std::make_unique<CExtractedObject>();recorded->Path=std::filesystem::path(_diskFilePath.Ptr());
         recorded->Identity=_outputIdentity;
         _ownership->Created.push_back(std::move(recorded));
     }
 
-    _outFileStream=outLoc;
     *outStream=outLoc.Detach();
     return S_OK;
+    }catch(...){return ExceptionFailure(L"A restore output stream could not be prepared.");}
 }
 
 Z7_COM7F_IMF(CArchiveExtractCallback::PrepareOperation(Int32 askExtractMode)){
@@ -985,27 +1080,45 @@ Z7_COM7F_IMF(CArchiveExtractCallback::PrepareOperation(Int32 askExtractMode)){
 }
 
 Z7_COM7F_IMF(CArchiveExtractCallback::SetOperationResult(Int32 operationResult)){
+    try{
     if(operationResult!=NArchive::NExtract::NOperationResult::kOK){
-        NumErrors++;
         PrintError("Extract error (operationResult != OK)");
+        using namespace NArchive::NExtract::NOperationResult;
+        HRESULT error=HRESULT_FROM_WIN32(ERROR_INVALID_DATA);
+        const wchar_t* detail=L"The archive decoder reported an extraction error.";
+        switch(operationResult){
+        case kUnsupportedMethod:error=E_NOTIMPL;detail=L"The backup uses an unsupported compression method.";break;
+        case kDataError:detail=L"The archive decoder found invalid compressed data.";break;
+        case kCRCError:error=HRESULT_FROM_WIN32(ERROR_CRC);detail=L"The backup failed its CRC integrity check.";break;
+        case kUnavailable:detail=L"Required archive data is unavailable.";break;
+        case kUnexpectedEnd:error=HRESULT_FROM_WIN32(ERROR_HANDLE_EOF);detail=L"The compressed archive data ended unexpectedly.";break;
+        case kDataAfterEnd:detail=L"Unexpected compressed data follows the archive stream.";break;
+        case kIsNotArc:error=HRESULT_FROM_WIN32(ERROR_BAD_FORMAT);detail=L"The selected file is not a supported archive.";break;
+        case kHeadersError:error=HRESULT_FROM_WIN32(ERROR_BAD_FORMAT);detail=L"The archive decoder found invalid archive headers.";break;
+        case kWrongPassword:error=HRESULT_FROM_WIN32(ERROR_INVALID_PASSWORD);detail=L"The archive requires a valid password; encrypted backup extraction is not supported.";break;
+        default:break;
+        }
+        RecordFailure(error,detail,operationResult);
     }
 
     if(_outFileStream&&_outFileStreamSpec){
         const HRESULT hrClose=_outFileStreamSpec->Close();
         if(hrClose!=S_OK){
-            NumErrors++;
             PrintError("WARNING: cannot close output file",_diskFilePath);
+            RecordFailure(hrClose,L"A restore staging output file could not be closed.");
         }
     }
     _outFileStream.Release();
     _outFileStreamSpec=nullptr;
 
     if(_extractMode&&_processed.Attrib_Defined){
-        SetFileAttrib_PosixHighDetect(_diskFilePath,_processed.Attrib);
+        const FString ioOutput=_ownership?us2fs(UString(CtRestoreIo::Path(std::filesystem::path(_diskFilePath.Ptr())).c_str())):_diskFilePath;
+        SetFileAttrib_PosixHighDetect(ioOutput,_processed.Attrib);
     }
     if(_ownership && _extractMode && !_processed.isDir){
-        if(FAILED(_ownership->Bind(std::filesystem::path(_diskFilePath.Ptr()),false,&_outputIdentity))){
-            NumErrors++;return HRESULT_FROM_WIN32(ERROR_FILE_INVALID);
+        const HRESULT bound=_ownership->Bind(std::filesystem::path(_diskFilePath.Ptr()),false,&_outputIdentity);
+        if(FAILED(bound)){
+            return RecordFailure(bound,L"The extracted restore file could not be protected or no longer matches its created identity.");
         }
     }
     {
@@ -1013,6 +1126,7 @@ Z7_COM7F_IMF(CArchiveExtractCallback::SetOperationResult(Int32 operationResult))
         ++CompletedItems;
     }
     return PrintProgress(false);
+    }catch(...){return ExceptionFailure(L"An extracted restore item could not be finalized or protected.");}
 }
 
 
@@ -1459,7 +1573,9 @@ static HRESULT OpenArchive7z(const FString& archivePath,
 
 static HRESULT ExtractOrTestOpenedArchive7z(IInArchive* inArchive,
                                              const FString& outDir,
-                                             bool testMode,CExtractionOwnership* ownership=nullptr){
+                                             bool testMode,CExtractionOwnership* ownership=nullptr,
+                                             std::wstring* errorDetails=nullptr){
+    if(errorDetails)errorDetails->clear();
     if(!inArchive)
         return E_INVALIDARG;
     // Ensure output directory exists
@@ -1472,12 +1588,22 @@ static HRESULT ExtractOrTestOpenedArchive7z(IInArchive* inArchive,
     cbSpec->Init(inArchive,outDir,ownership);
 
     HRESULT hr=inArchive->Extract(NULL,(UInt32)(Int32)(-1),testMode,cb);
-    if(cbSpec->ProgressAborted())hr=E_ABORT;
     const HRESULT closed=cbSpec->ClosePendingOutput();
-    if(SUCCEEDED(hr) && FAILED(closed))hr=closed;
+    if(FAILED(closed))cbSpec->RecordFailure(closed,L"The pending restore output file could not be closed.");
     cbSpec->EndProgressLine();
-    if(hr==S_FALSE || cbSpec->NumErrors!=0)
-        return E_FAIL;
+    if(hr==E_ABORT || cbSpec->ProgressAborted())return E_ABORT;
+    if(FAILED(cbSpec->FirstFailure())){
+        if(errorDetails)*errorDetails=cbSpec->FirstFailureDetails();
+        return cbSpec->FirstFailure();
+    }
+    if(hr==S_FALSE)hr=E_FAIL;
+    if(FAILED(hr) && errorDetails){
+        if(hr==E_OUTOFMEMORY)*errorDetails=L"There was not enough memory to extract the archive.";
+        else if(hr==E_NOTIMPL)*errorDetails=L"The backup uses an unsupported compression method.";
+        else if(HRESULT_FACILITY(hr)==FACILITY_WIN32)
+            *errorDetails=L"A Windows operation failed while reading or writing the archive extraction data.";
+        else *errorDetails=L"The archive decoder could not complete extraction.";
+    }
     return hr;
 }
 
@@ -1632,15 +1758,22 @@ HRESULT _7zOpenRestoreSession(const wchar_t *archivePath,
 HRESULT _7zExtractRestoreSession(_7zRestoreSession *session,
                                  const wchar_t *outDir,
                                  _7zProgressCb progressCb,
-                                 void *progressUser,bool ownsEmptyOutputRoot,HANDLE protectedRoot){
+                                 void *progressUser,bool ownsEmptyOutputRoot,HANDLE protectedRoot,
+                                 std::wstring* errorDetails){
+    if(errorDetails)errorDetails->clear();
     if(!session || !session->InArchive || !outDir) return E_INVALIDARG;
     _7zScopedProgress sp(_7zOp::Extract,progressCb,progressUser);
     const FString out=us2fs(UString(std::filesystem::absolute(std::filesystem::path(outDir)).lexically_normal().c_str()));
     if(session->Output)return HRESULT_FROM_WIN32(ERROR_ALREADY_EXISTS);
     session->Output=std::make_unique<CExtractionOwnership>();
-    if(!CreateComplexDir(out))return HRESULT_FROM_WIN32(::GetLastError());
+    if(!CreateComplexDir(out)){
+        const HRESULT error=LastExtractIoError();
+        if(errorDetails)*errorDetails=L"The restore staging root could not be created.";
+        return error;
+    }
     HRESULT hr=session->Output->Init(std::filesystem::path(outDir),ownsEmptyOutputRoot,protectedRoot);
-    if(SUCCEEDED(hr))hr=ExtractOrTestOpenedArchive7z(session->InArchive,out,false,session->Output.get());
+    if(FAILED(hr) && errorDetails)*errorDetails=L"The restore staging root or its original ancestors could not be protected.";
+    if(SUCCEEDED(hr))hr=ExtractOrTestOpenedArchive7z(session->InArchive,out,false,session->Output.get(),errorDetails);
     if(SUCCEEDED(hr) && progressCb)
         progressCb(progressUser,_7zOp::Extract,100,nullptr);
     return hr;

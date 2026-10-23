@@ -1,8 +1,8 @@
 # Developer Guide
 
-Applies to ctSpaces 6.3.4.0. The cumulative coworker baseline is 6.1.1.0; see
+Applies to ctSpaces 6.3.5.0. The cumulative coworker baseline is 6.1.1.0; see
 [the change list](CHANGES_SINCE_6.1.1.0.md) and
-[release validation](RELEASE_VALIDATION_6.3.4.0.md) for completed checks and limits.
+[release validation](RELEASE_VALIDATION_6.3.5.0.md) for completed checks and limits.
 
 ## Technology
 
@@ -273,6 +273,13 @@ Explorer caches `PKEY_AppUserModel_RelaunchIconResource`. Do not point different
 The starter archive and current all-client backups use the bundled in-process 7-Zip code. New backups contain a root-level `ctSpacesBackup.manifest` plus the top-level `Sites` folder. Creation fails if a source file is skipped, then inspects and fully CRC-tests the staged archive before atomically replacing the selected destination.
 
 Current restore inspects traversal/absolute/device paths, case-insensitive duplicates, item types, entry count, declared expanded size, links/reparse points, and free disk space before extraction. It validates CRCs during staging, checks the manifest and profile count, moves the current `Sites` aside, installs the restored folder, and attempts rollback if the swap fails. The prior `Sites_PreRestore_<timestamp>` folder remains after success. Older `.zip` files use an explicit System32 Windows PowerShell compatibility path and are normalized into the same transactional staging layout.
+
+Restore-only Win32 I/O uses extended absolute paths for temporary extraction,
+ownership binding, verification and owned cleanup. Inventory names stay in
+ordinary form. Final client paths are mapped from the verified sealed inventory
+and still enforce the existing directory/file budgets before commit, including
+the repeated check after the final safety callback. This does not enable
+process-wide long-path awareness or relax client creation/rename limits.
 
 ## Installation And Update Implementation
 

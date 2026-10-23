@@ -1,6 +1,7 @@
 #include "BackupEngine.h"
 #include "SiblingStageName.h"
 #include "ClientNameComparison.h"
+#include "RestoreIoPath.h"
 
 #include <windows.h>
 #include <bcrypt.h>
@@ -546,11 +547,12 @@ Result CaptureRestoreNode(const fs::path &path, const fs::path &relative,
                            bool boundRoots = false, bool protectedExtraction = false) {
   if (depth > CtArchiveSafety::kMaxDirectoryDepth || entries.size() >= CtArchiveSafety::kMaxItems)
     return Failure(HRESULT_FROM_WIN32(ERROR_FILE_TOO_LARGE), L"The staged restore tree exceeds its validation limits.");
-  const DWORD attributes = GetFileAttributesW(path.c_str());
+  const fs::path ioPath = CtRestoreIo::Path(path);
+  const DWORD attributes = GetFileAttributesW(ioPath.c_str());
   if (attributes == INVALID_FILE_ATTRIBUTES || (attributes & FILE_ATTRIBUTE_REPARSE_POINT))
     return Failure(E_INVALIDARG, L"The staged restore contains an uninspectable item or reparse point.");
   const bool directory = (attributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
-  RestoreHandle file(CreateFileW(path.c_str(), GENERIC_READ,
+  RestoreHandle file(CreateFileW(ioPath.c_str(), GENERIC_READ,
       directory ? FILE_SHARE_READ | FILE_SHARE_WRITE | (protectedExtraction || (boundRoots && depth <= 1) ? FILE_SHARE_DELETE : 0) : FILE_SHARE_READ | FILE_SHARE_DELETE,
       nullptr, OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT | (directory ? FILE_FLAG_BACKUP_SEMANTICS : 0), nullptr));
   if (!file) return Failure(HRESULT_FROM_WIN32(GetLastError()), L"A staged restore item could not be bound.");
@@ -566,11 +568,13 @@ Result CaptureRestoreNode(const fs::path &path, const fs::path &relative,
   }
   entries.push_back(entry);
   if (directory) {
-    for (const auto &child : fs::directory_iterator(path)) {
+    for (const auto &child : fs::directory_iterator(ioPath)) {
       const fs::path name = child.path().filename();
       if (name.empty() || name == L"." || name == L"..")
         return Failure(E_INVALIDARG, L"The staged restore produced an invalid child name.");
-      const Result captured = CaptureRestoreNode(child.path(), relative / name, entries, depth + 1, boundRoots, protectedExtraction);
+      // The extended spelling is an I/O detail. Keep ordinary names in the
+      // seal so relative paths, identity comparisons and final budgets agree.
+      const Result captured = CaptureRestoreNode(path / name, relative / name, entries, depth + 1, boundRoots, protectedExtraction);
       if (!captured.ok()) return captured;
     }
   }
@@ -1246,12 +1250,15 @@ Result StageValidated7zRestore(const fs::path &archivePath,
     if (!limitResult.ok())
       return limitResult;
 
+    std::wstring extractionFailure;
     hr = _7zExtractRestoreSession(session.get(), stagingRoot.c_str(),
-                                  progressCb, progressUser,true,protectedRoot.value);
+                                  progressCb, progressUser,true,protectedRoot.value,
+                                  &extractionFailure);
     if (FAILED(hr))
       return Failure(hr,
-                     L"The backup failed its integrity check while being "
-                     L"extracted.");
+                     extractionFailure.empty()
+                         ? L"The backup could not be extracted into its temporary restore folder."
+                         : std::move(extractionFailure));
     Result validationResult = ValidateStagingRoot(stagingRoot, stagedRestore,true);
     if (!validationResult.ok()) {
       stagedRestore = {};
@@ -1367,33 +1374,44 @@ Result CommitStagedRestore(const StagedRestore &stagedRestore,
     verified = VerifyRestoreSnapshot(stagedRestore, true);
     if (!verified.ok()) return verified;
     auto validatePathBudgets = [&]() -> Result {
-    for (const fs::directory_entry &entry : fs::directory_iterator(stagedRestore.payloadDir)) {
-      const std::wstring clientName = entry.path().filename().wstring();
-      if (!IsRealDirectory(entry.path()) ||
-          !Detail::IsValidClientDirectoryName(clientName)) {
-        return Failure(
-            E_INVALIDARG,
-            L"The staged restore contains an invalid client directory.");
+    // VerifyRestoreSnapshot binds this exact inventory before and after the
+    // pumped guard. Check its ordinary destination names directly: walking the
+    // longer temporary source with legacy Win32 APIs would reject valid final
+    // targets solely because Restore_Temp_XXXXXXXX lengthens the source path.
+    for (const auto &entry : stagedRestore.validation->entries) {
+      auto component = entry.relative.begin();
+      if (component == entry.relative.end() ||
+          !ComponentEquals(*component, L"Sites"))
+        continue;
+      if (++component == entry.relative.end())
+        continue;
+      const std::wstring clientName = component->wstring();
+      const bool directory =
+          (entry.information.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+      if (ComponentEquals(entry.relative.parent_path(), L"Sites")) {
+        if (!directory || !Detail::IsValidClientDirectoryName(clientName))
+          return Failure(E_INVALIDARG,
+                         L"The staged restore contains an invalid client directory.");
+        if (!Detail::IsNewClientTargetPathWithinLegacyBudget(live, clientName))
+          return Failure(
+              HRESULT_FROM_WIN32(ERROR_FILENAME_EXCED_RANGE),
+              L"The client '" + clientName +
+                  L"' is too long for this ctSpaces data-folder location. "
+                  L"Current profile data was left unchanged.");
       }
-      if (!Detail::IsNewClientTargetPathWithinLegacyBudget(
-              live, clientName)) {
-        return Failure(
-            HRESULT_FROM_WIN32(ERROR_FILENAME_EXCED_RANGE),
-            L"The client '" + clientName +
-                L"' is too long for this ctSpaces data-folder location. "
-                L"Current profile data was left unchanged.");
-      }
-      std::wstring pathBudgetError;
-      if (!Detail::IsTreeTargetWithinLegacyPathBudget(
-              entry.path(), live / clientName,
-              &pathBudgetError)) {
+      fs::path destination = live;
+      for (; component != entry.relative.end(); ++component)
+        destination /= *component;
+      const size_t maximum = directory
+          ? Detail::kLegacyMaximumDirectoryPathCharacters
+          : Detail::kLegacyMaximumFilePathCharacters;
+      if (destination.native().size() > maximum)
         return Failure(
             HRESULT_FROM_WIN32(ERROR_FILENAME_EXCED_RANGE),
             L"The client '" + clientName +
                 L"' contains data that would exceed the safe Windows path "
-                L"budget at this ctSpaces data-folder location. " +
-                pathBudgetError);
-      }
+                L"budget at this ctSpaces data-folder location: " +
+                destination.wstring());
     }
 
     if (currentSitesExists) {

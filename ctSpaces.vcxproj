@@ -183,6 +183,7 @@
     <ClInclude Include="ConfigPersistence.h" />
     <ClInclude Include="GuidedWalkthrough.h" />
     <ClInclude Include="InProc7z.h" />
+    <ClInclude Include="RestoreIoPath.h" />
     <ClInclude Include="CleanupResultPages.h" />
     <ClInclude Include="OwnerDrawUi.h" />
     <ClInclude Include="NotesEditorUi.h" />

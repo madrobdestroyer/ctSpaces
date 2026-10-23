@@ -1,7 +1,11 @@
 # What's changed since ctSpaces 6.1.1.0
 
-**For coworkers updating to 6.3.4.0:** this covers all changes since the last
+**For coworkers updating to 6.3.5.0:** this covers all changes since the last
 version shared with the team, rather than just the latest patch.
+
+The 6.3.5.0 patch fixes valid backups failing at longer temporary restore paths,
+improves extraction diagnostics and safely handles an extraction allocation
+failure. The backup format is unchanged; final client-path limits still apply.
 
 ## Notes is now a full notebook
 
@@ -78,6 +82,6 @@ format that 6.1.1.0 cannot read. Keep a backup before downgrading.
 
 Edge, Chrome, Brave and Firefox are supported application choices, not a promise
 that every browser/version/policy has been tested. See the
-[release validation](RELEASE_VALIDATION_6.3.4.0.md) for actual browser checks and
+[release validation](RELEASE_VALIDATION_6.3.5.0.md) for actual browser checks and
 limits, and the [user guide](USER_GUIDE.md) for instructions. Notes are local and
 unencrypted; ctSpaces is not a security sandbox or a cloud-sync service.

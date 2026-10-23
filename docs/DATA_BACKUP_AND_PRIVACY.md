@@ -84,10 +84,10 @@ Temporary browsing is not guaranteed secure deletion. Browser processes, antivir
 
 ## Export All Data
 
-`Back Up All Client Data` creates a validated 7-Zip archive containing the complete `Sites` folder and a ctSpaces manifest.
+`Back Up All Client Data` creates a validated 7-Zip archive containing the selected clients below `Sites` and a ctSpaces manifest.
 
 - Every supported browser process using a profile below `Sites` must be closed first, including one started manually with a ctSpaces profile path. An unreadable or indeterminate relevant process blocks export, and ctSpaces repeats the check immediately before archive creation.
-- The `.7z` backup contains all clients; selective export is not currently available.
+- The searchable client selection includes archived clients. Select all clients for a complete backup, or uncheck clients to exclude them.
 - Hidden profile files and files larger than 2 GB are supported by the built-in archive engine.
 - ctSpaces rejects skipped or unsafe source items, verifies the completed archive's paths, item types, sizes, and CRCs, and atomically installs the finished destination file.
 - The backup is not encrypted by ctSpaces.
@@ -104,12 +104,16 @@ The restore process:
 
 1. Requires every supported browser process using a profile below `Sites` to be closed; an unreadable or indeterminate relevant process blocks restore.
 2. Inspects a current backup for traversal/absolute/device paths, duplicates, unsafe item types, unreasonable item counts and declared sizes, and available staging space.
-3. Extracts into `Restore_Temp_<timestamp>` while checking archive integrity.
+3. Extracts into a fresh `Restore_Temp_<unique-token>` directory while checking archive integrity. Temporary extraction and verification support longer paths without raising the final client-folder limits.
 4. Verifies the ctSpaces manifest and profile count.
 5. Moves the current `Sites` folder to `Sites_PreRestore_<timestamp>`.
 6. Moves the staged data into place and rolls back the folder swap if replacement fails.
 
 The pre-restore folder is intentionally retained. After the restored clients have been checked, a maintainer can archive or remove old pre-restore folders according to the organization's retention policy.
+
+Extraction failures report their actual cause and archive item when available.
+A file-creation error does not establish archive corruption. A genuinely
+oversized final destination is refused before current client data is replaced.
 
 ## Moving To Another Computer
 

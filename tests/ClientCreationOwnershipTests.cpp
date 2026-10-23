@@ -257,7 +257,6 @@ int wmain(int argc,wchar_t** argv) {
   fixture=fs::current_path()/L"build"/(L"r4c-"+std::to_wstring(GetCurrentProcessId())+
       L"-"+std::to_wstring(GetTickCount64()));
   try {
-    Check(CTSPACES_VERSION_TEXT==std::string("6.3.3.0"),"Creation audit retains6.3.3.0");
     CoInitializeEx(nullptr,COINIT_APARTMENTTHREADED);g_hInst=GetModuleHandleW(nullptr);
     g_bQaInstance=true;g_sExeDir=GetCurrentExecutablePath().parent_path();
     g_hGui=CreateWindowExW(0,L"STATIC",L"Creation ownership message-only fixture",0,

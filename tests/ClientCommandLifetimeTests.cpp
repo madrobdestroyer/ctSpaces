@@ -123,7 +123,6 @@ int wmain(){try{std::cout<<std::unitbuf;CoInitializeEx(nullptr,COINIT_APARTMENTT
   Check(!accepted&&!error.empty()&&Read(g_sConfigPath)==originalConfig&&Read(target/client_notes::kNotebookFileName)==alpha&&Read(foreign/client_notes::kNotebookFileName)==bravo&&!fs::exists(g_sDataDir/L"Sites/Renamed")&&g_archivedClients.empty()&&g_pinnedClients==std::vector<std::wstring>{L"Alpha",L"Bravo"},renameOperation?"Mismatched supplied rename guard is rejected before touching either client's data or config":"Mismatched supplied archive guard is rejected before touching either client's data or config");Audit();
  }
 #endif
- Check(CTSPACES_VERSION_TEXT==std::string("6.3.3.0"),"Version remains 6.3.3.0");
  std::cout<<"Client command lifetime: "<<checks<<" checks, "<<scenarios<<" scenarios, "<<failures<<" failures; native input/foreground/launches=0\n";std::wcout<<L"Private fixture retained: "<<fixture<<L'\n';
  DestroyWindow(g_hGui);g_hGui=nullptr;CoUninitialize();return failures?1:0;
  }catch(const std::exception&error){std::cerr<<"Client command lifetime fixture failed: "<<error.what()<<'\n';if(g_hGui)DestroyWindow(g_hGui);CoUninitialize();return 2;}}
