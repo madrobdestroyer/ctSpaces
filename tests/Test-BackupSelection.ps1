@@ -2,7 +2,8 @@
 param(
  [string]$Configuration='Release',
  [string]$Platform='x64',
- [string]$ArtifactDirectory=(Join-Path $PSScriptRoot '..\build\tests\BackupSelection')
+ [string]$ArtifactDirectory=(Join-Path $PSScriptRoot '..\build\tests\BackupSelection'),
+ [ValidateSet('All','FocusedBefore')][string]$Proof='All'
 )
 $ErrorActionPreference='Stop'
 $root=[IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
@@ -32,30 +33,52 @@ function Hidden([string]$Exe,[string[]]$Arguments,[string]$Log,[int]$Timeout) {
   return $receipt
  }finally{$process.Dispose()}
 }
+function ReadGuard([string]$Text,[string]$Scope) {
+ $match=[regex]::Match($Text,'Background guards: (\{[^\r\n]+\})')
+ if(-not$match.Success){throw ('Background event audit is missing for '+$Scope)}
+ $guard=$match.Groups[1].Value|ConvertFrom-Json
+ foreach($field in 'forbiddenClipboard','forbiddenKeyboard','forbiddenRedraw','nativeVisibleEvents','nativeForegroundEvents','nativeFocusEvents'){
+  if($null-eq$guard.$field -or $guard.$field-ne0){throw ('Background guard did not remain zero for '+$Scope+' '+$field)}
+ }
+ return $guard
+}
 $msbuild='C:\Program Files (x86)\Microsoft Visual Studio\18\BuildTools\MSBuild\Current\Bin\MSBuild.exe'
 $bin=(Join-Path $artifacts 'bin')+'\';$obj=(Join-Path $artifacts 'obj')+'\'
 $build=Hidden $msbuild @((Join-Path $PSScriptRoot 'BackupSelectionTests.vcxproj'),'/m:1','/nodeReuse:false',"/p:Configuration=$Configuration","/p:Platform=$Platform",'/p:BuildProjectReferences=false','/p:NotesRedrawTestDefinitions=',('/p:OutDir='+$bin),('/p:IntDir='+$obj),'/v:minimal') (Join-Path $artifacts 'build.log') 300000
 Fence
-$native=Hidden (Join-Path $bin 'BackupSelectionTests.exe') @('--headless-background',$artifacts) (Join-Path $artifacts 'native.log') 90000
+$binary=Join-Path $bin 'BackupSelectionTests.exe'
+$focusedArtifacts=Join-Path $artifacts 'focused';New-Item -ItemType Directory -Force -Path $focusedArtifacts|Out-Null
+$before=$Proof-eq'FocusedBefore'
+$focusMode=if($before){'--focused-before'}else{'--focused-after'}
+$focused=Hidden $binary @('--headless-background',$focusedArtifacts,$focusMode) (Join-Path $artifacts 'native-focused.log') 90000
+Fence
+$focusedText=[IO.File]::ReadAllText($focused.Log)
+$expected=if($before){2}else{0}
+$focusedChecks=if($before){17}else{18}
+$reported=if($before){0}else{1}
+if($focusedText-notmatch "Backup selection: $focusedChecks checks; 2 private groups; 0 failures." -or
+   $focusedText-notmatch "(?m)^FOCUSED_EXPECTED_DEFECTS=$expected\r?$" -or
+   $focusedText-notmatch "(?m)^MANIFEST_NOTICE path=.+ exists=1 reported=$reported\r?$" -or
+   $focusedText-notmatch "(?m)^NOTES_ONLY_BACKUP picker=$reported published=$reported\r?$"){
+ throw 'The retained-manifest and notes-only backup proofs did not finish with the expected outcomes.'
+}
+$focusedGuard=ReadGuard $focusedText 'focused backup selection'
+if($before){
+ @{Checks=$focusedChecks;Scenarios=2;ExpectedDefects=$expected;Proof=$Proof;Build=$build;FocusedNative=$focused;SourceFencePassed=$true;FocusedGuard=$focusedGuard}|ConvertTo-Json -Depth 6|Set-Content -LiteralPath (Join-Path $artifacts 'result.json')
+ Write-Output "Backup selection before proof: $focusedChecks checks, 2 groups, 2 defects reproduced; actual visible/focus/foreground/clipboard/input=0."
+ return
+}
+$native=Hidden $binary @('--headless-background',$artifacts) (Join-Path $artifacts 'native.log') 90000
 Fence
 $text=[IO.File]::ReadAllText($native.Log)
 if($text-notmatch 'Backup selection: 74 checks; 5 private groups; 0 failures.'){throw 'The complete selection and excluded-Notes scenarios did not finish.'}
-$match=[regex]::Match($text,'Background guards: (\{[^\r\n]+\})')
-if(-not$match.Success){throw 'Background event audit is missing.'}
-$guard=$match.Groups[1].Value|ConvertFrom-Json
-foreach($field in 'forbiddenClipboard','forbiddenKeyboard','forbiddenRedraw','nativeVisibleEvents','nativeForegroundEvents','nativeFocusEvents'){
- if($null-eq$guard.$field -or $guard.$field-ne0){throw ('Background guard did not remain zero: '+$field)}
-}
+$guard=ReadGuard $text 'ordinary backup selection'
 $modalArtifacts=Join-Path $artifacts 'modal';New-Item -ItemType Directory -Force -Path $modalArtifacts|Out-Null
-$modal=Hidden (Join-Path $bin 'BackupSelectionTests.exe') @('--headless-background',$modalArtifacts,'--modal-snapshot') (Join-Path $artifacts 'native-modal.log') 90000
+$modal=Hidden $binary @('--headless-background',$modalArtifacts,'--modal-snapshot') (Join-Path $artifacts 'native-modal.log') 90000
 Fence
 $modalText=[IO.File]::ReadAllText($modal.Log)
 if($modalText-notmatch 'Backup selection: 16 checks; 1 private groups; 0 failures.'){throw 'The native owned-modal snapshot scenario did not finish.'}
-$modalMatch=[regex]::Match($modalText,'Background guards: (\{[^\r\n]+\})')
-if(-not$modalMatch.Success){throw 'Owned-modal background event audit is missing.'}
-$modalGuard=$modalMatch.Groups[1].Value|ConvertFrom-Json
-foreach($field in 'forbiddenClipboard','forbiddenKeyboard','forbiddenRedraw','nativeVisibleEvents','nativeForegroundEvents','nativeFocusEvents'){
- if($null-eq$modalGuard.$field -or $modalGuard.$field-ne0){throw ('Owned-modal background guard did not remain zero: '+$field)}
-}
-@{Checks=90;Scenarios=6;Build=$build;Native=$native;ModalNative=$modal;SourceFencePassed=$true;NativeGuard=$guard;ModalGuard=$modalGuard}|ConvertTo-Json -Depth 6|Set-Content -LiteralPath (Join-Path $artifacts 'result.json')
-Write-Output 'Backup selection: 90 checks, 6 groups, 0 failures; actual visible/focus/foreground/clipboard/input=0.'
+$modalGuard=ReadGuard $modalText 'owned-modal backup selection'
+$allChecks=90+$focusedChecks
+@{Checks=$allChecks;Scenarios=8;ExpectedDefects=$expected;Build=$build;Native=$native;ModalNative=$modal;FocusedNative=$focused;SourceFencePassed=$true;NativeGuard=$guard;ModalGuard=$modalGuard;FocusedGuard=$focusedGuard}|ConvertTo-Json -Depth 6|Set-Content -LiteralPath (Join-Path $artifacts 'result.json')
+Write-Output "Backup selection: $allChecks checks, 8 groups, 0 failures; actual visible/focus/foreground/clipboard/input=0."

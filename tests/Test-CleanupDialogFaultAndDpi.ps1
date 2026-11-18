@@ -1,5 +1,5 @@
 param(
-    [string]$ExePath = (Join-Path $PSScriptRoot '..\dist\x64\Release\ctSpaces.exe'),
+    [string]$ExePath = '',
     [ValidateSet('Release')]
     [string]$Configuration = 'Release',
     [ValidateSet('x64')]
@@ -7,6 +7,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+$ExePath = & (Join-Path $PSScriptRoot '..\qa\Resolve-Executable.ps1') -ExePath $ExePath
 $projectRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
 $resolvedExe = [IO.Path]::GetFullPath($ExePath)
 $runId = [Guid]::NewGuid().ToString('N')

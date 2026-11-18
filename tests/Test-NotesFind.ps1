@@ -39,7 +39,7 @@ Fence
 $native=Hidden (Join-Path $bin 'NotesFindTests.exe') @('--headless-background') (Join-Path $artifacts 'native.log') 90000
 Fence
 $text=[IO.File]::ReadAllText($native.Log)
-$summary=[regex]::Match($text,'Notes Find and Replace: (\d+) checks; (\d+) scenarios; 0 failures');if(-not$summary.Success-or[int]$summary.Groups[1].Value-lt422-or[int]$summary.Groups[2].Value-ne8){throw 'The complete search, replacement, transaction and native-edit accessibility cases did not finish.'}
+$summary=[regex]::Match($text,'Notes Find and Replace: (\d+) checks; (\d+) scenarios; 0 failures');if(-not$summary.Success-or[int]$summary.Groups[1].Value-lt430-or[int]$summary.Groups[2].Value-ne9-or$text-notmatch'(?m)^REPLACE_NEXT_CASE caret=1 selected=1 undo=1 wrapped=1 noOp=1\r?$'){throw 'The complete search, replacement, transaction and native-edit accessibility cases did not finish.'}
 $productionCases=@([regex]::Matches($text,'(?m)^Rollback edge probe: method=production-model-recovery;[^\r\n]+; supported=1\r?$'))
 if($productionCases.Count-ne10-or$text-notmatch'Actual Model recovery matrix: 10 native topology/limit cases plus empty-transaction/terminal-ownership guards completed'-or$text-notmatch'PASS A throwing pre-edit callback with no mutation leaves exact raw RTF'-or$text-notmatch'PASS An unowned throwing mutation is not mistaken for a restored transaction'-or$text-notmatch'Prospective save-budget proof:'){
  throw 'Default Find verification must complete all ten actual Model/recovery cases, legitimate Redo/terminal ownership guards, and prospective save/reopen regressions.'

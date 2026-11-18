@@ -100,6 +100,7 @@ std::vector<int> g_answers;
 size_t g_nextAnswer = 0;
 std::vector<CapturedMessage> g_messages;
 bool g_overrideVersions = false;
+bool g_missingRunningVersion = false;
 std::wstring g_currentVersion;
 std::wstring g_installedVersion;
 fs::path g_currentExecutable;
@@ -375,6 +376,7 @@ void ResetBoundaries(std::initializer_list<int> answers = {}) {
   g_nextAnswer = 0;
   g_messages.clear();
   g_overrideVersions = false;
+  g_missingRunningVersion = false;
   g_currentVersion.clear();
   g_installedVersion.clear();
   g_launchShouldSucceed = true;
@@ -533,6 +535,64 @@ void TestOlderVersionChoices() {
     Check(ReadBytes(fixture.installedExe()) == before,
           "older-copy rejection changed installed bytes");
     fixture.CheckSentinelsAndNoStageLitter();
+  }
+}
+
+#include "InstallerRoundCases.inl"
+#include "InstallerRoundCasesU.inl"
+
+void TestUnreadableVersionMetadata(const fs::path &artifacts, bool before) {
+  const auto root = artifacts / L"f";
+  Check(artifacts == fs::absolute(artifacts).lexically_normal() &&
+        SamePath(artifacts, g_currentExecutable.parent_path().parent_path()) &&
+        IsSafeExistingDirectory(artifacts) && !fs::exists(root),
+        "version proof requires a fresh fixture beside this exact harness output");
+  for (auto parent = artifacts; !parent.empty();) {
+    Check(IsSafeExistingDirectory(parent), "version proof artifact ancestor must be an ordinary directory");
+    const auto next = parent.parent_path();
+    if (next == parent) break;
+    parent = next;
+  }
+  Check(fs::create_directory(root), "create exact private version metadata fixture");
+
+  for (bool missingInstalled : {true, false}) {
+    const auto data = root / (missingInstalled ? L"installed" : L"running");
+    const auto installed = data / L"ctSpaces.exe";
+    const auto configuration = data / L"config.ini";
+    const auto notebook = data / L"Sites/Private/note.ctn";
+    Check(fs::create_directories(notebook.parent_path()), "create private settings and notebook namespace");
+    WriteBytes(configuration, "[fixture]\r\nkeep=1\r\n");
+    WriteBytes(notebook, "independent private notebook");
+    if (missingInstalled) WriteBytes(installed, "ordinary installed fixture with no version resource");
+    else Check(fs::copy_file(g_currentExecutable, installed), "copy the exact known-version harness as private installed fixture");
+    const auto original = ReadBytes(installed);
+    const auto originalSettings = ReadBytes(configuration);
+    const auto originalNotebook = ReadBytes(notebook);
+
+    g_sDataDir = data;
+    g_expectedInstallDirectory = data;
+    if (missingInstalled) ResetBoundaries({IDNO, IDYES});
+    else ResetBoundaries({IDNO});
+    g_missingRunningVersion = !missingInstalled;
+    Check(GetExeVersion(installed) == (missingInstalled ? L"" : CTSPACES_VERSION_WTEXT) &&
+          GetExeVersion(g_currentExecutable) == (missingInstalled ? CTSPACES_VERSION_WTEXT : L""),
+          "only the chosen version resource is unreadable at the product boundary");
+    Check(chkUpdate() == missingInstalled, "explicit Run Once response determines whether this copy continues");
+    const bool falseOrder = HasMessage(L"", L"newer than") || HasMessage(L"", L"older copy") ||
+        HasMessage(L"", L"both report version");
+    const bool explicitUnknown = HasMessage(L"", L"could not read") || HasMessage(L"", L"could not be read") ||
+        HasMessage(L"", L"could not determine") || HasMessage(L"", L"could not be determined") ||
+        HasMessage(L"", L"unreadable") || HasMessage(L"", L"unknown");
+    Check(before ? (falseOrder && !explicitUnknown) : (!falseOrder && explicitUnknown),
+          before ? "baseline incorrectly ranks an unreadable version" : "the message identifies unreadable version metadata without guessing version order");
+    Check(g_nextAnswer == (missingInstalled ? 2u : 1u) && g_launchCalls == 0 &&
+          g_registryReads == 0 && g_forbiddenRegistryWrites == 0 && g_knownFolderCalls == 0 &&
+          ReadBytes(installed) == original && ReadBytes(configuration) == originalSettings &&
+          ReadBytes(notebook) == originalNotebook &&
+          std::distance(fs::directory_iterator(data), fs::directory_iterator{}) == 3,
+          "declining replacement preserves the exact private executable and data without launch or staging");
+    std::cout << "INSTALLER_VERSION_METADATA_CASE=" << (missingInstalled ? "installed" : "running")
+              << " outcome=" << (before ? "incorrect-order-observed" : "unknown-reported") << '\n';
   }
 }
 
@@ -1060,6 +1120,10 @@ int CtSpacesInstallerTestMessageBox(HWND, LPCWSTR text, LPCWSTR title,
 
 bool CtSpacesInstallerTestTryGetExeVersion(const fs::path &filePath,
                                            std::wstring &version) {
+  if (g_missingRunningVersion && SamePath(filePath, g_currentExecutable)) {
+    version.clear();
+    return true;
+  }
   if (!g_overrideVersions)
     return false;
   if (SamePath(filePath, g_currentExecutable)) {
@@ -1331,10 +1395,16 @@ int wmain(int argc, wchar_t **argv) {
       return CtSpacesProductionWinMain(GetModuleHandleW(nullptr), nullptr,
                                        argv[1], SW_SHOWNORMAL);
     }
-    const bool headlessOnly =
-        argc == 2 &&
-        wcscmp(argv[1], L"--installer-runtime-headless") == 0;
-    Check(argc == 1 || headlessOnly,
+    const bool headlessOnly = argc >= 2 && wcscmp(argv[1], L"--installer-runtime-headless") == 0;
+    const bool versionProof = headlessOnly && argc == 4 &&
+        (wcscmp(argv[2], L"--version-metadata-before") == 0 || wcscmp(argv[2], L"--version-metadata-after") == 0);
+    int round = 0;
+    const bool roundU = headlessOnly && argc == 4 &&
+        wcscmp(argv[2], L"--installer-round-u-background") == 0;
+    if (roundU || (headlessOnly && argc == 4 && wcscmp(argv[2], L"--installer-round-background") == 0)) {
+      for (int i = 1; i <= 10; ++i) if (std::to_wstring(i) == argv[3]) round = i;
+    }
+    Check(argc == 1 || (headlessOnly && (argc == 2 || versionProof || round)),
           "unknown installer test arguments; refusing to run any scenarios");
     g_headlessOnly = headlessOnly;
     HeadlessDesktopBoundary desktopBoundary;
@@ -1344,6 +1414,21 @@ int wmain(int argc, wchar_t **argv) {
           "could not resolve installer harness executable path");
     Check(IsSafeExistingRegularFile(g_currentExecutable),
           "installer harness is not a safe regular file");
+
+    if (round) {
+      if (roundU) RunInstallerRoundU(round);
+      else RunInstallerRound(round);
+      desktopBoundary.Audit();
+      std::cout << "Installer round case passed (1 scenario).\n";
+      return 0;
+    }
+
+    if (versionProof) {
+      TestUnreadableVersionMetadata(fs::path(argv[3]), wcscmp(argv[2], L"--version-metadata-before") == 0);
+      desktopBoundary.Audit();
+      std::cout << "Installer version metadata proof passed (2 scenarios).\n";
+      return 0;
+    }
 
     TestRealVersionResourceReader();
     TestFreshInstallSuccess();

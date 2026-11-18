@@ -61,6 +61,11 @@ CtBackup::Result CtSpacesRestoreGuiTestRunStage(
   if (result.ok() && restoreGuiMode == 6) return {E_FAIL, L"Focused staging cancellation after extraction."};
   return result;
 }
+CtBackup::Result CtSpacesRestoreGuiTestRunCommit(
+    const std::function<CtBackup::Result(_7zUiCtx &)> &operation) {
+  _7zUiCtx context;
+  return operation(context); // No presentation in these namespace-focused fixtures.
+}
 void CtSpacesRestoreGuiTestAfterStage(CtBackup::StagedRestore &staged) {
   restoreGuiStage = staged.stagingRoot;
   if (restoreGuiMode == 2) {
@@ -246,9 +251,16 @@ void GuiRestoreConsumerSafety(const fs::path &fixture) {
       Check(Read(g_sDataDir / L"Sites" / L"Alpha" / L"Default" / L"state.bin") == "BACKUP" &&
             !fs::exists(restoreGuiStage), "Actual restore GUI installs verified payload and cleans its own stage");
       bool recoveryFound = false;
-      for (const auto &entry : fs::directory_iterator(g_sDataDir))
-        if (entry.path().filename().wstring().starts_with(L"Sites_PreRestore_") &&
+      for (const auto &entry : fs::directory_iterator(g_sDataDir)) {
+        const auto name = entry.path().filename().wstring();
+        const bool compact = name.size() == 5 && name.front() == L'R' &&
+            std::all_of(name.begin() + 1, name.end(), [](wchar_t character) {
+              return (character >= L'0' && character <= L'9') ||
+                  (character >= L'A' && character <= L'F');
+            });
+        if ((name.starts_with(L"Sites_PreRestore_") || compact) &&
             Read(entry.path() / L"Keep" / L"Default" / L"state.bin") == "ORIGINAL") recoveryFound = true;
+      }
       Check(recoveryFound && restoreGuiGuardCalled, "Actual restore GUI retains original recovery and performs final browser guard");
     } else {
       Check(Read(g_sDataDir / L"Sites" / L"Keep" / L"Default" / L"state.bin") == "ORIGINAL",

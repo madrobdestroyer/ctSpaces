@@ -102,3 +102,111 @@ static void NativePinnedMenuCases(){
   std::cout<<"Pinned menu: "<<pinnedScenarios<<" reentrant/control scenarios; native popups and clipboard reads suppressed.\n";
   menuMutation={};chosenLabel.clear();g_sessions.clear();g_pinnedClients.clear();
 }
+
+#ifndef CTSPACES_SESSION_MENU_BEFORE
+static void NativePinnedBrowserCases(bool before) {
+  struct ComScope {
+    HRESULT status = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
+    ~ComScope() { if (SUCCEEDED(status)) CoUninitialize(); }
+  } com;
+  if (FAILED(com.status))
+    throw std::runtime_error("Cannot initialize the isolated shortcut fixture");
+
+  const std::wstring client = L"Bravo";
+  const auto suite = g_sDataDir / L"pinned-browser";
+  const auto savedDesktopOverride = g_sShortcutDesktopOverride;
+  const auto prepare = [&] {
+    ++scenarios;
+    g_sDataDir = suite / std::to_wstring(scenarios);
+    g_sConfigPath = g_sDataDir / L"config.ini";
+    g_sShortcutDesktopOverride = g_sDataDir / L"private-desktop";
+    fs::create_directories(g_sShortcutDesktopOverride);
+    const auto clientRoot = g_sDataDir / L"Sites" / client;
+    fs::create_directories(clientRoot);
+    WriteBrowserSlotFixture(clientRoot / kClientSchemaMarkerName, kClientSchemaMarkerText);
+    CreateBrowserSlotFixture(clientRoot, BrowserKind::Edge);
+    CreateBrowserSlotFixture(clientRoot, BrowserKind::Chrome);
+    g_pinnedClients = {client};
+    g_archivedClients.clear();
+    g_activeProfiles.clear();
+    g_sessions = {{client, BrowserKind::Edge, bravoPid},
+                  {client, BrowserKind::Chrome, charliePid}};
+    g_iSelectedSessionTab = 0;
+    g_selectedBrowser = BrowserKind::Edge;
+    SetClientInputText(L"");
+    if (!SaveRestoreTabsPreference(MakeClientBrowserPreferenceKey(client, BrowserKind::Chrome), true) ||
+        !ShouldRestoreTabsForClient(client, BrowserKind::Edge) ||
+        ShouldRestoreTabsForClient(client, BrowserKind::Chrome))
+      throw std::runtime_error("Private pinned fixture needs opposite Edge and Chrome restore preferences");
+  };
+  const auto choose = [&](const wchar_t *label, const std::function<void()> &mutate = {}) {
+    chosenLabel = label;
+    menuMutation = mutate;
+    ShowPinnedClientOptionsMenu(g_hGui, client, {});
+    menuMutation = {};
+  };
+  const auto selectChrome = [&] {
+    WndProc(g_hGui, WM_COMMAND, MAKEWPARAM(IDM_BROWSER_CHROME, 0), 0);
+    if (g_selectedBrowser != BrowserKind::Chrome)
+      throw std::runtime_error("Private browser command did not change the preference");
+  };
+  const auto shortcut = [&] { return g_sShortcutDesktopOverride / L"Bravo.lnk"; };
+
+  prepare();
+  choose(L"Restore tabs");
+  LoadRestoreTabsPreferences();
+  Check(!ShouldRestoreTabsForClient(client, BrowserKind::Edge) &&
+        !ShouldRestoreTabsForClient(client, BrowserKind::Chrome),
+        "The pinned restore command toggles only the original browser when the selection stays put");
+
+  prepare();
+  choose(L"Restore tabs", selectChrome);
+  LoadRestoreTabsPreferences();
+  const bool changedChrome = ShouldRestoreTabsForClient(client, BrowserKind::Chrome);
+  Check(ShouldRestoreTabsForClient(client, BrowserKind::Edge) && changedChrome == before,
+        "The pinned restore command cannot toggle a different browser from the one shown");
+
+  prepare();
+  choose(L"Open client", selectChrome);
+  const bool openedChrome = g_iSelectedSessionTab == 2;
+  Check(before ? openedChrome : g_iSelectedSessionTab == 0 && GetClientInputText().empty(),
+        "A pending pinned Open cannot switch to a different browser session after the browser changes");
+
+  prepare();
+  choose(L"Select client", selectChrome);
+  Check(GetClientInputText() == client && g_iSelectedSessionTab == 0,
+        "The browser-independent pinned Select still targets the original client");
+
+  prepare();
+  choose(L"Create desktop shortcut", selectChrome);
+  const bool shortcutChrome = IsManagedClientDesktopShortcut(shortcut(), client, BrowserKind::Chrome);
+  Check(before ? shortcutChrome : fs::is_empty(g_sShortcutDesktopOverride),
+        "A pending pinned shortcut cannot publish a link to a different browser");
+
+  prepare();
+  choose(L"Create desktop shortcut", [] {
+    g_bClientNotesBusy = true;
+    SetUiState(false);
+  });
+  const bool shortcutWhileBusy = IsManagedClientDesktopShortcut(shortcut(), client, BrowserKind::Edge);
+  Check(before ? shortcutWhileBusy : fs::is_empty(g_sShortcutDesktopOverride),
+        "A pinned shortcut cannot publish while another operation owns the launcher");
+  Check(!g_bUiEnabled && g_bClientNotesBusy,
+        "The competing operation retains its launcher guard after the menu closes");
+  g_bClientNotesBusy = false;
+  SetUiState(true);
+
+  prepare();
+  choose(L"Create desktop shortcut");
+  Check(IsManagedClientDesktopShortcut(shortcut(), client, BrowserKind::Edge),
+        "An idle pinned shortcut still publishes an exact link in the isolated desktop");
+  Check(menuCalls == 7 && scenarios == 7 && suppressedClipboardRequests == 7 &&
+        !launchRequests && !forbiddenPaint && closeTargets.empty(),
+        "Each scenario reaches its guarded popup without launching or closing a process");
+  g_sShortcutDesktopOverride = savedDesktopOverride;
+  chosenLabel.clear();
+  std::cout << "PINNED_BROWSER restoreChangedChrome=" << changedChrome
+            << " openedChrome=" << openedChrome << " shortcutChrome=" << shortcutChrome
+            << " shortcutWhileBusy=" << shortcutWhileBusy << '\n';
+}
+#endif

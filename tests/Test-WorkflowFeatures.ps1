@@ -1,5 +1,5 @@
 param(
-    [string]$ExePath = (Join-Path $PSScriptRoot '..\dist\x64\Release\ctSpaces.exe'),
+    [string]$ExePath = '',
     [int]$TimeoutSeconds = 12,
     [ValidateRange(0, 2000)][int]$LifecycleStressCycles = 0,
     [ValidateRange(0, 20000)][int]$UnrelatedBrowserExitChurn = 0,
@@ -8,6 +8,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+$ExePath = & (Join-Path $PSScriptRoot '..\qa\Resolve-Executable.ps1') -ExePath $ExePath
 $projectRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
 $resolvedExe = [IO.Path]::GetFullPath($ExePath)
 $testedExecutableHash = $null

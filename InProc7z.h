@@ -55,7 +55,14 @@ struct _7zArchiveInfo {
 struct _7zRestoreSession;
 
 namespace CtArchiveSafety {
+#if defined(CTSPACES_BACKUP_TEST_HOOKS) && defined(CTSPACES_ARCHIVE_ITEM_LIMIT_FOR_TEST)
+// Exercise the real inclusive archive/seal boundary with tiny valid fixtures.
+// The production build never defines the backup test hooks or this override.
+inline constexpr unsigned long long kMaxItems = CTSPACES_ARCHIVE_ITEM_LIMIT_FOR_TEST;
+static_assert(kMaxItems >= 4 && kMaxItems <= 500'000);
+#else
 inline constexpr unsigned long long kMaxItems = 500'000;
+#endif
 inline constexpr unsigned long long kMaxUncompressedBytes =
     256ull * 1024ull * 1024ull * 1024ull;
 inline constexpr unsigned kMaxDirectoryDepth = 128;

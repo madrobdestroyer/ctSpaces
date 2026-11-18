@@ -10,6 +10,8 @@ static unsigned suppressedVisibility=0,suppressedFocus=0,suppressedProgress=0;
 namespace notes_test {
 BOOL WINAPI Show(HWND,int);
 BOOL WINAPI Position(HWND,HWND,int,int,int,int,UINT);
+LONG_PTR WINAPI WindowLong(HWND,int);
+LONG_PTR WINAPI WindowSetLong(HWND,int,LONG_PTR);
 HWND WINAPI Focus(HWND);
 BOOL WINAPI Foreground(HWND);
 void ProgressShow(HWND,const std::wstring &,int);
@@ -61,6 +63,8 @@ BOOL WINAPI RedrawOwned(HWND,const RECT *,HRGN,UINT);
 #define CreateWindowExW notes_test::CreateNoteWindow
 #define ShowWindow notes_test::Show
 #define SetWindowPos notes_test::Position
+#define GetWindowLongPtrW notes_test::WindowLong
+#define SetWindowLongPtrW notes_test::WindowSetLong
 #define SetFocus notes_test::Focus
 #define SetForegroundWindow notes_test::Foreground
 #define SetActiveWindow notes_test::Active
@@ -108,6 +112,8 @@ BOOL WINAPI RedrawOwned(HWND,const RECT *,HRGN,UINT);
 #undef CreateWindowExW
 #undef ShowWindow
 #undef SetWindowPos
+#undef GetWindowLongPtrW
+#undef SetWindowLongPtrW
 #undef SetFocus
 #undef SetForegroundWindow
 #undef SetActiveWindow
@@ -180,6 +186,47 @@ BOOL WINAPI notes_test::RedrawOwned(HWND window,const RECT *rect,HRGN region,UIN
 
 struct NotesShowRequest { HWND window;int command;bool registered; };
 static std::vector<NotesShowRequest> notesShowRequests;
+// Only logical child visibility is simulated. Native top-level styles, native
+// IsWindowVisible and event observations remain untouched by the fixture.
+static std::map<HWND,bool> notesLogicalChildVisibility;
+static std::function<void(HGDIOBJ)> notesPolishFontSelectionObserver;
+static std::function<void(HWND,HWND,UINT)> notesPolishPositionObserver;
+static std::function<void(HWND)> notesPolishFocusObserver;
+static LONG_PTR NotesNativeWindowLong(HWND window,int index){return ::GetWindowLongPtrW(window,index);}
+static bool NotesLogicalVisibilityEligible(HWND child) {
+  if(!backgroundNotesTests || !child || !IsWindow(child) ||
+      !(NotesNativeWindowLong(child,GWL_STYLE)&WS_CHILD))return false;
+  DWORD childPid=0,rootPid=0;const HWND root=GetAncestor(child,GA_ROOT);
+  GetWindowThreadProcessId(child,&childPid);GetWindowThreadProcessId(root,&rootPid);
+  return root && root!=child && childPid==GetCurrentProcessId() && rootPid==GetCurrentProcessId() &&
+      !(NotesNativeWindowLong(root,GWL_STYLE)&WS_VISIBLE) && !::IsWindowVisible(root);
+}
+static LRESULT CALLBACK NotesLogicalVisibilityLifetime(HWND window,UINT message,WPARAM w,LPARAM l,UINT_PTR id,DWORD_PTR) {
+  if(message==WM_NCDESTROY){notesLogicalChildVisibility.erase(window);RemoveWindowSubclass(window,NotesLogicalVisibilityLifetime,id);}
+  return DefSubclassProc(window,message,w,l);
+}
+static void NotesLogicalVisibilityRequest(HWND child,bool visible) {
+  if(!NotesLogicalVisibilityEligible(child))return;
+  if(!notesLogicalChildVisibility.contains(child) &&
+      !SetWindowSubclass(child,NotesLogicalVisibilityLifetime,0x4E4C5653,0))
+    throw std::runtime_error("Private logical child visibility lifetime could not be guarded");
+  notesLogicalChildVisibility[child]=visible;
+}
+LONG_PTR WINAPI notes_test::WindowLong(HWND window,int index) {
+  const auto native=NotesNativeWindowLong(window,index);
+  if(index!=GWL_STYLE || !NotesLogicalVisibilityEligible(window))return native;
+  const auto logical=notesLogicalChildVisibility.find(window);
+  return logical==notesLogicalChildVisibility.end()?native:
+      logical->second ? native|WS_VISIBLE : native&~static_cast<LONG_PTR>(WS_VISIBLE);
+}
+LONG_PTR WINAPI notes_test::WindowSetLong(HWND window,int index,LONG_PTR value) {
+  if(index!=GWL_STYLE || !NotesLogicalVisibilityEligible(window))return ::SetWindowLongPtrW(window,index,value);
+  const auto priorLogical=WindowLong(window,index),priorNative=NotesNativeWindowLong(window,index);
+  const auto preserved=(value&~static_cast<LONG_PTR>(WS_VISIBLE))|(priorNative&WS_VISIBLE);
+  SetLastError(ERROR_SUCCESS);const auto result=::SetWindowLongPtrW(window,index,preserved);
+  if(result || GetLastError()==ERROR_SUCCESS){NotesLogicalVisibilityRequest(window,(value&WS_VISIBLE)!=0);return priorLogical;}
+  return 0;
+}
 static HDC observedPaintTarget=nullptr;
 static unsigned observedPaintPublishes=0;
 static bool failNextPaintBitmap=false;
@@ -248,6 +295,7 @@ HBITMAP WINAPI notes_test::PaintBitmap(HDC target,int width,int height) {
   return ::CreateCompatibleBitmap(target,width,height);
 }
 HGDIOBJ WINAPI notes_test::PaintSelect(HDC target,HGDIOBJ object) {
+  if(notesPolishFontSelectionObserver)notesPolishFontSelectionObserver(object);
   if(failNextPaintSelection && GetObjectType(object)==OBJ_BITMAP) {failNextPaintSelection=false;SetLastError(ERROR_NOT_ENOUGH_MEMORY);return HGDI_ERROR;}
   return ::SelectObject(target,object);
 }
@@ -256,17 +304,22 @@ BOOL WINAPI notes_test::PaintViewport(HDC target,int x,int y,LPPOINT previous) {
   return ::SetViewportOrgEx(target,x,y,previous);
 }
 BOOL WINAPI notes_test::Show(HWND window,int command) {
+  if(backgroundNotesTests)NotesLogicalVisibilityRequest(window,command!=SW_HIDE);
   if(backgroundNotesTests) notesShowRequests.push_back({window,command,window==g_hNotesWindow});
   if(backgroundNotesTests) {++backgroundGuard.showRequested;++backgroundGuard.showSuppressed;}
   if(backgroundNotesTests) {if(command!=SW_HIDE) ++suppressedVisibility;return FALSE;}
   return ::ShowWindow(window,command);
 }
 BOOL WINAPI notes_test::Position(HWND window,HWND order,int x,int y,int width,int height,UINT flags) {
+  if(notesPolishPositionObserver)notesPolishPositionObserver(window,order,flags);
+  if(backgroundNotesTests && (flags&(SWP_SHOWWINDOW|SWP_HIDEWINDOW)))
+    NotesLogicalVisibilityRequest(window,(flags&SWP_SHOWWINDOW)!=0);
   if(backgroundNotesTests && (flags&SWP_SHOWWINDOW)) {++backgroundGuard.positionShowRequested;++backgroundGuard.positionShowSuppressed;}
-  if(backgroundNotesTests) {if(flags&SWP_SHOWWINDOW) ++suppressedVisibility;flags=(flags&~SWP_SHOWWINDOW)|SWP_NOACTIVATE;order=nullptr;flags|=SWP_NOZORDER;}
+  if(backgroundNotesTests) {if(flags&SWP_SHOWWINDOW) ++suppressedVisibility;flags=(flags&~(SWP_SHOWWINDOW|SWP_HIDEWINDOW))|SWP_NOACTIVATE;order=nullptr;flags|=SWP_NOZORDER;}
   return ::SetWindowPos(window,order,x,y,width,height,flags);
 }
 HWND WINAPI notes_test::Focus(HWND window) {
+  if(notesPolishFocusObserver)notesPolishFocusObserver(window);
   if(backgroundNotesTests) {++backgroundGuard.focusRequested;++backgroundGuard.focusSuppressed;}
   if(backgroundNotesTests) {++suppressedFocus;return nullptr;}return ::SetFocus(window);
 }
@@ -287,8 +340,11 @@ HDWP WINAPI notes_test::BeginPosition(int count) {
   return ::BeginDeferWindowPos(count);
 }
 HDWP WINAPI notes_test::DeferPosition(HDWP batch,HWND child,HWND order,int x,int y,int width,int height,UINT flags) {
+  if(notesPolishPositionObserver)notesPolishPositionObserver(child,order,flags);
+  if(backgroundNotesTests && (flags&(SWP_SHOWWINDOW|SWP_HIDEWINDOW)))
+    NotesLogicalVisibilityRequest(child,(flags&SWP_SHOWWINDOW)!=0);
   if(geometryFault==2 && ++geometryDeferCalls==3) {geometryFault=0;geometryFaultHit=true;return ::DeferWindowPos(batch,reinterpret_cast<HWND>(static_cast<INT_PTR>(-5)),nullptr,0,0,0,0,SWP_NOZORDER);}
-  if(backgroundNotesTests){if(flags&SWP_SHOWWINDOW){++backgroundGuard.positionShowRequested;++backgroundGuard.positionShowSuppressed;}flags=(flags&~SWP_SHOWWINDOW)|SWP_NOACTIVATE|SWP_NOZORDER;order=nullptr;}
+  if(backgroundNotesTests){if(flags&SWP_SHOWWINDOW){++backgroundGuard.positionShowRequested;++backgroundGuard.positionShowSuppressed;}flags=(flags&~(SWP_SHOWWINDOW|SWP_HIDEWINDOW))|SWP_NOACTIVATE|SWP_NOZORDER;order=nullptr;}
   return ::DeferWindowPos(batch,child,order,x,y,width,height,flags);
 }
 BOOL WINAPI notes_test::EndPosition(HDWP batch) {
@@ -421,6 +477,8 @@ INT_PTR WINAPI notes_test::Dialog(HINSTANCE,LPCWSTR resource,HWND,DLGPROC proced
 #define CreateWindowExW notes_test::CreateNoteWindow
 #define ShowWindow notes_test::Show
 #define SetWindowPos notes_test::Position
+#define GetWindowLongPtrW notes_test::WindowLong
+#define SetWindowLongPtrW notes_test::WindowSetLong
 #define SetFocus notes_test::Focus
 #define SetForegroundWindow notes_test::Foreground
 #define SetActiveWindow notes_test::Active
@@ -2891,7 +2949,10 @@ static void NotesAuditEditorCache(bool supportedLimit) {
     state.pages[i].open=true;state.activePage=i;
     if (!LoadNotesPage(owner,state)) throw std::runtime_error("Bounded cache failed to load a supported saved note");
     if (state.editors.size()>kNotesEditorCacheLimit) throw std::runtime_error("Editor cache exceeded native resource bound");
-    if (supportedLimit) NotesClosePage(owner,state,i);
+    if (supportedLimit) {
+      state.pages[i].open=false;
+      NotesReleasePageEditor(state,state.pages[i].id);
+    }
     if (i && i%1000==0) std::cout<<"Cache stress visited "<<i<<", retained "<<state.editors.size()<<", USER "<<GetGuiResources(GetCurrentProcess(),GR_USEROBJECTS)<<std::endl;
   }
   Check(state.editors.size()<=kNotesEditorCacheLimit && GetGuiResources(GetCurrentProcess(),GR_USEROBJECTS)<=baseline+20,
@@ -3047,15 +3108,38 @@ static void NotesLibrarySearchDecoder() {
 #include "NotesNormalOpeningTests.inl"
 #include "NotesRollbackTransactionsTests.inl"
 #include "NotesCodeRecoveryTests.inl"
+#include "NotesPolishBackground.inl"
+#include "NotesLibrarySelectionTests.inl"
+#include "NotesWorkflowEdgeTests.inl"
+#include "NotesInteractionEdgesTests.inl"
+#include "NotesInactiveTabCloseTests.inl"
+#include "NotesDetailsTabCloseTests.inl"
+#include "NotesDetailsTabSwitchTests.inl"
+#include "NotesMoveSaveTests.inl"
+#include "NotesWorkspaceRoundCases.inl"
+#include "NotesWorkspaceRoundUCases.inl"
 
 int wmain(int argc,wchar_t **argv) {
   try {
+    const auto backgroundSelector=[](const wchar_t *selector){return !wcscmp(selector,L"--polish-background") || !wcscmp(selector,L"--library-selection-background") || !wcscmp(selector,L"--workflow-edges-background") || !wcscmp(selector,L"--interaction-edges-background") || !wcscmp(selector,L"--inactive-tab-close-background") || !wcscmp(selector,L"--details-tab-close-background") || !wcscmp(selector,L"--details-tab-switch-background") || !wcscmp(selector,L"--move-save-background") || !wcscmp(selector,L"--notes-round-background") || !wcscmp(selector,L"--notes-round-u-background") || NotesBackgroundSelector(selector);};
     const bool explicitBackground=argc>1 && !wcscmp(argv[1],L"--headless-background");
-    if(explicitBackground && (argc<3 || !NotesBackgroundSelector(argv[2]))) {
+    if(explicitBackground && (argc<3 || !backgroundSelector(argv[2]))) {
       std::cerr<<"Background argument refused before native initialization; native windows created=0\n";return 2;
     }
     if(explicitBackground){--argc;++argv;}
-    backgroundNotesTests=argc>1 && NotesBackgroundSelector(argv[1]);
+    unsigned round = 0;
+    const bool currentRound = argc > 1 && !wcscmp(argv[1], L"--notes-round-u-background");
+    if (currentRound || (argc > 1 && !wcscmp(argv[1], L"--notes-round-background"))) {
+      const std::wstring_view argument = argc == 3 ? argv[2] : L"";
+      if (argument == L"10") round = 10;
+      else if (argument.size() == 1 && argument[0] >= L'1' && argument[0] <= L'9')
+        round = static_cast<unsigned>(argument[0] - L'0');
+      if (!explicitBackground || !round) {
+        std::cerr << "Notes round requires the explicit background flag and a round from 1 through 10.\n";
+        return 2;
+      }
+    }
+    backgroundNotesTests=argc>1 && backgroundSelector(argv[1]);
     NotesBackgroundEvents backgroundEvents;if(backgroundNotesTests) backgroundEvents.Start();
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     CoInitializeEx(nullptr,COINIT_APARTMENTTHREADED);
@@ -3067,6 +3151,65 @@ int wmain(int argc,wchar_t **argv) {
     Fixture(L"Workspace QA"); Fixture(L"Destination QA");
     g_hGui=CreateWindowExW(0,L"STATIC",L"Notes test parent",WS_OVERLAPPED,0,0,100,100,nullptr,nullptr,g_hInst,nullptr);
     if(backgroundNotesTests) NotesBackgroundAudit("initialization");
+    if (round) {
+      const bool passed = currentRound ? notes_workspace_round_u_cases::Run(round) :
+          notes_workspace_round_cases::Run(round);
+      DestroyWindow(g_hGui);
+      NotesBackgroundAudit("Notes round case cleanup");
+      NotesBackgroundBanner();
+      std::cout << "Notes round case: " << checks << " checks, " << (passed ? 0 : 1) << " failures.\n";
+      return passed ? 0 : 1;
+    }
+    if(argc>1 && !wcscmp(argv[1],L"--move-save-background")) {
+      const bool passed=notes_move_save::Run();
+      DestroyWindow(g_hGui);
+      NotesBackgroundAudit("Notes move save cleanup");
+      NotesBackgroundBanner();
+      std::cout<<"Notes move save: "<<checks<<" checks, "<<notes_move_save::failures<<" failures.\n";
+      return passed ? 0 : 1;
+    }
+    if(argc>1 && !wcscmp(argv[1],L"--details-tab-switch-background")) {
+      const bool passed=notes_details_tab_switch::Run();
+      DestroyWindow(g_hGui);
+      NotesBackgroundAudit("Notes Details tab switch cleanup");
+      NotesBackgroundBanner();
+      std::cout<<"Notes Details tab switch: "<<checks<<" checks, "<<notes_details_tab_switch::failures<<" failures.\n";
+      return passed ? 0 : 1;
+    }
+    if(argc>1 && !wcscmp(argv[1],L"--details-tab-close-background")) {
+      const bool passed=notes_details_tab_close::Run();
+      DestroyWindow(g_hGui);
+      NotesBackgroundAudit("Notes Details tab close cleanup");
+      NotesBackgroundBanner();
+      std::cout<<"Notes Details tab close: "<<checks<<" checks, "<<notes_details_tab_close::failures<<" failures.\n";
+      return passed ? 0 : 1;
+    }
+    if(argc>1 && !wcscmp(argv[1],L"--inactive-tab-close-background")) {
+      const bool passed=notes_inactive_tab_close::Run();
+      DestroyWindow(g_hGui);
+      NotesBackgroundAudit("Notes inactive tab close cleanup");
+      NotesBackgroundBanner();
+      std::cout<<"Notes inactive tab close: "<<checks<<" checks, "<<notes_inactive_tab_close::failures<<" failures.\n";
+      return passed ? 0 : 1;
+    }
+    if(argc>1 && !wcscmp(argv[1],L"--interaction-edges-background")) {
+      const bool passed=notes_interaction_edges::Run();
+      DestroyWindow(g_hGui);
+      NotesBackgroundAudit("Notes interaction edges cleanup");
+      NotesBackgroundBanner();
+      std::cout<<"Notes interaction edges: "<<checks<<" checks, "<<notes_interaction_edges::failures<<" failures.\n";
+      return passed ? 0 : 1;
+    }
+    if(argc>1 && !wcscmp(argv[1],L"--workflow-edges-background")) {
+      const bool passed=notes_workflow_edges::Run();
+      DestroyWindow(g_hGui);
+      NotesBackgroundAudit("Notes workflow edges cleanup");
+      NotesBackgroundBanner();
+      std::cout<<"Notes workflow edges: "<<checks<<" checks, "<<notes_workflow_edges::failures<<" failures.\n";
+      return passed ? 0 : 1;
+    }
+    if(argc>1 && !wcscmp(argv[1],L"--library-selection-background")) {const bool passed=notes_library_selection::Run();DestroyWindow(g_hGui);NotesBackgroundAudit("library selection cleanup");NotesBackgroundBanner();if(passed)std::cout<<"Notes library selection: "<<checks<<" checks passed.\n";else std::cout<<"Notes library selection: "<<checks<<" checks; "<<notes_library_selection::failures<<" failures.\n";return passed?0:1;}
+    if(argc>1 && !wcscmp(argv[1],L"--polish-background")) {notes_polish::Run(argc>2?fs::absolute(argv[2]):fs::path{});DestroyWindow(g_hGui);NotesBackgroundAudit("polish cleanup");NotesBackgroundBanner();std::cout<<"Notes polish background: "<<checks<<" checks passed.\n";return 0;}
     if(argc>1 && !wcscmp(argv[1],L"--normal-opening")) {NotesNormalOpening();DestroyWindow(g_hGui);NotesBackgroundAudit("normal Notes opening cleanup");NotesBackgroundBanner();std::cout<<"Notes normal opening: "<<checks<<" checks passed.\n";return 0;}
     if(argc>1 && !wcscmp(argv[1],L"--plus-switch-background")) {const bool passed=notes_plus_switch::Run(argc>2?fs::absolute(argv[2]):g_sDataDir/L"plus-switch-captures");DestroyWindow(g_hGui);NotesBackgroundAudit("plus-switch native proof cleanup");NotesBackgroundBanner();std::cout<<"Notes plus switch: "<<checks<<" setup checks; "<<notes_plus_switch::checks<<" native checks; "<<notes_plus_switch::failures<<" failures.\n";return passed?0:1;}
     if(argc>1 && !wcscmp(argv[1],L"--rollback-transactions-background")) {NotesRollbackTransactions(argc>2?fs::absolute(argv[2]):fs::path{});DestroyWindow(g_hGui);NotesBackgroundAudit("rollback transaction native proof cleanup");NotesBackgroundBanner();std::cout<<"Notes rollback transactions: "<<checks<<" checks passed.\n";return 0;}

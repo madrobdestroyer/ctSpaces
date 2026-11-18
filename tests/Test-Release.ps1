@@ -1,9 +1,10 @@
 param(
-    [string]$ExePath = (Join-Path $PSScriptRoot '..\dist\x64\Release\ctSpaces.exe'),
+    [string]$ExePath = '',
     [switch]$SourceOnly
 )
 
 $ErrorActionPreference = 'Stop'
+if (!$SourceOnly) { $ExePath = & (Join-Path $PSScriptRoot '..\qa\Resolve-Executable.ps1') -ExePath $ExePath }
 $projectRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
 $archivePath = Join-Path $projectRoot 'Default.7z'
 $versionHeaderPath = Join-Path $projectRoot 'version.h'
@@ -377,7 +378,8 @@ Assert-ReleaseCheck ($restoreCommitBody -match 'for\s*\(const auto &entry : stag
 Assert-ReleaseCheck ($backupEngine -match 'OpenRestoreDirectory[\s\S]*?CreateFileW\(path\.c_str\(\),\s*GENERIC_READ' -and $backupEngine -match 'KeepRestoreParentNonempty[\s\S]*?CREATE_NEW[\s\S]*?FILE_FLAG_DELETE_ON_CLOSE' -and $restoreCommitBody -match 'KeepRestoreParentNonempty\(live\.parent_path\(\),currentParentSentinel\)[\s\S]*?KeepRestoreParentNonempty\(recovery\.parent_path\(\),recoveryParentSentinel\)[\s\S]*?precommitGuard\(') 'Restore destination parents must retain real read leases and owned guard files before the final commit callback, including an initially empty separate recovery parent.'
 Assert-ReleaseCheck ($backupEngine -match 'ValidateStagingRoot[\s\S]*?CaptureStagedRestoreIdentity\(stagedRestore,\s*protectedExtraction\)' -and $source -match 'CaptureStagedRestoreIdentity\(stagedRestore\)[\s\S]*?if\s*\(!sealed\.ok\(\)\)' -and $restoreCommitBody -match 'CleanupBoundRestoreStage\(stagedRestore,\s*stage\.value\)') 'Validated and legacy restore inputs must seal their staged tree, reject sealing failures and clean only the bound original stage.'
 Assert-ReleaseCheck ($source -match 'finalRestoreCommitGuard[\s\S]*?ProbeAnySitesProfileInUse\(finalProfileUseError\)[\s\S]*?CommitStagedRestore\(\s*\r?\n?\s*stagedRestore,\s*sitesDir,\s*backupDir,\s*finalRestoreCommitGuard[\s\S]*?if\s*\(!commitResult\.ok\(\)\)\s*\{[\s\S]*?Restore staging location:[\s\S]*?tempDir\.wstring\(\)[\s\S]*?Retained recovery location:[\s\S]*?backupDir\.wstring\(\)' -and $restoreAllBodyMatch.Success -and $restoreAllBodyMatch.Groups['body'].Value -notmatch 'fs::remove_all\(tempDir') 'The restore UI must supply a fail-closed final browser-process guard and preserve/report rejected staging and recovery data.'
-Assert-ReleaseCheck ($source -match 'CreateRestoreStagingDirectory[\s\S]*?attempt\s*<\s*64[\s\S]*?CreateDirectoryW\(candidate\.c_str\(\),\s*nullptr\)[\s\S]*?ERROR_ALREADY_EXISTS' -and $restoreAllBodyMatch.Success -and $restoreAllBodyMatch.Groups['body'].Value -match 'CreateRestoreStagingDirectory\(tempDir\)[\s\S]*?if\s*\(!reservation\.ok\(\)\)' -and $backupEngine -match 'StageValidated7zRestore[\s\S]*?fs::create_directory\(stagingRoot\)[\s\S]*?IsRealDirectory\(stagingRoot\)[\s\S]*?fs::is_empty\(stagingRoot\)') 'Restore staging must reserve a fresh directory without deleting a name collision and reject occupied or redirected input roots.'
+Assert-ReleaseCheck ($source -match 'CreateRestoreStagingDirectory[\s\S]*?attempt\s*<\s*64[\s\S]*?CreateDirectoryW\(candidate\.c_str\(\),\s*nullptr\)[\s\S]*?ERROR_ALREADY_EXISTS' -and $restoreAllBodyMatch.Success -and $restoreAllBodyMatch.Groups['body'].Value -match 'CreateRestoreStagingDirectory\(tempDir,\s*stageReservation\)[\s\S]*?if\s*\(!reservation\.ok\(\)\)' -and $backupEngine -match 'StageValidated7zRestore[\s\S]*?fs::create_directory\(stagingRoot\)[\s\S]*?IsRealDirectory\(stagingRoot\)[\s\S]*?fs::is_empty\(stagingRoot\)') 'Restore staging must reserve a fresh directory without deleting a name collision and reject occupied or redirected input roots.'
+Assert-ReleaseCheck ($source -match 'RemoveEmptyRestoreReservation[\s\S]*?GetFileInformationByHandle\(reserved,[\s\S]*?FILE_FLAG_OPEN_REPARSE_POINT[\s\S]*?before\.nFileIndexHigh != after\.nFileIndexHigh[\s\S]*?SetFileInformationByHandle\(current\.get\(\), FileDispositionInfo' -and $restoreAllBodyMatch.Groups['body'].Value -match 'if\s*\(!stageResult\.ok\(\) && stageReservation && \*stageReservation\)[\s\S]*?RemoveEmptyRestoreReservation\(tempDir, stageReservation->get\(\)\)') 'Failed staging may remove only the originally reserved empty ordinary directory by its native handle.'
 Assert-ReleaseCheck `
     ($source -match 'GetClientShortcutFileName\([^;{}]*\)\s*\{\s*return\s+clientName\s*\+\s*L"\.lnk";\s*\}' -and
      $source -match 'GetClientShortcutPathInDirectory[\s\S]*?GetClientShortcutFileName\(clientName\)[\s\S]*?fileName\.size\(\)\s*>\s*\*budget[\s\S]*?return\s+std::nullopt' -and
@@ -466,7 +468,12 @@ if ($exactProfileProbeBodyMatch.Success) {
 Assert-ReleaseCheck $anySitesProbeBodyMatch.Success 'The whole-Sites browser-use probe could not be inspected.'
 if ($anySitesProbeBodyMatch.Success) {
     $anySitesProbeBody = $anySitesProbeBodyMatch.Groups['body'].Value
-    Assert-ReleaseCheck ($anySitesProbeBody -match '!g_activeProfiles\.empty\(\)[\s\S]*?ProfileUseState::InUse' -and $anySitesProbeBody -match 'IsSafeExistingDirectory\(sitesRoot\)' -and $anySitesProbeBody -match 'ProbeBrowserProcessesAgainstProfiles\(\{\},\s*sitesRoot') 'Whole-Sites use checks do not combine tracked sessions with a safe OS-level Sites-scope inspection.'
+    Assert-ReleaseCheck (
+        $anySitesProbeBody -match 'std::ranges::any_of\(\s*g_activeProfiles\s*,[\s\S]*?return\s+\w+\.second\.type\s*==\s*ProfileType::Standard\s*;[\s\S]*?ProfileUseState::InUse' -and
+        $anySitesProbeBody -notmatch '!g_activeProfiles\.empty\(\)' -and
+        $anySitesProbeBody -match 'IsSafeExistingDirectory\(sitesRoot\)' -and
+        $anySitesProbeBody -match 'ProbeBrowserProcessesAgainstProfiles\(\{\},\s*sitesRoot'
+    ) 'Whole-Sites use checks must combine tracked standard-client sessions with a safe OS-level Sites-scope inspection.'
 }
 Assert-ReleaseCheck ($source -match 'ValidateNoReparsePointsInTree[\s\S]*?recursive_directory_iterator[\s\S]*?FILE_ATTRIBUTE_REPARSE_POINT') 'Whole-client deletion does not inspect the complete target tree for reparse points.'
 Assert-ReleaseCheck ($source -match 'ValidateWholeClientDeleteTarget[\s\S]*?IsDirectChildPath[\s\S]*?IsV2ClientContainer[\s\S]*?IsSafeHybridClientRoot[\s\S]*?ValidateNoReparsePointsInTree') 'Whole-client deletion does not exact-validate v2 and hybrid profile layouts.'
@@ -502,7 +509,7 @@ if ($restoreAllBodyMatch.Success) {
 Assert-ReleaseCheck $exportAllBodyMatch.Success 'The whole-Sites backup function could not be inspected.'
 if ($exportAllBodyMatch.Success) {
     $exportAllBody = $exportAllBodyMatch.Groups['body'].Value
-    Assert-ReleaseCheck ([regex]::Matches($exportAllBody, 'ProbeBackupSelectionClosed\(\*selectedClients,\s*profileUseError\)').Count -eq 2 -and $exportAllBody -notmatch 'ProbeAnySitesProfileInUse\(') 'Backup must check the captured selected clients both before the location picker and immediately before compression, without blocking excluded clients.'
+    Assert-ReleaseCheck ([regex]::Matches($exportAllBody, 'ProbeBackupSelectionClosed\(\*selectedClients,\s*profileUseError\)').Count -eq 2 -and $exportAllBody -notmatch 'ProbeAnySitesProfileInUse\(' -and $exportAllBody -match 'ProbeBackupSelectionClosed\(\*selectedClients,\s*profileUseError\)[\s\S]*?GetSaveFileNameW[\s\S]*?recheckSelectedBrowsers\s*=\s*\[&\][\s\S]*?ProbeBackupSelectionClosed\(\*selectedClients,\s*profileUseError\)[\s\S]*?FindSelectedClientNotesForBackup\(\*selectedClients\)\s*&&\s*!recheckSelectedBrowsers\(\)[\s\S]*?flushNotes\(\)[\s\S]*?if\s*\(!recheckSelectedBrowsers\(\)\)[\s\S]*?RunArchiveTaskWithProgress') 'Backup must check only the captured clients before the picker, before flushing a selected notebook, and before compression.'
     Assert-ReleaseCheck ($exportAllBody -match 'ChooseBackupClients\(sourceDir\)[\s\S]*?if\s*\(!selectedClients\s*\|\|\s*selectedClients->empty\(\)\)\s*return;[\s\S]*?backupOptions\.selectedClientNames\s*=\s*\*selectedClients[\s\S]*?GetSaveFileNameW[\s\S]*?FreezeNotes\(\)[\s\S]*?flushNotes\(\)[\s\S]*?operationOptions\s*=\s*backupOptions[\s\S]*?CreateValidated7zBackup\([\s\S]*?operationOptions\)') 'Backup must preserve its explicit client selection, cancel without fallback, and flush/freeze Notes before archiving.'
 }
 Assert-ReleaseCheck $renameClientBodyMatch.Success 'The client rename function could not be inspected.'

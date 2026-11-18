@@ -54,7 +54,7 @@ function Invoke-HiddenTool([string]$Exe, [string[]]$Arguments, [string]$Log) {
     } finally { $process.Dispose() }
 }
 
-$sources = @('BackupEngine.cpp','BackupEngine.h','InProc7z.cpp','InProc7z.h','RestoreIoPath.h','SiblingStageName.h','ClientNameComparison.h','version.h','tests\RestoreStagingPathTests.cpp','tests\RestoreStagingPathTests.vcxproj','tests\Test-RestoreStagingPath.ps1','dist\x64\Release\7zip.lib')
+$sources = @('BackupEngine.cpp','BackupEngine.h','InProc7z.cpp','InProc7z.h','RestoreIoPath.h','SiblingStageName.h','ClientNameComparison.h','version.h','tests\RestoreStagingPathTests.cpp','tests\RestoreStagingPathTests.vcxproj','tests\Test-RestoreStagingPath.ps1','tests\fixtures\backup-timestamps-6.3.5.0.7z','dist\x64\Release\7zip.lib')
 $sourceBefore = @($sources | ForEach-Object { $path = Join-Path $root $_; [pscustomobject]@{ Path = $path; Sha256 = (Get-FileHash -LiteralPath $path).Hash } })
 $sourceBefore | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $artifacts 'source-before.json')
 $null = Invoke-HiddenTool $msbuild @($project,'/m:1','/nodeReuse:false',"/p:Configuration=$Configuration","/p:Platform=$Platform",('/p:OutDir='+$outputDirectory+'\'),('/p:IntDir='+$intermediateDirectory+'\'),'/v:minimal') (Join-Path $artifacts 'build.log')
@@ -66,16 +66,17 @@ if ((ConvertTo-Json -InputObject $sourceBefore -Compress) -ne (ConvertTo-Json -I
 # Win32 boundary. It is always a new workspace-private directory, retained.
 $fixture = Join-Path (Join-Path $root 'build\rsp') ([Guid]::NewGuid().ToString('N').Substring(0,12))
 if (Test-Path -LiteralPath $fixture) { throw 'Fresh private fixture path was occupied; existing data was left alone.' }
-$nativeLog = Invoke-HiddenTool (Join-Path $outputDirectory 'RestoreStagingPathTests.exe') @('--headless',$fixture) (Join-Path $artifacts 'native.log')
+$nativeLog = Invoke-HiddenTool (Join-Path $outputDirectory 'RestoreStagingPathTests.exe') @('--headless',$fixture,(Join-Path $root 'tests\fixtures\backup-timestamps-6.3.5.0.7z')) (Join-Path $artifacts 'native.log')
 $sourceAfterNative = @($sources | ForEach-Object { $path = Join-Path $root $_; [pscustomobject]@{ Path = $path; Sha256 = (Get-FileHash -LiteralPath $path).Hash } })
 $sourceAfterNative | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $artifacts 'source-after-native.json')
 if ((ConvertTo-Json -InputObject $sourceBefore -Compress) -ne (ConvertTo-Json -InputObject $sourceAfterNative -Compress)) { throw 'Inputs changed during restore staging path native execution.' }
-if ($nativeLog -notmatch 'Restore staging path tests passed: (\d+) checks\.' -or [int]$Matches[1] -ne 74 -or $nativeLog -notmatch 'FAILURES=0') {
+if ($nativeLog -notmatch 'Restore staging path tests passed: (\d+) checks\.' -or [int]$Matches[1] -ne 117 -or
+    $nativeLog -notmatch 'FAILURES=0' -or $nativeLog -notmatch 'LOCKED_ARCHIVE_HRESULT=0x80070020') {
     throw 'The complete ordinary restore staging path regression was not confirmed.'
 }
 $receipt = [ordered]@{
-    Scope = 'Ordinary CRC-valid backup/restore through long staging paths, exact final path boundaries, occupied-output diagnostics, one-shot ownership allocation failure/close/retry, and pure Drive/UNC path conversion'
-    Checks = 74; Failures = 0; Headless = $true; NoBrowserGuiOrNetwork = $true
+    Scope = 'Ordinary CRC-valid backup/restore through long staging paths, exact final path boundaries, occupied-output diagnostics, one-shot ownership allocation failure/close/retry, pure Drive/UNC path conversion, exact file/empty/populated/nested-directory creation/write timestamp round trips including a read-only file, and retained original 6.3.5.0 archive modification-time compatibility without requiring absent metadata'
+    Checks = 117; Failures = 0; Headless = $true; NoBrowserGuiOrNetwork = $true
     FixturesRetained = $true; Fixture = $fixture; ProductionInputsUnchanged = $true
     Binary = (Join-Path $outputDirectory 'RestoreStagingPathTests.exe')
     BinarySha256 = (Get-FileHash -LiteralPath (Join-Path $outputDirectory 'RestoreStagingPathTests.exe')).Hash

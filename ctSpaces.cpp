@@ -1,4 +1,4 @@
-﻿// ctSpaces.cpp
+// ctSpaces.cpp
 
 // Because I didn't have the paitence to port this from the ground up, I used
 // Gemini 2.5 Pro for heavylifting and filled in the gaps.
@@ -35,6 +35,7 @@
 #include "InProc7z.h"
 #include "OwnerDrawUi.h"
 #include "NotesEditorUi.h"
+#include "NotesAccessibility.h"
 #include "NotesTextTools.h"
 #include "ProgressUI.h"
 #include "BackupProgressUi.h"
@@ -90,6 +91,7 @@
 #include <string>
 #include <system_error>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include "resource.h" // For bundled resource IDs.
@@ -372,6 +374,9 @@ static std::atomic_bool g_bClientNotesBusy = false;
 static HWND g_hNotesWindow = nullptr;
 static bool NotesTranslateKey(MSG &message);
 static bool PrepareNotesForClientChange(const std::wstring &client = {});
+struct ClientNotesDialogState;
+static ClientNotesDialogState *FindSelectedClientNotesForBackup(
+    const std::vector<std::wstring> &selectedClients);
 static bool FlushClientNotesForBackup(
     const std::vector<std::wstring> &selectedClients, std::wstring &error);
 static std::vector<std::unique_ptr<ProfileExitPayload>> g_notesDeferredExits;
@@ -427,6 +432,9 @@ enum class MainDragKind { None, PinnedClient, SessionTab };
 static MainDragKind g_mainDragKind = MainDragKind::None;
 static int g_iMainDragIndex = -1;
 static uint64_t g_mainDragSessionIdentity = 0;
+static uint64_t g_sessionClosePressIdentity = 0;
+enum class MainControlPress { None, NewTab, SessionOverflow, BrowserSelector, PinnedOverflow };
+static MainControlPress g_mainControlPress = MainControlPress::None;
 static POINT g_ptMainDragStart{};
 static bool g_bMainDragActive = false;
 static bool g_bPinnedOrderChanged = false;
@@ -1257,6 +1265,8 @@ static bool SaveBrowserPreference() {
       {{L"user", std::wstring(L"browser"), v}});
 }
 
+static void SelectLauncherBrowser(BrowserKind browser);
+
 static void LoadThemePreference() {
   if (g_sConfigPath.empty())
     return;
@@ -1279,11 +1289,34 @@ static void LoadThemePreference() {
   }
 
   wchar_t buf[32]{};
-  GetPrivateProfileStringW(L"user", L"theme", L"", buf,
-                           (DWORD)(sizeof(buf) / sizeof(buf[0])),
-                           g_sConfigPath.c_str());
-  if (buf[0] != L'\0') {
-    g_iThemeMode = _wtoi(buf);
+  const DWORD length = GetPrivateProfileStringW(
+      L"user", L"theme", L"", buf, (DWORD)std::size(buf),
+      g_sConfigPath.c_str());
+  if (length != 0) {
+    // Auto is an explicit choice (0). Do not mistake an unreadable or
+    // truncated legacy value for Auto or accept a partially parsed index.
+    g_iThemeMode = 1;
+    if (length == std::size(buf) - 1)
+      return;
+    const wchar_t *digit = buf;
+    while (iswspace(*digit))
+      ++digit;
+    const bool negative = *digit == L'-';
+    if (negative || *digit == L'+')
+      ++digit;
+    if (*digit < L'0' || *digit > L'9')
+      return;
+    int mode = 0;
+    for (; *digit >= L'0' && *digit <= L'9'; ++digit) {
+      const int value = *digit - L'0';
+      if (mode > (INT_MAX - value) / 10)
+        return;
+      mode = mode * 10 + value;
+    }
+    while (iswspace(*digit))
+      ++digit;
+    if (*digit == L'\0' && (!negative || mode == 0))
+      g_iThemeMode = mode;
     return;
   }
 
@@ -1508,6 +1541,8 @@ static bool RestoreArchivedClient(const std::wstring &clientName,
 static int HitTestSessionTab(HWND hWnd, POINT pt);
 static int HitTestSessionClose(HWND hWnd, POINT pt);
 static bool HitTestSessionOverflow(HWND hWnd, POINT pt);
+static MainControlPress HitTestMainControl(HWND hWnd, POINT point);
+static void ClearMainPointerGesture();
 static void StartMainDragCandidate(HWND hWnd, MainDragKind kind, int index,
                                    POINT point);
 static void MovePinnedClientForDrag(int fromIndex, int toIndex);
@@ -1518,7 +1553,6 @@ static bool FinishMainDrag(HWND hWnd, POINT point);
 static void SelectSessionTab(int iTab, bool bBringToFront);
 static void CloseSessionTab(int iTab);
 static void ShowSessionOverflowMenu(HWND hWnd);
-static bool RequestSessionClose(DWORD pid);
 static bool RequestSessionShutdown(DWORD pid);
 static void SwitchToLaunchModeForInput();
 static void InvalidateSessionTabs(HWND hWnd);
@@ -3877,6 +3911,8 @@ static std::wstring
 GetSelectedClientNameSanitized(bool preferListSelection = false);
 static fs::path GetProfileDirFromName(const std::wstring &name);
 static void BringSessionToFront(DWORD pid);
+static std::optional<ActiveProfileInfo>
+GetActiveProfile(const std::wstring &clientName, BrowserKind browser);
 static void OnSessionStarted(DWORD pid, const std::wstring &name);
 static void OnSessionEnded(DWORD pid);
 static void ClearClientIconCache(const std::wstring &clientName);
@@ -3962,7 +3998,6 @@ static void HandleClientInputChanged() {
   if (g_bSyncingClientInput || g_bFilteringClientList || !g_hComboClient)
     return;
 
-  SwitchToLaunchModeForInput();
   g_bClientListNavigated = false;
   const std::wstring currentText = GetClientInputText();
   bool hasInvalidChar = false;
@@ -3998,6 +4033,7 @@ static void HandleClientInputChanged() {
     return;
   }
 
+  SwitchToLaunchModeForInput();
   g_sLastValidComboText = currentText;
   TOOLINFOW tip{sizeof(TOOLINFOW)};
   tip.hwnd = g_hGui;
@@ -4639,9 +4675,8 @@ static bool CollectClientBrowserProfileLocations(
     return false;
   }
 
-  if (IsV2ClientContainer(clientRoot)) {
-    // Pure v2 clients have only nested browser profiles.
-  } else {
+  const bool isV2 = IsV2ClientContainer(clientRoot);
+  if (!isV2) {
     std::optional<BrowserKind> legacyBinding;
     if (!IsSafeHybridClientRoot(clientRoot, &legacyBinding))
       return false;
@@ -4655,7 +4690,7 @@ static bool CollectClientBrowserProfileLocations(
   if (browsersError)
     return false;
   if (!browsersExist)
-    return !locations.empty() || IsV2ClientContainer(clientRoot);
+    return !locations.empty() || isV2;
   try {
     for (const auto &entry : fs::directory_iterator(browsersRoot)) {
       const auto browser =
@@ -4673,7 +4708,8 @@ static bool CollectClientBrowserProfileLocations(
   } catch (...) {
     return false;
   }
-  return !locations.empty();
+  // A valid v2 client can own Notes before it has any browser slots.
+  return !locations.empty() || isV2;
 }
 
 static bool RemoveNestedCacheDirectory(const fs::path &profileRoot,
@@ -5621,6 +5657,8 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam,
       }
     } else if (wmId == IDOK) {
       g_bSuppressClientSelectionCommit = false;
+      if (!g_bUiEnabled || g_isLaunchInFlight.load())
+        return 0;
       if (g_iSelectedSessionTab > 0 &&
           g_iSelectedSessionTab <= (int)g_sessions.size()) {
         BringSessionToFront(g_sessions[g_iSelectedSessionTab - 1].pid);
@@ -5728,37 +5766,13 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam,
     } else if (wmId == IDM_ABOUT) {
       ShowAboutDialog();
     } else if (wmId == IDM_BROWSER_EDGE) {
-      const BrowserKind previousBrowser = g_selectedBrowser;
-      g_selectedBrowser = BrowserKind::Edge;
-      if (!SaveBrowserPreference())
-        g_selectedBrowser = previousBrowser;
-      UpdateRestoreTabsToggleState();
-      UpdateConfigMenuEnabledState();
-      InvalidateRect(g_hGui, &g_rcUtilityBar, TRUE);
+      SelectLauncherBrowser(BrowserKind::Edge);
     } else if (wmId == IDM_BROWSER_CHROME) {
-      const BrowserKind previousBrowser = g_selectedBrowser;
-      g_selectedBrowser = BrowserKind::Chrome;
-      if (!SaveBrowserPreference())
-        g_selectedBrowser = previousBrowser;
-      UpdateRestoreTabsToggleState();
-      UpdateConfigMenuEnabledState();
-      InvalidateRect(g_hGui, &g_rcUtilityBar, TRUE);
+      SelectLauncherBrowser(BrowserKind::Chrome);
     } else if (wmId == IDM_BROWSER_BRAVE) {
-      const BrowserKind previousBrowser = g_selectedBrowser;
-      g_selectedBrowser = BrowserKind::Brave;
-      if (!SaveBrowserPreference())
-        g_selectedBrowser = previousBrowser;
-      UpdateRestoreTabsToggleState();
-      UpdateConfigMenuEnabledState();
-      InvalidateRect(g_hGui, &g_rcUtilityBar, TRUE);
+      SelectLauncherBrowser(BrowserKind::Brave);
     } else if (wmId == IDM_BROWSER_FIREFOX) {
-      const BrowserKind previousBrowser = g_selectedBrowser;
-      g_selectedBrowser = BrowserKind::Firefox;
-      if (!SaveBrowserPreference())
-        g_selectedBrowser = previousBrowser;
-      UpdateRestoreTabsToggleState();
-      UpdateConfigMenuEnabledState();
-      InvalidateRect(g_hGui, &g_rcUtilityBar, TRUE);
+      SelectLauncherBrowser(BrowserKind::Firefox);
     } else {
     }
 
@@ -5780,14 +5794,20 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam,
                              point);
       return 0;
     }
-    if (HitTestSessionClose(hWnd, point) < 0) {
-      const int sessionTab = HitTestSessionTab(hWnd, point);
-      if (sessionTab > 0) {
-        StartMainDragCandidate(hWnd, MainDragKind::SessionTab, sessionTab,
-                               point);
-        return 0;
-      }
+    const int closeTab = HitTestSessionClose(hWnd, point);
+    if (closeTab > 0 && closeTab <= static_cast<int>(g_sessions.size())) {
+      g_sessionClosePressIdentity = g_sessions[closeTab - 1].identity;
+      SetCapture(hWnd);
+      return 0;
     }
+    g_mainControlPress = HitTestMainControl(hWnd, point);
+    if (g_mainControlPress != MainControlPress::None) {
+      SetCapture(hWnd);
+      return 0;
+    }
+    const int sessionTab = HitTestSessionTab(hWnd, point);
+    if (sessionTab > 0)
+      StartMainDragCandidate(hWnd, MainDragKind::SessionTab, sessionTab, point);
     return 0;
   }
   case WM_MOUSEMOVE: {
@@ -5811,50 +5831,76 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam,
     int x = (int)(short)LOWORD(lParam);
     int y = (int)(short)HIWORD(lParam);
     POINT pt{x, y};
+    const auto pressedControl = std::exchange(g_mainControlPress, MainControlPress::None);
+    if (pressedControl != MainControlPress::None) {
+      if (GetCapture() != hWnd)
+        return 0;
+      ReleaseCapture();
+      if (HitTestMainControl(hWnd, pt) != pressedControl)
+        return 0;
+      switch (pressedControl) {
+      case MainControlPress::NewTab:
+        SelectSessionTab(0, true);
+        break;
+      case MainControlPress::SessionOverflow:
+        ShowSessionOverflowMenu(hWnd);
+        break;
+      case MainControlPress::BrowserSelector:
+        if (const UINT command = ShowBrowserMenuFromSelector(hWnd); command && g_bUiEnabled)
+          SendMessageW(hWnd, WM_COMMAND, command, 0);
+        break;
+      case MainControlPress::PinnedOverflow:
+        ShowPinnedOverflowMenu(hWnd);
+        break;
+      case MainControlPress::None:
+        break;
+      }
+      return 0;
+    }
+    const uint64_t pressedSession =
+        std::exchange(g_sessionClosePressIdentity, 0);
+    if (pressedSession) {
+      if (GetCapture() != hWnd)
+        return 0;
+      ReleaseCapture();
+      const int closeTab = HitTestSessionClose(hWnd, pt);
+      if (closeTab > 0 && closeTab <= static_cast<int>(g_sessions.size()) &&
+          g_sessions[closeTab - 1].identity == pressedSession)
+        CloseSessionTab(closeTab);
+      return 0;
+    }
+    const uint64_t pressedShowSession =
+        g_mainDragKind == MainDragKind::SessionTab && GetCapture() == hWnd
+            ? g_mainDragSessionIdentity : 0;
+    const bool pressedPin = g_mainDragKind == MainDragKind::PinnedClient;
+    const int pressedPinIndex =
+        pressedPin && GetCapture() == hWnd ? g_iMainDragIndex : -1;
     if (FinishMainDrag(hWnd, pt))
       return 0;
-    const int iCloseTab = HitTestSessionClose(hWnd, pt);
-    if (iCloseTab > 0) {
-      CloseSessionTab(iCloseTab);
+    if (pressedPin) {
+      if (g_bUiEnabled && pressedPinIndex >= 0 &&
+          pressedPinIndex < static_cast<int>(g_pinnedClients.size()) &&
+          HitTestPinnedClient(pt) == pressedPinIndex)
+        OpenPinnedClient(g_pinnedClients[pressedPinIndex]);
       return 0;
     }
-    if (HitTestSessionOverflow(hWnd, pt)) {
-      ShowSessionOverflowMenu(hWnd);
+    if (HitTestSessionClose(hWnd, pt) > 0)
       return 0;
-    }
     const int iHitTab = HitTestSessionTab(hWnd, pt);
-    if (iHitTab >= 0) {
+    if (pressedShowSession && iHitTab > 0 &&
+        iHitTab <= static_cast<int>(g_sessions.size()) &&
+        g_sessions[iHitTab - 1].identity == pressedShowSession)
       SelectSessionTab(iHitTab, true);
-      return 0;
-    }
-    if (g_bUiEnabled && PtInRect(&g_rcBrowserSelector, pt)) {
-      const UINT command = ShowBrowserMenuFromSelector(hWnd);
-      if (command)
-        SendMessageW(hWnd, WM_COMMAND, command, 0);
-      return 0;
-    }
-    if (g_bUiEnabled && HitTestPinnedOverflow(pt)) {
-      ShowPinnedOverflowMenu(hWnd);
-      return 0;
-    }
-    const int pinnedClient = g_bUiEnabled ? HitTestPinnedClient(pt) : -1;
-    if (pinnedClient >= 0 && pinnedClient < (int)g_pinnedClients.size()) {
-      OpenPinnedClient(g_pinnedClients[pinnedClient]);
-      return 0;
-    }
     return 0;
   }
   case WM_CAPTURECHANGED:
-    if (g_mainDragKind != MainDragKind::None) {
-      const bool savePinnedOrder = g_bPinnedOrderChanged;
-      g_mainDragKind = MainDragKind::None;
-      g_iMainDragIndex = -1;
-      g_mainDragSessionIdentity = 0;
-      g_bMainDragActive = false;
-      g_bPinnedOrderChanged = false;
-      FinishPinnedDragPersistence(savePinnedOrder);
-    }
+    ClearMainPointerGesture();
     return 0;
+  case WM_CANCELMODE:
+    ClearMainPointerGesture();
+    if (GetCapture() == hWnd)
+      ReleaseCapture();
+    return DefWindowProcW(hWnd, message, wParam, lParam);
   case WM_RBUTTONUP: {
     POINT point{(int)(short)LOWORD(lParam), (int)(short)HIWORD(lParam)};
     if (!g_bUiEnabled)
@@ -6176,19 +6222,19 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam,
   case WM_TIMER:
     if (wParam == kCloseAllCheckTimer) {
       if (!g_bCloseAllClientsPending) return 0;
-      // A tracked process can precede its first browser window. Retry only
-      // requests that have never reached a window, within the original grace
-      // period. Never resend after a browser receives WM_CLOSE: its unsaved
-      // changes prompt and cancellation remain the user's decision.
-      std::erase_if(g_closeAllAwaitingWindows, [](const PendingClientClose &target) {
-        const bool tracked = std::ranges::any_of(g_sessions, [&target](const Session &session) {
-          return session.pid == target.pid;
+      if (GetTickCount64() < g_closeAllDeadline) {
+        // A tracked process can precede its first browser window. Retry only
+        // requests that have not reached a window within the grace period.
+        // A browser that received WM_CLOSE can still prompt or remain open.
+        std::erase_if(g_closeAllAwaitingWindows, [](const PendingClientClose &target) {
+          const bool tracked = std::ranges::any_of(g_sessions, [&target](const Session &session) {
+            return session.pid == target.pid;
+          });
+          return !tracked || WaitForSingleObject(target.process.get(),0) != WAIT_TIMEOUT ||
+                 RequestSessionCloseNormally(target.pid);
         });
-        return !tracked || WaitForSingleObject(target.process.get(),0) != WAIT_TIMEOUT ||
-               RequestSessionCloseNormally(target.pid);
-      });
-      if (g_bCloseAllClientsPending && GetTickCount64() < g_closeAllDeadline)
         return 0;
+      }
       KillTimer(hWnd, kCloseAllCheckTimer);
       g_closeAllAwaitingWindows.clear();
       g_bCloseAllClientsPending = false;
@@ -6274,12 +6320,12 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam,
     return 0;
   }
   case WM_QUERYENDSESSION:
-    if (!PrepareNotesForClientChange()) return FALSE;
     if (g_bCleanupBusy.load() || g_bClientNotesBusy.load()) {
       if (g_hCleanupScanDialog && IsWindow(g_hCleanupScanDialog))
         PostMessageW(g_hCleanupScanDialog, WM_CLOSE, 0, 0);
       return FALSE;
     }
+    if (!PrepareNotesForClientChange()) return FALSE;
     if (g_hQuickTourDialog && IsWindow(g_hQuickTourDialog))
       DismissQuickTour(false);
     return TRUE;
@@ -6434,27 +6480,33 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam,
 }
 
 void GuiProfOpen() {
-  SetUiState(false);
-  std::wstring clientName = GetSelectedClientNameSanitized(false);
+  const std::wstring clientName = GetSelectedClientNameSanitized(false);
   const BrowserKind browser = g_selectedBrowser;
   if (clientName.empty()) {
+    SetUiState(false);
     MessageBox(g_hGui, L"Please select or enter a valid client name.",
                L"Input Error", MB_OK | MB_ICONWARNING);
     SetUiState(true);
     return;
   }
 
-  {
-    std::lock_guard<std::mutex> lock(g_activeProfilesMutex);
-    if (g_activeProfiles.count(ClientBrowserKey{clientName, browser})) {
-      const std::wstring message = std::format(
-          L"This client is already open in {}.",
-          GetBrowserDisplayName(browser));
-      MessageBoxW(g_hGui, message.c_str(), L"Already Running",
-                  MB_OK | MB_ICONINFORMATION);
-      SetUiState(true);
+  if (const auto active = GetActiveProfile(clientName, browser)) {
+    const auto session = std::ranges::find_if(g_sessions, [&](const Session &item) {
+      return item.pid == active->pid && item.browser == browser &&
+             client_name_comparison::EqualIgnoringCase(item.clientName, clientName);
+    });
+    if (session != g_sessions.end()) {
+      SelectSessionTab(static_cast<int>(session - g_sessions.begin()) + 1, true);
       return;
     }
+
+    SetUiState(false);
+    const std::wstring message = std::format(
+        L"This client is already open in {}.", GetBrowserDisplayName(browser));
+    MessageBoxW(g_hGui, message.c_str(), L"Already Running",
+                MB_OK | MB_ICONINFORMATION);
+    SetUiState(true);
+    return;
   }
   LaunchProfileAsync(clientName, false, false, browser);
 }
@@ -7364,6 +7416,13 @@ static CtBackup::Result RunArchiveTaskWithProgress(
   MSG progressMessage{};
   while (PeekMessageW(&progressMessage, g_hGui, WM_APP_PROGRESS_SHOW,
                       WM_APP_PROGRESS_HIDE, PM_REMOVE)) {
+    // WM_QUIT is returned even outside the requested message range. A worker
+    // that is already complete can leave it here instead of in the wait pump.
+    if (progressMessage.message == WM_QUIT) {
+      repostQuit = true;
+      quitCode = static_cast<int>(progressMessage.wParam);
+      continue;
+    }
     TranslateMessage(&progressMessage);
     DispatchMessageW(&progressMessage);
   }
@@ -7381,14 +7440,33 @@ static CtBackup::Result RunArchiveTaskWithProgress(
 static std::wstring QuotePowerShellSingle(const std::wstring &value) {
   std::wstring out = L"'";
   for (wchar_t ch : value) {
-    if (ch == L'\'')
-      out += L"''";
-    else
+    // Windows PowerShell recognizes both straight and typographic single quotes.
+    if (ch == L'\'' || (ch >= L'\u2018' && ch <= L'\u201B'))
       out += ch;
+    out += ch;
   }
   out += L"'";
   return out;
 }
+
+class ScopedKernelHandle {
+public:
+  explicit ScopedKernelHandle(HANDLE value = INVALID_HANDLE_VALUE)
+      : value_(value) {}
+  ~ScopedKernelHandle() {
+    if (value_ != INVALID_HANDLE_VALUE && value_ != nullptr)
+      CloseHandle(value_);
+  }
+  ScopedKernelHandle(const ScopedKernelHandle &) = delete;
+  ScopedKernelHandle &operator=(const ScopedKernelHandle &) = delete;
+  HANDLE get() const { return value_; }
+  explicit operator bool() const {
+    return value_ != INVALID_HANDLE_VALUE && value_ != nullptr;
+  }
+
+private:
+  HANDLE value_ = INVALID_HANDLE_VALUE;
+};
 
 struct HiddenCommandResult {
   bool launched = false;
@@ -7485,6 +7563,20 @@ static CtBackup::Result ExtractLegacyZip(const fs::path &zipPath,
     return {HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND),
             L"The selected legacy ZIP backup does not exist."};
 
+  // Use the same read sharing as the extractor and keep the archive readable
+  // for its whole run. Surface Windows sharing errors before starting a child.
+  const ScopedKernelHandle archive(CreateFileW(
+      zipPath.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+      FILE_ATTRIBUTE_NORMAL, nullptr));
+  if (!archive) {
+    const DWORD error = GetLastError();
+    if (error == ERROR_SHARING_VIOLATION)
+      return {HRESULT_FROM_WIN32(error),
+              L"The selected legacy ZIP backup is in use by another process."};
+    return {HRESULT_FROM_WIN32(error),
+            L"The selected legacy ZIP backup could not be opened for reading."};
+  }
+
   std::vector<wchar_t> systemDirectory(32768, L'\0');
   const UINT length = GetSystemDirectoryW(
       systemDirectory.data(), static_cast<UINT>(systemDirectory.size()));
@@ -7523,7 +7615,7 @@ static CtBackup::Result ExtractLegacyZip(const fs::path &zipPath,
             L";$count=[int64]0;$bytes=[int64]0;"
             L"$seen=[Collections.Generic.HashSet[string]]::new("
             L"[StringComparer]::OrdinalIgnoreCase);"
-            L"$stream=[IO.File]::Open($archive,[IO.FileMode]::Open,"
+            L"try{$stream=[IO.File]::Open($archive,[IO.FileMode]::Open,"
             L"[IO.FileAccess]::Read,[IO.FileShare]::Read);"
             L"try{$zip=[IO.Compression.ZipArchive]::new("
             L"$stream,[IO.Compression.ZipArchiveMode]::Read,$true);"
@@ -7572,8 +7664,13 @@ static CtBackup::Result ExtractLegacyZip(const fs::path &zipPath,
             L"$required -gt ($drive.AvailableFreeSpace-$reserve)){"
             L"throw 'Insufficient disk space for safe ZIP staging.'};"
             L"Expand-Archive -LiteralPath $archive "
-            L"-DestinationPath $destination -Force;"
-            L"}finally{$stream.Dispose()};";
+            L"-DestinationPath ([System.Management.Automation.WildcardPattern]::Escape($destination)) -Force;"
+            L"}finally{$stream.Dispose()}}catch{"
+            L"for($cause=$_.Exception;$null -ne $cause;$cause=$cause.InnerException){"
+            L"if($cause.HResult -eq ";
+  // ZIP validation can wrap the underlying Windows read failure.
+  script += std::to_wstring(HRESULT_FROM_WIN32(ERROR_LOCK_VIOLATION));
+  script += L"){exit " + std::to_wstring(ERROR_LOCK_VIOLATION) + L"}};throw};";
   const std::wstring arguments =
       L"-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "
       L"\"" + script + L"\"";
@@ -7589,12 +7686,108 @@ static CtBackup::Result ExtractLegacyZip(const fs::path &zipPath,
     return {HRESULT_FROM_WIN32(commandResult.systemError),
             L"The legacy ZIP validation process could not be monitored "
             L"safely."};
+  if (commandResult.exitCode == ERROR_LOCK_VIOLATION)
+    return {HRESULT_FROM_WIN32(ERROR_LOCK_VIOLATION),
+            L"The legacy ZIP backup or a temporary restore file is in use. "
+            L"Close any program using it and try again."};
   if (commandResult.exitCode != 0)
     return {E_FAIL,
             std::format(
                 L"Legacy ZIP validation or extraction failed (exit code {}).",
                 commandResult.exitCode)};
   return {};
+}
+
+static std::string ReadSmallLegacyZipMarker(const fs::path &markerPath) {
+  if (!IsSafeExistingRegularFile(markerPath))
+    return {};
+
+  // The supported schema markers fit within this buffer. A larger file
+  // cannot be a match, and need not be read in full.
+  std::array<char, 64> bytes{};
+  std::ifstream marker(markerPath, std::ios::binary);
+  marker.read(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+  if (!marker.eof() || marker.bad())
+    return {};
+  return std::string(bytes.data(), static_cast<size_t>(marker.gcount()));
+}
+
+static bool IsFlatLegacySitesClient(const fs::path &clientRoot) {
+  const auto clientMarker = clientRoot / kClientSchemaMarkerName;
+  if (ReadSmallLegacyZipMarker(clientMarker) == kClientSchemaMarkerText)
+    return true;
+
+  // A Chromium legacy client has a real Default browser profile. Default is
+  // reserved as a client name, so this cannot be a valid Sites wrapper.
+  const auto defaultProfile = clientRoot / L"Default";
+  if (!IsSafeExistingDirectory(defaultProfile))
+    return false;
+  const auto bindingMarker = clientRoot / kLegacyBrowserBindingMarkerName;
+  const auto binding = ReadSmallLegacyZipMarker(bindingMarker);
+  for (BrowserKind browser : {BrowserKind::Edge, BrowserKind::Chrome,
+                              BrowserKind::Brave}) {
+    if (binding == GetLegacyBrowserBindingText(browser))
+      return true;
+  }
+
+  // Older profiles predate both markers. Require their normal Chromium
+  // profile files and actual marker absence before inferring the flat layout.
+  const auto markerMissing = [](const fs::path &path) {
+    if (GetFileAttributesW(path.c_str()) != INVALID_FILE_ATTRIBUTES)
+      return false;
+    const DWORD error = GetLastError();
+    return error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND;
+  };
+  return markerMissing(clientMarker) && markerMissing(bindingMarker) &&
+         IsSafeExistingRegularFile(defaultProfile / L"Preferences") &&
+         IsSafeExistingRegularFile(clientRoot / L"Local State");
+}
+
+static CtBackup::Result
+WrapFlatLegacyCollectionWithSitesClient(const fs::path &stagingRoot,
+                                        const fs::path &sitesPayload) {
+  // Temp is reserved as a client name. Assemble the wrapper there until the
+  // existing client named Sites has moved out of the way.
+  const auto wrapper = stagingRoot / L"Temp";
+  struct ClientMove {
+    fs::path source;
+    fs::path target;
+  };
+  std::vector<ClientMove> moves;
+  for (const auto &entry : fs::directory_iterator(stagingRoot)) {
+    const auto name = entry.path().filename();
+    if (!IsSafeExistingDirectory(entry.path()) ||
+        !CtBackup::Detail::IsValidClientDirectoryName(name.native()))
+      return {E_INVALIDARG, L"The legacy backup contains unexpected root data."};
+    moves.push_back({entry.path(), wrapper / name});
+  }
+
+  if (!CreateDirectoryW(wrapper.c_str(), nullptr))
+    return {HRESULT_FROM_WIN32(GetLastError()),
+            L"A temporary wrapper could not be created for the legacy client collection."};
+
+  size_t moved = 0;
+  for (; moved < moves.size(); ++moved) {
+    const auto &move = moves[moved];
+    if (!MoveFileExW(move.source.c_str(), move.target.c_str(), MOVEFILE_WRITE_THROUGH))
+      break;
+  }
+  if (moved == moves.size() &&
+      MoveFileExW(wrapper.c_str(), sitesPayload.c_str(), MOVEFILE_WRITE_THROUGH))
+    return {};
+
+  const DWORD error = GetLastError();
+  bool rolledBack = true;
+  while (moved != 0) {
+    const auto &move = moves[--moved];
+    if (!MoveFileExW(move.target.c_str(), move.source.c_str(), MOVEFILE_WRITE_THROUGH))
+      rolledBack = false;
+  }
+  if (rolledBack && RemoveDirectoryW(wrapper.c_str()))
+    return {HRESULT_FROM_WIN32(error),
+            L"The legacy client collection could not be wrapped. Its original staged layout was retained."};
+  return {HRESULT_FROM_WIN32(error),
+          L"The legacy client collection could not be wrapped or fully returned to its original staged layout. Extracted data may be under Temp in the staging folder."};
 }
 
 static CtBackup::Result
@@ -7615,11 +7808,16 @@ NormalizeLegacyZipStaging(const fs::path &stagingRoot,
           (payloadAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0)
         return {E_INVALIDARG,
                 L"The legacy backup contains an invalid Sites entry."};
-      for (const fs::directory_entry &entry :
-           fs::directory_iterator(stagingRoot)) {
-        if (_wcsicmp(entry.path().filename().c_str(), L"Sites") != 0)
-          return {E_INVALIDARG,
-                  L"The legacy backup contains unexpected root data."};
+      if (IsFlatLegacySitesClient(sitesPayload)) {
+        const auto wrapped = WrapFlatLegacyCollectionWithSitesClient(stagingRoot, sitesPayload);
+        if (!wrapped.ok()) return wrapped;
+      } else {
+        for (const fs::directory_entry &entry :
+             fs::directory_iterator(stagingRoot)) {
+          if (_wcsicmp(entry.path().filename().c_str(), L"Sites") != 0)
+            return {E_INVALIDARG,
+                    L"The legacy backup contains unexpected root data."};
+        }
       }
     } else {
       std::vector<fs::path> rootEntries;
@@ -7669,12 +7867,46 @@ NormalizeLegacyZipStaging(const fs::path &stagingRoot,
 }
 
 static fs::path UniqueRecoveryPath(const fs::path &dataDir,
-                                   const std::wstring &timestamp) {
-  fs::path candidate = dataDir / (L"Sites_PreRestore_" + timestamp);
-  for (unsigned suffix = 2; fs::exists(candidate); ++suffix)
-    candidate = dataDir /
-                std::format(L"Sites_PreRestore_{}-{}", timestamp, suffix);
-  return candidate;
+                                   const std::wstring &timestamp,
+                                   DWORD *failure = nullptr) {
+  if (failure) *failure = ERROR_SUCCESS;
+  const auto fail = [&](DWORD error) {
+    if (failure) *failure = error ? error : ERROR_GEN_FAILURE;
+    return fs::path{};
+  };
+  // Nothing is precreated here. CommitStagedRestore pins the parents and uses
+  // a no-replace handle rename, so a later collision still fails safely.
+  try {
+    if (dataDir.empty() || !dataDir.is_absolute())
+      return fail(ERROR_INVALID_PARAMETER);
+    // Keep the sibling name as short as Sites: moving an otherwise valid
+    // collection into recovery must not lengthen any of its existing paths.
+    // The timestamp only chooses a starting slot in the bounded namespace;
+    // every returned name must still be inspected and absent.
+    uint32_t hash = 2166136261u;
+    for (const wchar_t character : timestamp) {
+      hash ^= static_cast<uint32_t>(character);
+      hash *= 16777619u;
+    }
+    constexpr uint32_t slots = 1u << 16;
+    for (uint32_t attempt = 0; attempt < slots; ++attempt) {
+      const auto name = std::format(L"R{:04X}", (hash + attempt) & (slots - 1));
+      const fs::path candidate = dataDir / name;
+      // Attributes describe the link itself, so even a dangling reparse entry
+      // occupies its name. An unreadable/missing parent is never free space.
+      if (GetFileAttributesW(candidate.c_str()) != INVALID_FILE_ATTRIBUTES)
+        continue;
+      const DWORD error = GetLastError();
+      if (error == ERROR_FILE_NOT_FOUND)
+        return candidate;
+      return fail(error);
+    }
+    return fail(ERROR_ALREADY_EXISTS);
+  } catch (const std::bad_alloc &) {
+    return fail(ERROR_NOT_ENOUGH_MEMORY);
+  } catch (...) {
+    return fail(ERROR_GEN_FAILURE);
+  }
 }
 
 static std::wstring ArchiveFailureMessage(const wchar_t *heading,
@@ -7688,6 +7920,11 @@ static std::wstring ArchiveFailureMessage(const wchar_t *heading,
 }
 
 void GuiProfExportAll() {
+  // A popup or queued command can outlive the enabled state that opened it.
+  // Do not admit an archive task while a launch or other client task owns it.
+  if (!g_bUiEnabled || g_isLaunchInFlight.load() || g_bDefaultProfileUiBusy ||
+      g_bCleanupBusy.load() || g_bCloseAllClientsPending)
+    return;
   // Progress and file-picker message loops must not start a second backup or
   // mutate the client tree. Notes remains usable until the final snapshot.
   if (g_bClientNotesBusy.exchange(true))
@@ -7765,8 +8002,6 @@ void GuiProfExportAll() {
                 L"Backup Cancelled", MB_OK | MB_ICONWARNING);
     return false;
   };
-  if (!flushNotes())
-    return;
   CtBackup::BackupOptions backupOptions;
   backupOptions.selectedClientNames = *selectedClients;
   const auto profileCount = selectedClients->size();
@@ -7797,8 +8032,33 @@ void GuiProfExportAll() {
 
   if (GetSaveFileNameW(&ofn)) {
     fs::path destPath(ofn.lpstrFile);
-    // The picker can pump Notes edits/autosave. Flush again with interaction
-    // disabled, then hold the stable notebook through compression and CRC.
+    const auto destinationCheck =
+        CtBackup::ValidateBackupDestination(sourceDir, destPath);
+    if (!destinationCheck.ok()) {
+      const auto message =
+          ArchiveFailureMessage(L"The backup could not be created.", destinationCheck);
+      MessageBoxW(g_hGui, message.c_str(), L"Back Up Data", MB_OK | MB_ICONERROR);
+      return;
+    }
+    const auto recheckSelectedBrowsers = [&]() {
+      profileUseError.clear();
+      if (ProbeBackupSelectionClosed(*selectedClients,profileUseError))
+        return true;
+      MessageBoxW(
+          g_hGui,
+          (L"A selected client's browser began using its profile or could not be "
+           L"reverified after the backup location was selected. No backup was "
+           L"created.\n\n" + profileUseError).c_str(),
+          L"Backup Cancelled", MB_OK | MB_ICONWARNING);
+      return false;
+    };
+    // A browser may open while the picker is up. If backup would flush an
+    // open notebook, check again before changing the editor or its saved data.
+    if (FindSelectedClientNotesForBackup(*selectedClients) &&
+        !recheckSelectedBrowsers())
+      return;
+    // Wait for a confirmed destination before saving or closing Notes panels.
+    // The picker can pump edits, so freeze interaction before taking the snapshot.
     if (!uiGuard.FreezeNotes()) {
       MessageBoxW(g_hGui,
                   L"The open Notes windows could not be paused safely. "
@@ -7808,19 +8068,8 @@ void GuiProfExportAll() {
     }
     if (!flushNotes())
       return;
-    profileUseError.clear();
-    if (!ProbeBackupSelectionClosed(*selectedClients,profileUseError)) {
-      MessageBoxW(
-          g_hGui,
-          (L"A selected client's browser began using its profile or could not be "
-           L"reverified after the backup location was selected. No backup was "
-           L"created.\n\n" +
-           profileUseError)
-              .c_str(),
-          L"Backup Cancelled", MB_OK | MB_ICONWARNING);
-      SetUiState(true);
+    if (!recheckSelectedBrowsers())
       return;
-    }
     const CtBackup::Result result = RunArchiveTaskWithProgress(
         L"Preparing backup...", [&](auto &context) {
           auto operationOptions=backupOptions;
@@ -7831,11 +8080,13 @@ void GuiProfExportAll() {
               nullptr,operationOptions);
         });
     if (result.ok()) {
-      const std::wstring message =
+      std::wstring message =
           std::format(L"Backup complete and verified.\n\n{} client profile{} "
                       L"saved to:\n{}",
                       profileCount, profileCount == 1 ? L" was" : L"s were",
                       destPath.wstring());
+      if (!result.details.empty())
+        message.append(L"\n\n").append(result.details);
       MessageBox(g_hGui, message.c_str(), L"Backup Complete",
                  MB_OK | MB_ICONINFORMATION);
     } else {
@@ -7853,11 +8104,14 @@ extern BOOL CtSpacesRestoreGuiTestPickArchive(OPENFILENAMEW *picker);
 extern std::wstring CtSpacesRestoreGuiTestStageSuffix(unsigned attempt);
 extern CtBackup::Result CtSpacesRestoreGuiTestRunStage(
     const std::function<CtBackup::Result(_7zUiCtx &)> &operation);
+extern CtBackup::Result CtSpacesRestoreGuiTestRunCommit(
+    const std::function<CtBackup::Result(_7zUiCtx &)> &operation);
 extern void CtSpacesRestoreGuiTestAfterStage(CtBackup::StagedRestore &staged);
 extern void CtSpacesRestoreGuiTestBeforeCommitGuard();
 #endif
 
-static CtBackup::Result CreateRestoreStagingDirectory(fs::path &staging) {
+static CtBackup::Result CreateRestoreStagingDirectory(
+    fs::path &staging, std::optional<ScopedKernelHandle> &reservation) {
   staging.clear();
   try {
     fs::create_directories(g_sDataDir);
@@ -7876,6 +8130,13 @@ static CtBackup::Result CreateRestoreStagingDirectory(fs::path &staging) {
       const fs::path candidate = g_sDataDir / (L"Restore_Temp_" + suffix);
       if (CreateDirectoryW(candidate.c_str(), nullptr)) {
         staging = candidate;
+        // Keep the new directory identifiable without blocking the archive
+        // worker's extraction, rename, or cleanup handles.
+        reservation.emplace(CreateFileW(
+            staging.c_str(), FILE_READ_ATTRIBUTES,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+            OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+            nullptr));
         return {};
       }
       const DWORD error = GetLastError();
@@ -7888,7 +8149,34 @@ static CtBackup::Result CreateRestoreStagingDirectory(fs::path &staging) {
   }
 }
 
+static void RemoveEmptyRestoreReservation(const fs::path &path, HANDLE reserved) {
+  BY_HANDLE_FILE_INFORMATION before{}, after{};
+  if (!GetFileInformationByHandle(reserved, &before) ||
+      (before.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) !=
+          FILE_ATTRIBUTE_DIRECTORY)
+    return;
+  const ScopedKernelHandle current(CreateFileW(
+      path.c_str(), DELETE, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+      nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+      nullptr));
+  if (!current || !GetFileInformationByHandle(current.get(), &after) ||
+      (after.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) !=
+          FILE_ATTRIBUTE_DIRECTORY ||
+      before.dwVolumeSerialNumber != after.dwVolumeSerialNumber ||
+      before.nFileIndexHigh != after.nFileIndexHigh || before.nFileIndexLow != after.nFileIndexLow)
+    return;
+  // Windows atomically refuses to remove a nonempty directory. Keep all
+  // retained extraction output and never delete an object by pathname alone.
+  FILE_DISPOSITION_INFO disposition{TRUE};
+  SetFileInformationByHandle(current.get(), FileDispositionInfo, &disposition,
+                             sizeof(disposition));
+}
+
 void GuiProfRestoreAll() {
+  // Recheck at command execution, including commands queued before a launch.
+  if (!g_bUiEnabled || g_isLaunchInFlight.load() || g_bDefaultProfileUiBusy ||
+      g_bCleanupBusy.load() || g_bCloseAllClientsPending)
+    return;
   if (g_bClientNotesBusy.exchange(true))
     return;
   struct RestoreUiGuard {
@@ -7906,7 +8194,6 @@ void GuiProfRestoreAll() {
       }
     }
   } uiGuard;
-  if (!PrepareNotesForClientChange()) return;
   SetUiState(false);
 
   std::wstring profileUseError;
@@ -7995,9 +8282,21 @@ void GuiProfRestoreAll() {
   const std::wstring stamp = GetBackupTimestamp();
   fs::path tempDir;
   const fs::path sitesDir = g_sDataDir / "Sites";
-  const fs::path backupDir = UniqueRecoveryPath(g_sDataDir, stamp);
+  DWORD recoveryPathError = ERROR_SUCCESS;
+  const fs::path backupDir = UniqueRecoveryPath(g_sDataDir, stamp, &recoveryPathError);
+  if (backupDir.empty()) {
+    const CtBackup::Result failure{
+        HRESULT_FROM_WIN32(recoveryPathError ? recoveryPathError : ERROR_GEN_FAILURE),
+        L"A safe pre-restore recovery location could not be selected. "
+        L"Current profile data was left unchanged."};
+    MessageBoxW(g_hGui, ArchiveFailureMessage(L"The restore could not start.", failure).c_str(),
+                L"Restore Data", MB_OK | MB_ICONERROR);
+    SetUiState(true);
+    return;
+  }
 
-  const CtBackup::Result reservation = CreateRestoreStagingDirectory(tempDir);
+  std::optional<ScopedKernelHandle> stageReservation;
+  const CtBackup::Result reservation = CreateRestoreStagingDirectory(tempDir, stageReservation);
   if (!reservation.ok()) {
     MessageBox(g_hGui, ArchiveFailureMessage(L"A restore staging folder could not be reserved.", reservation).c_str(), L"Restore Data",
                MB_OK | MB_ICONERROR);
@@ -8023,6 +8322,10 @@ void GuiProfRestoreAll() {
       legacyZip ? L"Reading older ZIP backup..." : L"Validating and staging backup...", stageOperation);
 #endif
 
+  if (!stageResult.ok() && stageReservation && *stageReservation)
+    RemoveEmptyRestoreReservation(tempDir, stageReservation->get());
+  // A directory marked for deletion disappears when its last handle closes.
+  stageReservation.reset();
   if (!stageResult.ok()) {
     std::wstring message = ArchiveFailureMessage(
         L"The selected backup could not be restored.", stageResult);
@@ -8053,6 +8356,18 @@ void GuiProfRestoreAll() {
     return;
   }
 
+  // Staging reads a separate tree. Keep the editor and its Undo available
+  // until a verified replacement is ready, then save before moving Sites.
+  if (!PrepareNotesForClientChange()) {
+    const std::wstring message =
+        L"Save or recover the open notes before restoring. "
+        L"Current profile data was left unchanged.\n\n"
+        L"The verified staging data was retained here:\n" + tempDir.wstring();
+    MessageBoxW(g_hGui, message.c_str(), L"Restore Cancelled",
+                MB_OK | MB_ICONWARNING);
+    return;
+  }
+
   const auto finalRestoreCommitGuard =
       [](void *, std::wstring &failureDetails) -> bool {
 #ifdef CTSPACES_RESTORE_GUI_TEST_HOOKS
@@ -8071,14 +8386,28 @@ void GuiProfRestoreAll() {
       failureDetails += L"\n\n" + finalProfileUseError;
     return false;
   };
-  const CtBackup::Result commitResult = CtBackup::CommitStagedRestore(
-      stagedRestore, sitesDir, backupDir, finalRestoreCommitGuard, nullptr);
+  // Full-content rechecks can read a large payload several times. Keep the
+  // launcher pumping messages while the same guarded transaction verifies and
+  // promotes its bound objects. UI refreshes remain below, after worker join.
+  bool previousCollectionInRecovery = false;
+  const auto commitOperation = [&](auto &) {
+    return CtBackup::CommitStagedRestore(
+        stagedRestore, sitesDir, backupDir, finalRestoreCommitGuard, nullptr,
+        &previousCollectionInRecovery);
+  };
+#ifdef CTSPACES_RESTORE_GUI_TEST_HOOKS
+  const CtBackup::Result commitResult =
+      CtSpacesRestoreGuiTestRunCommit(commitOperation);
+#else
+  const CtBackup::Result commitResult = RunArchiveTaskWithProgress(
+      L"Verifying and installing restored data...", commitOperation);
+#endif
   if (!commitResult.ok()) {
     std::wstring message = ArchiveFailureMessage(
         L"The restored data could not be installed. No retained staging or recovery data was deleted.",
         commitResult);
     message += L"\n\nRestore staging location:\n" + tempDir.wstring();
-    if (GetFileAttributesW(backupDir.c_str()) != INVALID_FILE_ATTRIBUTES)
+    if (previousCollectionInRecovery)
       message += L"\n\nRetained recovery location:\n" + backupDir.wstring();
     MessageBox(g_hGui, message.c_str(), L"Restore Data",
                MB_OK | MB_ICONERROR);
@@ -8086,6 +8415,13 @@ void GuiProfRestoreAll() {
     return;
   }
 
+  // Restored icons can have new contents with the same size and write time.
+  // RefreshIconCacheSource will retire the old handles when each cache is used.
+  {
+    std::lock_guard<std::mutex> cacheLock(g_iconCacheMutex);
+    for (auto &entry : g_iconCache)
+      entry.second.sourceInitialized = false;
+  }
   UpdateClientsComboBox();
   UpdatePinButtonState();
   SendMessageW(g_hComboClient, CB_SETCURSEL, (WPARAM)-1, 0);
@@ -8099,7 +8435,7 @@ void GuiProfRestoreAll() {
       legacyZip ? L" from a legacy ZIP backup" : L" from a verified backup");
   if (!commitResult.details.empty())
     msg += L"\n\n" + commitResult.details;
-  if (fs::exists(backupDir))
+  if (previousCollectionInRecovery)
     msg += L"\n\nYour previous profile data was kept here:\n" +
            backupDir.wstring();
   MessageBox(g_hGui, msg.c_str(), L"Restore Data", MB_OK | MB_ICONINFORMATION);
@@ -8499,7 +8835,9 @@ static ProfileUseState ProbeAnySitesProfileInUse(std::wstring &errorDetails) {
   errorDetails.clear();
   {
     std::lock_guard<std::mutex> lock(g_activeProfilesMutex);
-    if (!g_activeProfiles.empty()) {
+    if (std::ranges::any_of(g_activeProfiles, [](const auto &active) {
+          return active.second.type == ProfileType::Standard;
+        })) {
       errorDetails = L"ctSpaces is still tracking one or more open browsers.";
       return ProfileUseState::InUse;
     }
@@ -10461,13 +10799,39 @@ static bool ShouldRestoreTabsForClient(const std::wstring &clientName,
   return !ContainsClientName(g_clientsWithoutTabRestore, preferenceKey);
 }
 
+static bool HasExistingBrowserSlot(const std::wstring &clientName,
+                                   BrowserKind browser) {
+  try {
+    fs::path clientRoot;
+    if (!TryGetSafeClientProfilePath(clientName, clientRoot) ||
+        !IsSafeExistingDirectory(clientRoot))
+      return false;
+
+    if (!IsV2ClientContainer(clientRoot)) {
+      std::optional<BrowserKind> binding;
+      if (!IsSafeHybridClientRoot(clientRoot, &binding))
+        return false;
+      // The first Chromium choice uses the existing legacy profile in place.
+      if (IsChromiumBrowser(browser) && (!binding || *binding == browser))
+        return true;
+    }
+
+    fs::path slotRoot;
+    fs::path profileRoot;
+    return GetNestedBrowserSlotPaths(clientRoot, browser, slotRoot, profileRoot) &&
+           IsValidBrowserSlot(slotRoot, profileRoot, browser);
+  } catch (...) {
+    return false;
+  }
+}
+
 static void UpdateRestoreTabsToggleState() {
   if (!g_hBtnRestoreTabs)
     return;
 
   const std::wstring clientName = GetSelectedClientNameSanitized(false);
   const BrowserKind browser = GetBrowserForCurrentSelection();
-  g_bRestoreTabsToggleAvailable = IsExistingClientProfile(clientName);
+  g_bRestoreTabsToggleAvailable = HasExistingBrowserSlot(clientName, browser);
   g_bRestoreTabsForSelection =
       g_bRestoreTabsToggleAvailable &&
       ShouldRestoreTabsForClient(clientName, browser);
@@ -10480,7 +10844,7 @@ static void UpdateRestoreTabsToggleState() {
 static void ToggleRestoreTabsForSelectedClient() {
   const std::wstring clientName = GetSelectedClientNameSanitized(false);
   const BrowserKind browser = GetBrowserForCurrentSelection();
-  if (!IsExistingClientProfile(clientName))
+  if (!g_bUiEnabled || !HasExistingBrowserSlot(clientName, browser))
     return;
   const std::wstring preferenceKey =
       MakeClientBrowserPreferenceKey(clientName, browser);
@@ -10920,25 +11284,6 @@ struct SafeRegularFileSignature {
   DWORD fileSizeLow = 0;
   FILETIME creationTime{};
   FILETIME lastWriteTime{};
-};
-
-class ScopedKernelHandle {
-public:
-  explicit ScopedKernelHandle(HANDLE value = INVALID_HANDLE_VALUE)
-      : value_(value) {}
-  ~ScopedKernelHandle() {
-    if (value_ != INVALID_HANDLE_VALUE && value_ != nullptr)
-      CloseHandle(value_);
-  }
-  ScopedKernelHandle(const ScopedKernelHandle &) = delete;
-  ScopedKernelHandle &operator=(const ScopedKernelHandle &) = delete;
-  HANDLE get() const { return value_; }
-  explicit operator bool() const {
-    return value_ != INVALID_HANDLE_VALUE && value_ != nullptr;
-  }
-
-private:
-  HANDLE value_ = INVALID_HANDLE_VALUE;
 };
 
 static bool SameSafeRegularFileSignature(
@@ -12000,7 +12345,6 @@ static bool RenameClientProfile(const std::wstring &oldName,
     errorMessage = L"The original client directory could not be pinned safely.\n\n" + errorMessage;
     return false;
   }
-  if (!PrepareNotesForClientChange(oldName)) { errorMessage = L"Save or recover the open notes before renaming this client."; return false; }
   if (!IsExistingClientProfile(oldName)) {
     errorMessage = L"Select an existing client first.";
     return false;
@@ -12082,6 +12426,10 @@ static bool RenameClientProfile(const std::wstring &oldName,
     }
   }
 
+  if (!PrepareNotesForClientChange(oldName)) {
+    errorMessage = L"Save or recover the open notes before renaming this client.";
+    return false;
+  }
   profileUseError.clear();
   if (ProbeClientProfilesInUse(oldName, profileUseError) !=
       ProfileUseState::NotInUse) {
@@ -13000,6 +13348,13 @@ void SetUiState(bool enabled) {
             !g_bClientNotesBusy.load() && !g_bCloseAllClientsPending &&
             !g_bExitWhenProfilesClose;
   g_bUiEnabled = enabled;
+  if (!enabled && (g_mainControlPress != MainControlPress::None ||
+                   g_sessionClosePressIdentity ||
+                   g_mainDragKind != MainDragKind::None)) {
+    ClearMainPointerGesture();
+    if (g_hGui && GetCapture() == g_hGui)
+      ReleaseCapture();
+  }
   EnableWindow(g_hComboClient, enabled);
   EnableWindow(g_hClientEdit, enabled);
   EnableWindow(g_hBtnClientIcon, enabled);
@@ -16393,10 +16748,18 @@ bool chkUpdate() {
     return true;
   }
 
-  std::wstring currentVersion = GetExeVersion(currentExePath);
-  std::wstring installedVersion = GetExeVersion(installedExePath);
-  const int versionCompare = CompareExeVersions(currentVersion, installedVersion);
-  const bool correctedVersionUpdate =
+  const std::wstring currentVersion = GetExeVersion(currentExePath);
+  if (currentVersion.empty()) {
+    return MessageBoxW(NULL,
+                       L"The version of this copy could not be read.\n\n"
+                       L"Run this copy once without replacing the installed copy?",
+                       L"Run Once", MB_YESNO | MB_ICONQUESTION) == IDYES;
+  }
+  const std::wstring installedVersion = GetExeVersion(installedExePath);
+  const bool installedVersionKnown = !installedVersion.empty();
+  const int versionCompare = installedVersionKnown
+      ? CompareExeVersions(currentVersion, installedVersion) : 0;
+  const bool correctedVersionUpdate = installedVersionKnown &&
       IsCorrectedVersionNumberingUpdate(currentVersion, installedVersion);
 
   if (versionCompare > 0 || correctedVersionUpdate) {
@@ -16441,11 +16804,11 @@ bool chkUpdate() {
       }
     }
   } else if (versionCompare == 0) {
-    std::wstring prompt = std::format(
-        L"This copy is not the installed executable, but both report version "
-        L"{}.\n\nReplace the installed copy with this build and relaunch from "
-        L"there?",
-        currentVersion.empty() ? L"unknown" : currentVersion);
+    const std::wstring versionDetails = installedVersionKnown
+        ? std::format(L"This copy is not the installed executable, but both report version {}.", currentVersion)
+        : std::format(L"The installed copy's version could not be read.\n\nThis copy: {}", currentVersion);
+    const std::wstring prompt = versionDetails +
+        L"\n\nReplace the installed copy with this build and relaunch from there?";
     if (MessageBox(NULL, prompt.c_str(), L"Replace Installed Copy",
                    MB_YESNO | MB_ICONQUESTION) == IDYES) {
       if (!CopyCurrentBuildToInstalled(currentExePath, installedExePath)) {
@@ -17877,6 +18240,7 @@ struct ClientNotesDialogState {
   HWND panel = nullptr;
   HWND formatSurface = nullptr;
   bool formatVisible = false, formatExplicit = false, formatDismissed = false;
+  bool formatExpanded = false;
   bool problemVisible = false;
   CHARRANGE dismissedFormatRange{};
   DWORD formatEffects = 0;
@@ -17937,6 +18301,7 @@ static bool NotesEditorMatchesActive(const ClientNotesDialogState &state) {
       state.attachedPageId == state.pages[state.activePage].id;
 }
 static bool NotesWorkspaceCommand(HWND dialog, ClientNotesDialogState &state, UINT command);
+static void NotesCloseTabAt(HWND dialog, ClientNotesDialogState &state, size_t index);
 static void NotesCharacterFormat(HWND dialog, ClientNotesDialogState &state, DWORD mask,
     DWORD effect, COLORREF color = 0, LONG height = 0,bool collectLinkEdit=true);
 static bool NotesListKey(HWND edit, UINT message, WPARAM key);
@@ -17944,7 +18309,10 @@ static void RefreshNotesTabs(HWND dialog, ClientNotesDialogState &state);
 static bool LoadNotesPage(HWND dialog, ClientNotesDialogState &state);
 static void LayoutClientNotes(HWND dialog, UINT dpi);
 static int NotesFindHeight(const ClientNotesDialogState &state);
+static void LayoutNotesFindPanel(HWND dialog, ClientNotesDialogState &state,
+    int left, int top, int available, UINT dpi);
 static void NotesFindChanged(HWND dialog, ClientNotesDialogState &state);
+static void NotesFindRefresh(HWND dialog, ClientNotesDialogState &state);
 static void NotesApplyWordWrap(HWND edit, bool enabled);
 static void NotesCheckSpelling(HWND dialog, ClientNotesDialogState &state);
 static void NotesRememberView(HWND dialog, ClientNotesDialogState &state);
@@ -17965,14 +18333,16 @@ static constexpr const wchar_t *kNotesHandledTableTab=L"ctSpaces.notes.handled-t
 // RichEdit only while the user needs formatting; it never changes document size.
 static constexpr UINT_PTR kNotesFormatTimer = 3;
 static bool IsNotesFormatControl(int id) {
-  return (id >= IDC_NOTES_STYLE && id <= IDC_NOTES_CLEAR) || id == IDC_NOTES_HIGHLIGHT_COLOR;
+  return (id >= IDC_NOTES_STYLE && id <= IDC_NOTES_CLEAR) ||
+      id == IDC_NOTES_HIGHLIGHT_COLOR || id == IDC_NOTES_FORMAT_MORE;
 }
 static bool NotesFormatOwnsFocus(HWND dialog, HWND focus) {
   for (int id = IDC_NOTES_STYLE; id <= IDC_NOTES_CLEAR; ++id) {
     const HWND control = GetDlgItem(dialog,id);
     if (control && (focus == control || IsChild(control,focus))) return true;
   }
-  return focus && focus == GetDlgItem(dialog,IDC_NOTES_HIGHLIGHT_COLOR);
+  return focus && (focus == GetDlgItem(dialog,IDC_NOTES_HIGHLIGHT_COLOR) ||
+      focus == GetDlgItem(dialog,IDC_NOTES_FORMAT_MORE));
 }
 static void HideNotesFormat(HWND dialog, ClientNotesDialogState &state, bool dismiss = true) {
   KillTimer(dialog,kNotesFormatTimer);
@@ -17982,10 +18352,12 @@ static void HideNotesFormat(HWND dialog, ClientNotesDialogState &state, bool dis
     state.formatDismissed = true;
   }
   state.formatVisible = state.formatExplicit = false;
+  state.formatExpanded = false;
   InvalidateRect(GetDlgItem(dialog,IDC_NOTES_FORMAT),nullptr,FALSE);
   for (int id = IDC_NOTES_STYLE; id <= IDC_NOTES_CLEAR; ++id)
     ShowWindow(GetDlgItem(dialog,id),SW_HIDE);
   ShowWindow(GetDlgItem(dialog,IDC_NOTES_HIGHLIGHT_COLOR),SW_HIDE);
+  ShowWindow(GetDlgItem(dialog,IDC_NOTES_FORMAT_MORE),SW_HIDE);
   if (state.formatSurface) ShowWindow(state.formatSurface,SW_HIDE);
 }
 static LRESULT CALLBACK NotesFormatSurfaceSubclass(HWND surface, UINT message,
@@ -18002,14 +18374,7 @@ static LRESULT CALLBACK NotesFormatSurfaceSubclass(HWND surface, UINT message,
       FillRect(dc,&area,reinterpret_cast<HBRUSH>(GetStockObject(DC_BRUSH)));
       const UINT dpi=GetDpiForWindow(surface);
       DrawNotesSurface(dc,area,NotesControlColor(),NotesBorder(),dpi,5);
-      SetDCBrushColor(dc,NotesBorder());
-      for (int control : {IDC_NOTES_BOLD,IDC_NOTES_BULLETS,IDC_NOTES_LINK,IDC_NOTES_UNDO,IDC_NOTES_CLEAR}) {
-        RECT bounds{};GetWindowRect(GetDlgItem(GetParent(surface),control),&bounds);
-        MapWindowPoints(nullptr,surface,reinterpret_cast<POINT *>(&bounds),2);
-        RECT divider{bounds.left-ScaleByDpi(6,dpi),bounds.top+ScaleByDpi(4,dpi),
-            bounds.left-ScaleByDpi(6,dpi)+1,bounds.bottom-ScaleByDpi(4,dpi)};
-        FillRect(dc,&divider,reinterpret_cast<HBRUSH>(GetStockObject(DC_BRUSH)));
-      }
+
     }
     if (message == WM_PAINT) EndPaint(surface,&paint);
     return 0;
@@ -18031,18 +18396,37 @@ static void PositionNotesFormat(HWND dialog, ClientNotesDialogState &state, UINT
   if (!state.formatExplicit && !visible(first) && !visible(last)) {HideNotesFormat(dialog,state);return;}
   POINT anchor=visible(first) ? first : visible(last) ? last : POINT{text.left,text.top};
   MapWindowPoints(edit,dialog,&anchor,1);
-  int width=16;
-  for (const auto [id,w] : {std::pair{IDC_NOTES_STYLE,132},{IDC_NOTES_SIZE,54},
-      {IDC_NOTES_BOLD,32},{IDC_NOTES_ITALIC,32},{IDC_NOTES_UNDERLINE,32},
-      {IDC_NOTES_HIGHLIGHT,48},{IDC_NOTES_BULLETS,32},{IDC_NOTES_NUMBERS,32},
-      {IDC_NOTES_CHECKLIST,32},{IDC_NOTES_LINK,32},{IDC_NOTES_UNDO,32},
-      {IDC_NOTES_REDO,32},{IDC_NOTES_CLEAR,32}}) {
-    width+=w+4;
-    if (id==IDC_NOTES_BOLD || id==IDC_NOTES_BULLETS || id==IDC_NOTES_LINK ||
-        id==IDC_NOTES_UNDO || id==IDC_NOTES_CLEAR) width+=8;
+  // A short first row covers everyday formatting. More reveals the remaining
+  // existing controls without adding permanent chrome or changing the document.
+  const int inset=ScaleByDpi(6,dpi), pad=ScaleByDpi(8,dpi);
+  if(editor.right-editor.left < ScaleByDpi(144,dpi)) {
+    HideNotesFormat(dialog,state,false);return;
   }
-  width=ScaleByDpi(width-4,dpi);
-  const int height=ScaleByDpi(48,dpi), inset=ScaleByDpi(6,dpi);
+  const int width=(std::min)(ScaleByDpi(428,dpi),
+      (std::max)(ScaleByDpi(132,dpi),static_cast<int>(editor.right-editor.left)-inset*2));
+  const int rowStep=ScaleByDpi(34,dpi), controlHeight=ScaleByDpi(28,dpi);
+  struct FormatCell {int id,x,y,width;};
+  std::vector<FormatCell> cells;
+  int cellX=pad,row=0;
+  const auto addCell=[&](int id,int logicalWidth) {
+    const int cellWidth=(std::min)(ScaleByDpi(logicalWidth,dpi),width-pad*2);
+    if(cellX>pad && cellX+cellWidth>width-pad) {cellX=pad;++row;}
+    cells.push_back({id,cellX,ScaleByDpi(6,dpi)+row*rowStep,cellWidth});
+    cellX+=cellWidth+ScaleByDpi(4,dpi);
+  };
+  for(const auto [id,w]:{std::pair{IDC_NOTES_STYLE,116},{IDC_NOTES_BOLD,28},
+      {IDC_NOTES_ITALIC,28},{IDC_NOTES_UNDERLINE,28},{IDC_NOTES_HIGHLIGHT,44},
+      {IDC_NOTES_BULLETS,28},{IDC_NOTES_CHECKLIST,28},{IDC_NOTES_LINK,28},
+      {IDC_NOTES_FORMAT_MORE,52}}) addCell(id,w);
+  if(state.formatExpanded) {
+    cellX=pad;++row;
+    for(const auto [id,w]:{std::pair{IDC_NOTES_SIZE,60},{IDC_NOTES_NUMBERS,28},
+        {IDC_NOTES_UNDO,28},{IDC_NOTES_REDO,28},{IDC_NOTES_CLEAR,28}}) addCell(id,w);
+  }
+  const int height=ScaleByDpi(12,dpi)+row*rowStep+controlHeight;
+  if(editor.bottom-editor.top < height+inset*2) {
+    HideNotesFormat(dialog,state,false);return;
+  }
   const int x=(std::clamp)(static_cast<int>(anchor.x)-ScaleByDpi(16,dpi),
       static_cast<int>(editor.left)+inset,(std::max)(static_cast<int>(editor.left)+inset,static_cast<int>(editor.right)-width-inset));
   int y=anchor.y-height-ScaleByDpi(8,dpi);
@@ -18063,28 +18447,35 @@ static void PositionNotesFormat(HWND dialog, ClientNotesDialogState &state, UINT
     if (!state.formatSurface) {HideNotesFormat(dialog,state,false);return;}
     SetWindowSubclass(state.formatSurface,NotesFormatSurfaceSubclass,1,0);
   }
-  HDWP positions=BeginDeferWindowPos(15);
+  SetDlgItemTextW(dialog,IDC_NOTES_FORMAT_MORE,state.formatExpanded ? L"Less" : L"More");
+  for(int id=IDC_NOTES_STYLE;id<=IDC_NOTES_CLEAR;++id) {
+    if(std::none_of(cells.begin(),cells.end(),[&](const auto &cell){return cell.id==id;}))
+      ShowWindow(GetDlgItem(dialog,id),SW_HIDE);
+  }
+  HDWP positions=BeginDeferWindowPos(static_cast<int>(cells.size())+2);
   auto place=[&](HWND control,int left,int top,int w,int h) {
-    if (positions) positions=DeferWindowPos(positions,control,HWND_TOP,left,top,w,h,SWP_NOACTIVATE|SWP_SHOWWINDOW);
-    else SetWindowPos(control,HWND_TOP,left,top,w,h,SWP_NOACTIVATE|SWP_SHOWWINDOW);
+    // Keep the template's visual keyboard order. Moving every command to the
+    // front in succession reverses sibling traversal on each reposition.
+    // Only the inert backing surface needs stacking, below the commands and
+    // above the editor; it never participates in keyboard navigation.
+    const bool surface=control==state.formatSurface;
+    const HWND after=surface ? GetDlgItem(dialog,IDC_NOTES_CLEAR) : nullptr;
+    const UINT flags=SWP_NOACTIVATE|SWP_SHOWWINDOW|(surface ? 0 : SWP_NOZORDER);
+    if (positions) positions=DeferWindowPos(positions,control,after,left,top,w,h,flags);
+    else SetWindowPos(control,after,left,top,w,h,flags);
   };
   place(state.formatSurface,x,y,width,height);
-  int left=x+ScaleByDpi(8,dpi),top=y+ScaleByDpi(6,dpi);
-  for (const auto [id,w] : {std::pair{IDC_NOTES_STYLE,132},{IDC_NOTES_SIZE,54},
-      {IDC_NOTES_BOLD,32},{IDC_NOTES_ITALIC,32},{IDC_NOTES_UNDERLINE,32},
-      {IDC_NOTES_HIGHLIGHT,48},{IDC_NOTES_BULLETS,32},{IDC_NOTES_NUMBERS,32},
-      {IDC_NOTES_CHECKLIST,32},{IDC_NOTES_LINK,32},{IDC_NOTES_UNDO,32},
-      {IDC_NOTES_REDO,32},{IDC_NOTES_CLEAR,32}}) {
-    if (id==IDC_NOTES_BOLD || id==IDC_NOTES_BULLETS || id==IDC_NOTES_LINK ||
-        id==IDC_NOTES_UNDO || id==IDC_NOTES_CLEAR) left+=ScaleByDpi(8,dpi);
-    const bool combo=id==IDC_NOTES_STYLE || id==IDC_NOTES_SIZE;
-    if (combo) {
-      SendDlgItemMessageW(dialog,id,CB_SETITEMHEIGHT,static_cast<WPARAM>(-1),ScaleByDpi(30,dpi));
-      SendDlgItemMessageW(dialog,id,CB_SETITEMHEIGHT,0,ScaleByDpi(30,dpi));
+  for(const auto &cell:cells) {
+    const bool combo=cell.id==IDC_NOTES_STYLE || cell.id==IDC_NOTES_SIZE;
+    if(combo) {
+      SendDlgItemMessageW(dialog,cell.id,CB_SETITEMHEIGHT,static_cast<WPARAM>(-1),ScaleByDpi(22,dpi));
+      SendDlgItemMessageW(dialog,cell.id,CB_SETITEMHEIGHT,0,ScaleByDpi(28,dpi));
     }
-    place(GetDlgItem(dialog,id),left,top,ScaleByDpi(id==IDC_NOTES_HIGHLIGHT ? 32 : w,dpi),ScaleByDpi(combo ? 210 : 36,dpi));
-    if (id==IDC_NOTES_HIGHLIGHT) place(GetDlgItem(dialog,IDC_NOTES_HIGHLIGHT_COLOR),left+ScaleByDpi(32,dpi),top,ScaleByDpi(16,dpi),ScaleByDpi(36,dpi));
-    left+=ScaleByDpi(w+4,dpi);
+    const int swatchWidth=cell.id==IDC_NOTES_HIGHLIGHT ? ScaleByDpi(16,dpi) : 0;
+    place(GetDlgItem(dialog,cell.id),x+cell.x,y+cell.y,cell.width-swatchWidth,
+        combo ? ScaleByDpi(210,dpi) : controlHeight);
+    if(swatchWidth) place(GetDlgItem(dialog,IDC_NOTES_HIGHLIGHT_COLOR),
+        x+cell.x+cell.width-swatchWidth,y+cell.y,swatchWidth,controlHeight);
   }
   if (positions) EndDeferWindowPos(positions);
   InvalidateRect(state.formatSurface,nullptr,FALSE);
@@ -18323,6 +18714,7 @@ static void UpdateNotesToolbar(HWND dialog, ClientNotesDialogState &state) {
   for (int id = IDC_NOTES_STYLE; id <= IDC_NOTES_CLEAR; ++id)
     EnableWindow(GetDlgItem(dialog, id), HasActiveNote(state));
   EnableWindow(GetDlgItem(dialog, IDC_NOTES_HIGHLIGHT_COLOR), HasActiveNote(state));
+  EnableWindow(GetDlgItem(dialog, IDC_NOTES_FORMAT_MORE), HasActiveNote(state));
   for (int id : {IDC_NOTES_FIND_TOGGLE,IDC_NOTES_WORKLOG,IDC_NOTES_FORMAT}) EnableWindow(GetDlgItem(dialog,id),HasActiveNote(state));
   EnableWindow(GetDlgItem(dialog,IDC_NOTES_DETAILS),HasActiveNote(state));
   const bool hasTicketUrl=HasActiveNote(state) && ValidNotesUrl(state.pages[state.activePage].ticketUrl);
@@ -18722,6 +19114,7 @@ static LRESULT CALLBACK NotesEditSubclass(HWND edit, UINT message,
   if (message == WM_SETFONT)
     return 0;
   if (message == WM_NCDESTROY) {
+    ClearNoteAccessibleName(edit);
     RemovePropW(edit,kNotesHandledTableTab);
     RemoveWindowSubclass(edit, NotesEditSubclass, id);
   } else if (message == WM_PASTE) {
@@ -19208,6 +19601,32 @@ static bool NotesKeepUnloadedSavedText(const ClientNotesDialogState &state) {
       std::all_of(state.pages.begin(),state.pages.end(),[&](const auto &page){const auto saved=std::find_if(state.original.pages.begin(),state.original.pages.end(),[&](const auto &prior){return prior.id==page.id;});
         return saved!=state.original.pages.end() && page.rich==saved->rich && page.rtf==saved->rtf && page.text==saved->text && page.links==saved->links && page.linkRanges==saved->linkRanges && page.linkRangesKnown==saved->linkRangesKnown;});
 }
+static bool CommitClientNotesDraft(HWND dialog, ClientNotesDialogState &state) {
+  const auto safeClient = [&]() {
+    return RevalidateSafeClientContainerPath(state.clientName, state.clientRoot) &&
+           IsExistingClientProfile(state.clientName) && !IsClientArchived(state.clientName);
+  };
+  if (!safeClient() ||
+      !client_notes::WriteNotebook(state.clientRoot, state.pages, state.original, safeClient))
+    return false;
+  // Keep the exact committed bytes as the next expected snapshot. Reading
+  // again here could accidentally accept a concurrent writer's later version.
+  state.metadataChanged = false;
+  client_notes::DeleteAuxiliary(state.clientRoot,state.draftName,state.original.directory_identity,state.draftIdentity);
+  state.draftIdentity={};
+  state.original.status = client_notes::ReadStatus::Ok;
+  state.original.pages = state.pages;
+  state.original.notebook_snapshot.status = client_notes::ReadStatus::Ok;
+  client_notes::SerializeNotebook(state.pages, state.original.notebook_snapshot.bytes);
+  for (size_t i = 0; i < state.pages.size(); ++i)
+    state.baselines[i] = state.pages[i].rtf;
+  state.formattingChanged = false;
+  SendDlgItemMessageW(dialog, IDC_CLIENT_NOTES_TEXT, EM_SETMODIFY, FALSE, 0);
+  SetNotesSaveFailure(dialog, state, false);
+  SetNotesStatus(dialog, state);
+  return true;
+}
+
 static bool SaveClientNotesDraft(HWND dialog, ClientNotesDialogState &state,
                                  bool reportFailure) {
   if (state.pendingTransactionRecovery) {
@@ -19232,14 +19651,7 @@ static bool SaveClientNotesDraft(HWND dialog, ClientNotesDialogState &state,
     SetNotesStatus(dialog, state);
     return true;
   }
-  const auto safeClient = [&]() {
-    return RevalidateSafeClientContainerPath(state.clientName,
-                                             state.clientRoot) &&
-           IsExistingClientProfile(state.clientName) &&
-           !IsClientArchived(state.clientName);
-  };
-  if (!safeClient() ||
-      !client_notes::WriteNotebook(state.clientRoot, state.pages, state.original, safeClient)) {
+  if (!CommitClientNotesDraft(dialog, state)) {
     state.saveProblemDetail=client_notes::PersistenceError();
     NotesWriteRecovery(dialog, state);
     SetNotesSaveFailure(dialog, state, true);
@@ -19251,34 +19663,25 @@ static bool SaveClientNotesDraft(HWND dialog, ClientNotesDialogState &state,
                 L"Client Notes", MB_OK | MB_ICONWARNING);
     return false;
   }
-  // Keep the exact committed bytes as the next expected snapshot. Reading
-  // again here could accidentally accept a concurrent writer's later version.
-  state.metadataChanged = false;
-  client_notes::DeleteAuxiliary(state.clientRoot,state.draftName,state.original.directory_identity,state.draftIdentity);
-  state.draftIdentity={};
-  state.original.status = client_notes::ReadStatus::Ok;
-  state.original.pages = state.pages;
-  state.original.notebook_snapshot.status = client_notes::ReadStatus::Ok;
-  client_notes::SerializeNotebook(state.pages, state.original.notebook_snapshot.bytes);
-  for (size_t i = 0; i < state.pages.size(); ++i)
-    state.baselines[i] = state.pages[i].rtf;
-  state.formattingChanged = false;
-  SendDlgItemMessageW(dialog, IDC_CLIENT_NOTES_TEXT, EM_SETMODIFY, FALSE, 0);
-  SetNotesSaveFailure(dialog, state, false);
-  SetNotesStatus(dialog, state);
   return true;
+}
+
+static ClientNotesDialogState *FindSelectedClientNotesForBackup(
+    const std::vector<std::wstring> &selectedClients) {
+  if (!g_hNotesWindow || !IsWindow(g_hNotesWindow)) return nullptr;
+  auto *state=reinterpret_cast<ClientNotesDialogState *>(GetWindowLongPtrW(g_hNotesWindow,DWLP_USER));
+  if (!state) return nullptr;
+  const bool selected=std::ranges::any_of(selectedClients,
+          [&](const auto &name) {
+            return client_name_comparison::EqualIgnoringCase(name, state->clientName);
+          });
+  return selected ? state : nullptr;
 }
 
 static bool FlushClientNotesForBackup(
     const std::vector<std::wstring> &selectedClients, std::wstring &error) {
-  if (!g_hNotesWindow || !IsWindow(g_hNotesWindow)) return true;
-  auto *state=reinterpret_cast<ClientNotesDialogState *>(GetWindowLongPtrW(g_hNotesWindow,DWLP_USER));
+  auto *state=FindSelectedClientNotesForBackup(selectedClients);
   if (!state) return true;
-  if (std::none_of(selectedClients.begin(), selectedClients.end(),
-          [&](const auto &name) {
-            return client_name_comparison::EqualIgnoringCase(name, state->clientName);
-          }))
-    return true;
   CloseNotesPanel(*state);
   if (!state->detailsDrafts.empty()) {
     error=L"These notes have unfinished invalid Details:\n"+NotesInvalidDetailsSummary(*state)+
@@ -19431,14 +19834,14 @@ static void LayoutClientNotes(HWND dialog, UINT dpi) {
         SendMessageW(control, WM_SETFONT, font, TRUE);
       return TRUE;
     }, reinterpret_cast<LPARAM>(state->uiFont));
-    state->tabFont = CreateFontW(-MulDiv(12, dpi, 72), 0, 0, 0, FW_SEMIBOLD,
+    state->tabFont = CreateFontW(-MulDiv(10, dpi, 72), 0, 0, 0, FW_SEMIBOLD,
         FALSE, FALSE, FALSE, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, L"Segoe UI");
     for (HFONT font : {oldFont, oldTabFont}) if (font) DeleteObject(font);
     state->fontDpi = dpi;
   }
   RECT area{}; GetClientRect(dialog, &area);
-  const int margin = ScaleByDpi(24, dpi), gap = ScaleByDpi(6, dpi);
-  const int height = ScaleByDpi(36, dpi);
+  const int margin = ScaleByDpi(16, dpi), gap = ScaleByDpi(6, dpi);
+  const int height = ScaleByDpi(32, dpi);
   RECT priorEditorBounds{};
   GetClientRect(GetDlgItem(dialog, IDC_CLIENT_NOTES_TEXT), &priorEditorBounds);
   RECT priorTabsBounds{};
@@ -19479,8 +19882,9 @@ static void LayoutClientNotes(HWND dialog, UINT dpi) {
   place(IDC_NOTES_MORE,area.right-ScaleByDpi(195,dpi),ScaleByDpi(5,dpi),ScaleByDpi(75,dpi),ScaleByDpi(30,dpi));
   place(IDC_NOTES_HELP,area.right-ScaleByDpi(112,dpi),ScaleByDpi(5,dpi),ScaleByDpi(55,dpi),ScaleByDpi(30,dpi));
   place(IDCANCEL,area.right-ScaleByDpi(44,dpi),ScaleByDpi(2,dpi),ScaleByDpi(36,dpi),ScaleByDpi(36,dpi));
-  // Tabs name the notes. Show one small ticket/tag line only when populated;
-  // otherwise everyday actions lead straight into the document.
+  // Tabs own note names. Context shares the command row so switching between
+  // notes never pushes the document down. Secondary actions move to labeled Tools
+  // only when the available width cannot fit their measured labels and context.
   const auto labelWidth=[&](int id) {
     SIZE size{};wchar_t label[768]{};HWND control=GetDlgItem(dialog,id);
     GetWindowTextW(control,label,static_cast<int>(std::size(label)));
@@ -19491,43 +19895,63 @@ static void LayoutClientNotes(HWND dialog, UINT dpi) {
     }
     return static_cast<int>(size.cx);
   };
-  // Date-based ticket IDs need their full measured width. The reference is
-  // plain information until a URL supplies a distinct open-ticket action.
+  constexpr int actionTop=80;
+  const int actionY=ScaleByDpi(actionTop,dpi), actionHeight=ScaleByDpi(28,dpi);
   const int contextGap=ScaleByDpi(8,dpi);
-  const int metadataMax=(std::min)(ScaleByDpi(720,dpi),static_cast<int>(area.right-margin*2));
   const bool hasTicket=labelWidth(IDC_NOTES_OPEN_TICKET)>0;
   const bool hasTicketUrl=HasActiveNote(*state) && ValidNotesUrl(state->pages[state->activePage].ticketUrl);
-  const int ticketWidth=hasTicket ? (std::clamp)(labelWidth(IDC_NOTES_OPEN_TICKET)+ScaleByDpi(16,dpi),
-      ScaleByDpi(96,dpi),(std::max)(ScaleByDpi(96,dpi),(std::min)(ScaleByDpi(360,dpi),metadataMax-contextGap))) : 0;
-  const int tagWidth=(std::min)({labelWidth(IDC_NOTES_CONTEXT),ScaleByDpi(224,dpi),
-      (std::max)(0,metadataMax-ticketWidth-contextGap)});
-  const bool hasContext=hasTicket || tagWidth>0;
-  const int tagLeft=margin+ticketWidth+(hasTicket && tagWidth>0 ? contextGap : 0);
-  place(IDC_NOTES_OPEN_TICKET,margin,ScaleByDpi(97,dpi),(std::max)(1,ticketWidth),ScaleByDpi(28,dpi));
-  place(IDC_NOTES_TICKET_REFERENCE,margin,ScaleByDpi(97,dpi),(std::max)(1,ticketWidth),ScaleByDpi(28,dpi));
-  place(IDC_NOTES_CONTEXT,tagLeft,ScaleByDpi(101,dpi),tagWidth,ScaleByDpi(22,dpi));
-  ShowWindow(GetDlgItem(dialog,IDC_NOTES_OPEN_TICKET),hasTicket && hasTicketUrl ? SW_SHOW : SW_HIDE);
-  ShowWindow(GetDlgItem(dialog,IDC_NOTES_TICKET_REFERENCE),hasTicket && !hasTicketUrl ? SW_SHOW : SW_HIDE);
-  const int actionTop=hasContext ? 128 : 96;
-  place(IDC_NOTES_STATUS,margin,ScaleByDpi(actionTop+31,dpi),area.right-margin*2,ScaleByDpi(20,dpi));
-  int actionX=margin;
-  for (const auto [id,width] : {std::pair{IDC_NOTES_FIND_TOGGLE,54},
-      {IDC_NOTES_SNIPPETS,82},{IDC_NOTES_TEMPLATES,90},{IDC_NOTES_WORKLOG,92},
-      {IDC_NOTES_FORMAT,74}}) {
-    const int actionWidth=(std::max)(ScaleByDpi(width,dpi),labelWidth(id)+ScaleByDpi(27,dpi));
-    place(id,actionX,ScaleByDpi(actionTop,dpi),actionWidth,ScaleByDpi(28,dpi));
-    actionX+=actionWidth+ScaleByDpi(6,dpi);
-  }
-  const int detailsLeft=area.right-margin-ScaleByDpi(66,dpi);
+  const int ticketDesired=hasTicket ? (std::min)(labelWidth(IDC_NOTES_OPEN_TICKET)+ScaleByDpi(16,dpi),ScaleByDpi(360,dpi)) : 0;
   const bool hasWorkStatus=HasActiveNote(*state) && *NotesWorkStatusLabel(state->pages[state->activePage].status);
-  const int statusWidth=hasWorkStatus ? labelWidth(IDC_NOTES_WORK_STATUS)+ScaleByDpi(28,dpi) : 1;
-  place(IDC_NOTES_WORK_STATUS,detailsLeft-ScaleByDpi(16,dpi)-statusWidth,ScaleByDpi(actionTop,dpi),statusWidth,ScaleByDpi(28,dpi));
-  place(IDC_NOTES_DETAILS,detailsLeft,ScaleByDpi(actionTop,dpi),ScaleByDpi(66,dpi),ScaleByDpi(28,dpi));
+  const int detailsLeft=area.right-margin-ScaleByDpi(66,dpi);
+  const int statusWidth=hasWorkStatus ? labelWidth(IDC_NOTES_WORK_STATUS)+ScaleByDpi(28,dpi) : 0;
+  int contextRight=detailsLeft-contextGap-(hasWorkStatus ? statusWidth+contextGap : 0);
+  place(IDC_NOTES_WORK_STATUS,contextRight+contextGap,actionY,(std::max)(1,statusWidth),actionHeight);
+  place(IDC_NOTES_DETAILS,detailsLeft,actionY,ScaleByDpi(66,dpi),actionHeight);
   ShowWindow(GetDlgItem(dialog,IDC_NOTES_WORK_STATUS),hasWorkStatus ? SW_SHOW : SW_HIDE);
+  const std::array<std::pair<int,int>,5> actions{{{IDC_NOTES_FIND_TOGGLE,54},
+      {IDC_NOTES_SNIPPETS,82},{IDC_NOTES_TEMPLATES,90},{IDC_NOTES_WORKLOG,92},{IDC_NOTES_FORMAT,74}}};
+  std::array<int,5> actionWidths{};std::array<bool,5> shown{true,true,true,true,true};
+  int actionWidth=0;
+  for(size_t i=0;i<actions.size();++i) {
+    actionWidths[i]=(std::max)(ScaleByDpi(actions[i].second,dpi),labelWidth(actions[i].first)+ScaleByDpi(28,dpi));
+    actionWidth+=actionWidths[i]+gap;
+  }
+  const int toolsWidth=ScaleByDpi(60,dpi);
+  bool overflow=false;
+  for(size_t i:{size_t{3},size_t{1},size_t{2},size_t{4}}) {
+    if(margin+actionWidth+(overflow ? toolsWidth+gap : 0)+ticketDesired+contextGap<=contextRight) break;
+    shown[i]=false;actionWidth-=actionWidths[i]+gap;overflow=true;
+  }
+  if(hasWorkStatus && margin+actionWidth+(overflow ? toolsWidth+gap : 0)>contextRight) {
+    contextRight=detailsLeft-contextGap;
+    ShowWindow(GetDlgItem(dialog,IDC_NOTES_WORK_STATUS),SW_HIDE);
+  }
+  if(margin+actionWidth+(overflow ? toolsWidth+gap : 0)>contextRight) {
+    shown[0]=false;actionWidth-=actionWidths[0]+gap;overflow=true;
+  }
+  int actionX=margin;
+  for(size_t i=0;i<actions.size();++i) {
+    if(shown[i]) {place(actions[i].first,actionX,actionY,actionWidths[i],actionHeight);actionX+=actionWidths[i]+gap;}
+    ShowWindow(GetDlgItem(dialog,actions[i].first),shown[i] ? SW_SHOW : SW_HIDE);
+  }
+  place(IDC_NOTES_TOOLS,actionX,actionY,toolsWidth,actionHeight);
+  ShowWindow(GetDlgItem(dialog,IDC_NOTES_TOOLS),overflow ? SW_SHOW : SW_HIDE);
+  if(overflow) actionX+=toolsWidth+gap;
+  const int contextAvailable=(std::max)(0,contextRight-actionX-contextGap);
+  const int ticketWidth=(std::min)(ticketDesired,contextAvailable);
+  const int tagWidth=(std::min)({labelWidth(IDC_NOTES_CONTEXT),ScaleByDpi(224,dpi),
+      (std::max)(0,contextAvailable-ticketWidth-(ticketWidth ? contextGap : 0))});
+  const int ticketLeft=contextRight-ticketWidth-tagWidth-(ticketWidth && tagWidth ? contextGap : 0);
+  place(IDC_NOTES_OPEN_TICKET,ticketLeft,actionY,(std::max)(1,ticketWidth),actionHeight);
+  place(IDC_NOTES_TICKET_REFERENCE,ticketLeft,actionY,(std::max)(1,ticketWidth),actionHeight);
+  place(IDC_NOTES_CONTEXT,contextRight-tagWidth,actionY,tagWidth,actionHeight);
+  ShowWindow(GetDlgItem(dialog,IDC_NOTES_OPEN_TICKET),ticketWidth>0 && hasTicketUrl ? SW_SHOW : SW_HIDE);
+  ShowWindow(GetDlgItem(dialog,IDC_NOTES_TICKET_REFERENCE),ticketWidth>0 && !hasTicketUrl ? SW_SHOW : SW_HIDE);
   ShowWindow(GetDlgItem(dialog,IDC_NOTES_CONTEXT),tagWidth>0 ? SW_SHOW : SW_HIDE);
+  place(IDC_NOTES_STATUS,margin,ScaleByDpi(actionTop+31,dpi),area.right-margin*2,ScaleByDpi(20,dpi));
   ShowWindow(GetDlgItem(dialog,IDC_NOTES_STATUS),state->problemVisible ? SW_SHOW : SW_HIDE);
   ShowWindow(GetDlgItem(dialog,IDC_NOTES_RENAME_TAB),SW_HIDE);
-  const int tabTop = ScaleByDpi(46, dpi), plusWidth = ScaleByDpi(40, dpi);
+  const int tabTop = ScaleByDpi(40, dpi), plusWidth = ScaleByDpi(40, dpi);
   const int maxTabs = (std::max)(1, static_cast<int>(area.right) - margin * 2 - plusWidth - gap);
   HWND tabs = GetDlgItem(dialog, IDC_NOTES_TABS);
   if (dpiChanged) {
@@ -19539,34 +19963,13 @@ static void LayoutClientNotes(HWND dialog, UINT dpi) {
   const int tabWidth = (std::min)(maxTabs, (std::max)(1, count) * ScaleByDpi(118, dpi) + ScaleByDpi(6, dpi));
   place(IDC_NOTES_TABS, margin, tabTop, tabWidth, height + ScaleByDpi(3, dpi));
   place(IDC_NOTES_ADD_TAB, margin + tabWidth + gap, tabTop, plusWidth);
-  const int findTop=ScaleByDpi(actionTop+36+(state->problemVisible ? 20 : 0),dpi);
-  const int findGap=ScaleByDpi(6,dpi),findHeight=ScaleByDpi(28,dpi);
-  const int available=static_cast<int>(area.right)-margin*2;
-  const int queryWidth=(std::max)(ScaleByDpi(120,dpi),available-ScaleByDpi(350,dpi));
-  int findX=margin;
-  for(const auto [id,width]:{std::pair{IDC_NOTES_FIND,queryWidth},{IDC_NOTES_FIND_PREV,ScaleByDpi(76,dpi)},
-      {IDC_NOTES_FIND_NEXT,ScaleByDpi(56,dpi)},{IDC_NOTES_REPLACE,ScaleByDpi(90,dpi)},{IDC_NOTES_FIND_CLOSE,ScaleByDpi(104,dpi)}}) {
-    place(id,findX,findTop,width,findHeight);findX+=width+findGap;
-    ShowWindow(GetDlgItem(dialog,id),state->findVisible?SW_SHOW:SW_HIDE);
-  }
-  findX=margin;
-  for(const auto [id,width]:{std::pair{IDC_NOTES_FIND_MATCH_CASE,100},{IDC_NOTES_FIND_WHOLE_WORD,108},{IDC_NOTES_FIND_WRAP,64}}) {
-    place(id,findX,findTop+ScaleByDpi(34,dpi),ScaleByDpi(width,dpi),findHeight);findX+=ScaleByDpi(width+6,dpi);
-    ShowWindow(GetDlgItem(dialog,id),state->findVisible?SW_SHOW:SW_HIDE);
-  }
-  place(IDC_NOTES_FIND_INFO,findX,findTop+ScaleByDpi(34,dpi),(std::max)(1,static_cast<int>(area.right)-margin-findX),findHeight);
-  ShowWindow(GetDlgItem(dialog,IDC_NOTES_FIND_INFO),state->findVisible?SW_SHOW:SW_HIDE);
-  findX=margin;
-  for(const auto [id,width]:{std::pair{IDC_NOTES_REPLACE_TEXT,available-ScaleByDpi(244,dpi)},
-      {IDC_NOTES_REPLACE_NEXT,ScaleByDpi(116,dpi)},{IDC_NOTES_REPLACE_ALL,ScaleByDpi(116,dpi)}}) {
-    place(id,findX,findTop+ScaleByDpi(68,dpi),width,findHeight);findX+=width+findGap;
-    ShowWindow(GetDlgItem(dialog,id),state->findVisible&&state->replaceVisible?SW_SHOW:SW_HIDE);
-  }
-  const int editorTop = ScaleByDpi(actionTop+36+NotesFindHeight(*state)+(state->problemVisible ? 20 : 0), dpi);
+  const int findTop=ScaleByDpi(actionTop+32+(state->problemVisible ? 20 : 0),dpi);
+  LayoutNotesFindPanel(dialog,*state,margin,findTop,static_cast<int>(area.right)-margin*2,dpi);
+  const int editorTop = ScaleByDpi(actionTop+32+NotesFindHeight(*state)+(state->problemVisible ? 20 : 0), dpi);
   place(IDC_NOTES_EMPTY, margin, editorTop + ScaleByDpi(80,dpi),area.right-margin*2,ScaleByDpi(60,dpi));
   ShowWindow(GetDlgItem(dialog,IDC_NOTES_EMPTY),HasActiveNote(*state) ? SW_HIDE : SW_SHOW);
-  place(IDC_CLIENT_NOTES_TEXT, margin + ScaleByDpi(4, dpi), editorTop,
-        (std::max)(0, static_cast<int>(area.right) - margin * 2 - ScaleByDpi(8, dpi)),
+  place(IDC_CLIENT_NOTES_TEXT, margin, editorTop,
+        (std::max)(0, static_cast<int>(area.right) - margin * 2),
         (std::max)(0, static_cast<int>(area.bottom) - margin - editorTop));
   layout.Commit();
   // Moving the strip can preserve a partially painted native button image.
@@ -19629,12 +20032,12 @@ static void LayoutClientNotes(HWND dialog, UINT dpi) {
   if (const HWND edit=GetDlgItem(dialog, IDC_CLIENT_NOTES_TEXT)) {
     RECT document{};
     GetClientRect(edit, &document);
-    InflateRect(&document, -ScaleByDpi(28, dpi), -ScaleByDpi(16, dpi));
+    InflateRect(&document, -ScaleByDpi(16, dpi), -ScaleByDpi(12, dpi));
     RECT previous{};
     SendMessageW(edit, EM_GETRECT, 0, reinterpret_cast<LPARAM>(&previous));
     // RichEdit can update the reported rectangle before recalculating wrapped
     // lines. Compare the actual width across positioning as well as padding.
-    if (!EqualRect(&previous, &document) || priorEditorBounds.right != document.right + ScaleByDpi(28, dpi)) {
+    if (!EqualRect(&previous, &document) || priorEditorBounds.right != document.right + ScaleByDpi(16, dpi)) {
       SendMessageW(edit, EM_SETRECT, 0, reinterpret_cast<LPARAM>(&document));
       SendMessageW(edit, EM_SETTARGETDEVICE, 0, state->wordWrap ? 0 : 1);
       InvalidateRect(edit, nullptr, TRUE);
@@ -19755,7 +20158,8 @@ static bool IsNotesToolbarItem(const DRAWITEMSTRUCT &draw) {
   if(draw.CtlType!=ODT_BUTTON) return false;
   for(const UINT id:{IDC_NOTES_SWITCH_CLIENT,IDC_NOTES_LIBRARY,IDC_NOTES_TRASH,IDC_NOTES_MORE,IDC_NOTES_HELP,
       IDC_NOTES_FIND_TOGGLE,IDC_NOTES_SNIPPETS,IDC_NOTES_TEMPLATES,IDC_NOTES_DETAILS,IDC_NOTES_OPEN_TICKET,
-      IDC_NOTES_WORKLOG,IDC_NOTES_FORMAT,IDC_NOTES_ADD_TAB,IDC_NOTES_HIGHLIGHT_COLOR,IDCANCEL})
+      IDC_NOTES_WORKLOG,IDC_NOTES_FORMAT,IDC_NOTES_TOOLS,IDC_NOTES_FORMAT_MORE,IDC_NOTES_FIND_OPTIONS,
+      IDC_NOTES_ADD_TAB,IDC_NOTES_HIGHLIGHT_COLOR,IDCANCEL})
     if(draw.CtlID==id) return true;
   return draw.CtlID>=IDC_NOTES_BOLD && draw.CtlID<=IDC_NOTES_CLEAR;
 }
@@ -19766,7 +20170,8 @@ static bool DrawNotesToolbarButtonCore(const DRAWITEMSTRUCT &draw,
       draw.CtlID==IDC_NOTES_MORE || draw.CtlID==IDC_NOTES_HELP;
   const bool textAction = draw.CtlID == IDC_NOTES_FIND_TOGGLE || draw.CtlID == IDC_NOTES_SNIPPETS ||
       draw.CtlID == IDC_NOTES_TEMPLATES || draw.CtlID == IDC_NOTES_DETAILS ||
-      draw.CtlID == IDC_NOTES_OPEN_TICKET || draw.CtlID == IDC_NOTES_WORKLOG || draw.CtlID == IDC_NOTES_FORMAT;
+      draw.CtlID == IDC_NOTES_OPEN_TICKET || draw.CtlID == IDC_NOTES_WORKLOG || draw.CtlID == IDC_NOTES_FORMAT ||
+      draw.CtlID == IDC_NOTES_TOOLS || draw.CtlID == IDC_NOTES_FORMAT_MORE || draw.CtlID == IDC_NOTES_FIND_OPTIONS;
   if (draw.CtlType != ODT_BUTTON ||
       !((draw.CtlID >= IDC_NOTES_BOLD && draw.CtlID <= IDC_NOTES_CLEAR) ||
         textAction || headerAction || draw.CtlID == IDC_NOTES_ADD_TAB || draw.CtlID == IDC_NOTES_HIGHLIGHT_COLOR || draw.CtlID == IDCANCEL)) return false;
@@ -19783,22 +20188,23 @@ static bool DrawNotesToolbarButtonCore(const DRAWITEMSTRUCT &draw,
   } else PaintNotesChrome(draw.hDC, draw.hwndItem);
   const bool ticketLink=draw.CtlID==IDC_NOTES_OPEN_TICKET;
   const bool newNote=draw.CtlID==IDC_NOTES_ADD_TAB;
-  const bool utility=textAction && !ticketLink && draw.CtlID!=IDC_NOTES_DETAILS;
-  if (active || hot || (textAction && !ticketLink) || headerAction || newNote) {
-    // Named palettes can give the resting button and crControlHot the same
-    // colour. Derive filled-button hover from its actual face so it is visible.
+  const bool navigation=draw.CtlID==IDC_NOTES_LIBRARY || draw.CtlID==IDC_NOTES_TRASH;
+  const bool quiet=(textAction || headerAction) && !clientPicker && !navigation;
+  if (active || hot || clientPicker || navigation || newNote) {
+    // Quiet commands share the same themed interaction states. The client
+    // picker and direct notebook/trash navigation retain their resting outline.
     COLORREF fill=active ? BlendColor(g_themeColors.crWindow, g_themeColors.crAccent, 28) :
         hot ? (headerAction || draw.CtlID==IDC_NOTES_DETAILS ?
             TintColor(NotesControlColor(),g_bThemeIsDark ? 8 : -8) : g_themeColors.crControlHot) : newNote ? NotesWindowColor() :
-        utility ? BlendColor(g_themeColors.crWindow,g_themeColors.crControl,g_bThemeIsDark ? 18 : 30) : NotesControlColor();
+        navigation ? NotesWindowColor() : NotesControlColor();
     COLORREF border=active || newNote || hot ? g_themeColors.crAccent :
-        utility ? BlendColor(g_themeColors.crControlBorder,g_themeColors.crWindow,42) : g_themeColors.crControlBorder;
+        g_themeColors.crControlBorder;
     if (disabled) {fill=BlendColor(fill,g_themeColors.crWindow,50);border=BlendColor(border,g_themeColors.crWindow,50);}
     else if (draw.itemState&ODS_SELECTED) fill=TintColor(fill,-12);
     DrawNotesSurface(draw.hDC,draw.rcItem,fill,border,dpi);
   }
-  const COLORREF buttonInk=ticketLink ? g_themeColors.crControlText : g_themeColors.crButtonText;
-  const COLORREF ink = disabled ? BlendColor(buttonInk,g_themeColors.crWindowText,60) : buttonInk;
+  const COLORREF buttonInk=ticketLink || quiet ? g_themeColors.crWindowText : g_themeColors.crButtonText;
+  const COLORREF ink = disabled ? BlendColor(buttonInk,g_themeColors.crWindow,60) : buttonInk;
   RECT icon = draw.rcItem;
   if (clientPicker) {
     const int iconSize=ScaleByDpi(18,dpi);const int middle=(draw.rcItem.top+draw.rcItem.bottom)/2;
@@ -19906,6 +20312,28 @@ static bool DrawNotesComboItem(const DRAWITEMSTRUCT &draw) {
   return DrawNotesBufferedItem(draw,DrawNotesComboItemCore);
 }
 
+static void ApplyNotesTypingColors(HWND edit) {
+  CHARRANGE selection{};NotesSelection(edit,selection);
+  CHARFORMAT2W typing{sizeof(typing)},defaults{sizeof(defaults)};
+  SendMessageW(edit,EM_GETCHARFORMAT,SCF_SELECTION,reinterpret_cast<LPARAM>(&typing));
+  SendMessageW(edit,EM_GETCHARFORMAT,SCF_DEFAULT,reinterpret_cast<LPARAM>(&defaults));
+  // Streaming RTF can leave its automatic system ink as the pending typing
+  // format even after the visible runs were recolored for the chosen theme.
+  CHARFORMAT2W ink{sizeof(ink)};ink.dwMask=CFM_COLOR;ink.crTextColor=g_themeColors.crControlText;
+  if((defaults.dwEffects&CFE_AUTOCOLOR) || defaults.crTextColor!=ink.crTextColor)
+    SendMessageW(edit,EM_SETCHARFORMAT,SCF_DEFAULT,reinterpret_cast<LPARAM>(&ink));
+  if(selection.cpMin!=selection.cpMax)return;
+  const bool linked=(typing.dwEffects&CFE_LINK)!=0;
+  if(!(typing.dwEffects&CFE_AUTOBACKCOLOR) && !linked) {
+    // Keep custom highlight contrast, including an explicitly chosen color.
+    ink.dwEffects=typing.dwEffects&CFE_AUTOCOLOR;ink.crTextColor=typing.crTextColor;
+  } else if(linked) ink.crTextColor=(typing.dwEffects&CFE_AUTOBACKCOLOR) && g_bThemeIsDark ? RGB(138,205,235) : RGB(0,91,158);
+  else if(typing.dwEffects&CFE_STRIKEOUT)ink.crTextColor=BlendColor(g_themeColors.crControlText,g_themeColors.crControl,30);
+  CHARFORMAT2W actual{sizeof(actual)};SendMessageW(edit,EM_GETCHARFORMAT,SCF_SELECTION,reinterpret_cast<LPARAM>(&actual));
+  if((actual.dwEffects&CFE_AUTOCOLOR)!=(ink.dwEffects&CFE_AUTOCOLOR) || actual.crTextColor!=ink.crTextColor)
+    SendMessageW(edit,EM_SETCHARFORMAT,SCF_SELECTION,reinterpret_cast<LPARAM>(&ink));
+}
+
 static void ApplyNotesTextColors(HWND edit) {
   IUnknown *ole = nullptr;
   ITextDocument *document = nullptr;
@@ -19958,6 +20386,7 @@ static void ApplyNotesTextColors(HWND edit) {
     range->Release();
   }
   document->Release();
+  ApplyNotesTypingColors(edit);
 }
 
 static void RefreshNotesForTheme() {
@@ -20028,6 +20457,10 @@ static bool LoadNotesPage(HWND dialog, ClientNotesDialogState &state) {
     else { if (next) ShowWindow(next,SW_SHOW); if (previousEditor && previousEditor!=next) ShowWindow(previousEditor,SW_HIDE); }
     if (retirePrevious) DestroyWindow(previousEditor);
     NotesTrimEditors(state);
+    if (previousId!=state.attachedPageId) {
+      state.findNotice.clear();
+      NotesFindRefresh(dialog,state);
+    }
     // Invalidate after the final visibility swap so the document outline is
     // painted against the new child clipping region, never an intermediate one.
     if (next) InvalidateRect(next,nullptr,TRUE);
@@ -20082,6 +20515,7 @@ static bool LoadNotesPage(HWND dialog, ClientNotesDialogState &state) {
   SetWindowTheme(edit, g_bThemeIsDark ? L"DarkMode_Explorer" : L"Explorer", nullptr);
   ShowWindow(edit, SW_HIDE);
   SetWindowSubclass(edit, NotesEditSubclass, 1, 0);
+  SetNoteAccessibleName(edit);
   SendMessageW(edit, EM_SETOLECALLBACK, 0, reinterpret_cast<LPARAM>(&g_notesOleCallback));
   SendMessageW(edit, EM_EXLIMITTEXT, 0, client_notes::kMaxRichBytes);
   SendMessageW(edit, EM_SETUNDOLIMIT, 256, 0);
@@ -20145,9 +20579,6 @@ static bool LoadNotesPage(HWND dialog, ClientNotesDialogState &state) {
     page.rtf = std::move(normalized);
     if (upgradedSpacing) client_notes::RememberRevision(page,previous,true);
     page.text.clear();
-    SendMessageW(edit, EM_EMPTYUNDOBUFFER, 0, 0);
-    SendMessageW(edit, EM_SETMODIFY, FALSE, 0);
-    state.formattingChanged = false;
   }
   CHARRANGE caret{static_cast<LONG>(page.cursor), static_cast<LONG>(page.cursor)};
   const auto remembered=state.editorViews.find(id);
@@ -20158,6 +20589,12 @@ static bool LoadNotesPage(HWND dialog, ClientNotesDialogState &state) {
   POINT scroll{0,static_cast<LONG>(page.scroll)};
   if (remembered!=state.editorViews.end()) scroll=remembered->second.scroll;
   SendMessageW(edit, EM_SETSCROLLPOS, 0, reinterpret_cast<LPARAM>(&scroll));
+  // Restoring the caret can select RTF's pending automatic font again. Seed
+  // only its ink, then finish the new editor's ordinary clean initialization.
+  ApplyNotesTypingColors(edit);
+  SendMessageW(edit,EM_EMPTYUNDOBUFFER,0,0);
+  SendMessageW(edit,EM_SETMODIFY,FALSE,0);
+  state.formattingChanged=false;
   state.loading = false;
   state.editorLoadFailed=false;
   if (upgradedSpacing) SetTimer(dialog,1,750,nullptr);
@@ -20191,6 +20628,12 @@ static bool NotesReorderTab(HWND dialog,ClientNotesDialogState &state,int from,i
   RefreshNotesTabs(dialog,state);
   return SaveClientNotesDraft(dialog,state,true);
 }
+static bool SaveNotesBeforeTabSwitch(HWND dialog, ClientNotesDialogState &state,
+                                     bool changingNote = true) {
+  // Apply pending Details while the panel still owns the active note.
+  if (changingNote) CloseNotesPanel(state);
+  return SaveClientNotesDraft(dialog, state, true);
+}
 static bool NotesCanRenameTabAt(HWND tabs,const ClientNotesDialogState &state,POINT point) {
   if (!HasActiveNote(state)) return false;
   TCHITTESTINFO hit{point,0};const int index=TabCtrl_HitTest(tabs,&hit);
@@ -20210,10 +20653,8 @@ static LRESULT CALLBACK NotesTabsSubclass(HWND tabs, UINT message,
     if (tab>=0 && static_cast<size_t>(tab)<workspace->visiblePages.size()) {
       RECT rect{}; TabCtrl_GetItemRect(tabs,tab,&rect);
       if (hit.pt.x>=rect.right-ScaleByDpi(25,GetDpiForWindow(tabs))) {
-        if (!SaveClientNotesDraft(dialog,*workspace,true)) return 0;
-        workspace->activePage=workspace->visiblePages[tab];
-        if (!LoadNotesPage(dialog,*workspace)) {RefreshNotesTabs(dialog,*workspace);return 0;}
-        NotesWorkspaceCommand(dialog,*workspace,IDC_NOTES_CLOSE_TAB); workspace->dragTab=-1; return 0;
+        NotesCloseTabAt(dialog,*workspace,workspace->visiblePages[tab]);
+        return 0;
       }
       // Let the native control select first, then own the complete drag gesture.
       // Its default mouse-move handling must not release our drag capture.
@@ -20257,9 +20698,10 @@ static LRESULT CALLBACK NotesTabsSubclass(HWND tabs, UINT message,
     if (message==WM_CANCELMODE && GetCapture()==tabs) ReleaseCapture();
   }
   if (workspace && message==WM_MOUSEWHEEL && !workspace->visiblePages.empty()) {
-    if (!SaveClientNotesDraft(dialog,*workspace,true)) return 0;
     int selected=TabCtrl_GetCurSel(tabs)+(GET_WHEEL_DELTA_WPARAM(wParam)<0 ? 1 : -1);
     selected=std::clamp(selected,0,static_cast<int>(workspace->visiblePages.size())-1);
+    if (!SaveNotesBeforeTabSwitch(dialog, *workspace,
+                                  workspace->visiblePages[selected] != workspace->activePage)) return 0;
     workspace->activePage=workspace->visiblePages[selected];
     if (!LoadNotesPage(dialog,*workspace)) MessageBoxW(dialog,L"This note's editor could not be opened. Its saved content has been kept.",L"Client Notes",MB_OK|MB_ICONWARNING);
     RefreshNotesTabs(dialog,*workspace);return 0;
@@ -20281,7 +20723,7 @@ static LRESULT CALLBACK NotesTabsSubclass(HWND tabs, UINT message,
       if (clicked < 0) return 0;
       if (clicked != TabCtrl_GetCurSel(tabs)) {
         auto *state = reinterpret_cast<ClientNotesDialogState *>(GetWindowLongPtrW(dialog, DWLP_USER));
-        if (!state || !SaveClientNotesDraft(dialog, *state, true)) return 0;
+        if (!state || !SaveNotesBeforeTabSwitch(dialog, *state)) return 0;
         TabCtrl_SetCurSel(tabs, clicked);
         NMHDR notice{tabs, IDC_NOTES_TABS, TCN_SELCHANGE};
         SendMessageW(dialog, WM_NOTIFY, IDC_NOTES_TABS, reinterpret_cast<LPARAM>(&notice));
@@ -20442,6 +20884,20 @@ static void RefreshNotesTabs(HWND dialog, ClientNotesDialogState &state) {
   InvalidateRect(tabs,nullptr,FALSE);
 }
 
+static HMENU BuildNotesToolsMenu(HWND dialog) {
+  HMENU menu=CreatePopupMenu();
+  if(!menu) return nullptr;
+  for(const auto [id,label]:{std::pair{IDC_NOTES_FIND_TOGGLE,L"Find in note"},
+      {IDC_NOTES_SNIPPETS,L"Snippets..."},
+      {IDC_NOTES_TEMPLATES,L"Templates..."},{IDC_NOTES_WORKLOG,L"Add update"},
+      {IDC_NOTES_FORMAT,L"Text formatting"}}) {
+    const HWND control=GetDlgItem(dialog,id);
+    if(control && !(GetWindowLongPtrW(control,GWL_STYLE)&WS_VISIBLE))
+      AppendMenuW(menu,MF_STRING|(IsWindowEnabled(control) ? 0 : MF_GRAYED),id,label);
+  }
+  return menu;
+}
+
 #include "NotesWorkspaceUi.inl"
 
 struct NotesTabNameState {
@@ -20573,6 +21029,7 @@ static INT_PTR CALLBACK ClientNotesDlgProc(HWND dialog, UINT message,
       return FALSE;
     }
     SetWindowSubclass(edit, NotesEditSubclass, 1, 0);
+    SetNoteAccessibleName(edit);
     SendMessageW(edit, EM_SETOLECALLBACK, 0,
                  reinterpret_cast<LPARAM>(&g_notesOleCallback));
     SendMessageW(edit, EM_EXLIMITTEXT, 0, client_notes::kMaxRichBytes);
@@ -20597,6 +21054,7 @@ static INT_PTR CALLBACK ClientNotesDlgProc(HWND dialog, UINT message,
     for (int id=IDC_NOTES_STYLE;id<=IDC_NOTES_CLEAR;++id)
       SetWindowSubclass(GetDlgItem(dialog,id),NotesFormatControlSubclass,2,0);
     SetWindowSubclass(GetDlgItem(dialog,IDC_NOTES_HIGHLIGHT_COLOR),NotesFormatControlSubclass,2,0);
+    SetWindowSubclass(GetDlgItem(dialog,IDC_NOTES_FORMAT_MORE),NotesFormatControlSubclass,2,0);
     HideNotesFormat(dialog,*state,false);
     state->loading = true;
     state->loading = false;
@@ -20629,6 +21087,8 @@ static INT_PTR CALLBACK ClientNotesDlgProc(HWND dialog, UINT message,
         {IDC_NOTES_SNIPPETS,L"Create, edit, save or insert reusable text blocks"},
         {IDC_NOTES_WORKLOG,L"Add a dated work log update at the end of this note"},
         {IDC_NOTES_FORMAT,L"Show text formatting at the selection or typing position; Escape closes it"},
+        {IDC_NOTES_FORMAT_MORE,L"Show or hide font size, numbering, Undo, Redo and clear formatting"},
+        {IDC_NOTES_TOOLS,L"Commands moved here to leave room for this note's ticket and status"},
         {IDC_NOTES_WORK_STATUS,L"Note status - change it in Details; local organization, no ticket-system sync"},
         {IDC_NOTES_TEMPLATES,L"Create and edit reusable starters directly, or use one for a new note"},
         {IDC_NOTES_STYLE,L"Text style - Code opens a language picker and inserts a bordered code block"},
@@ -20694,8 +21154,8 @@ static INT_PTR CALLBACK ClientNotesDlgProc(HWND dialog, UINT message,
     RECT area{}; GetClientRect(dialog, &area);
     {
     NotesPaintBuffer buffer(target, area); HDC dc = buffer.dc();
-    RECT tabLine{ScaleByDpi(24, dpi), ScaleByDpi(87, dpi),
-                 area.right - ScaleByDpi(24, dpi), ScaleByDpi(88, dpi)};
+    RECT tabLine{ScaleByDpi(16, dpi), ScaleByDpi(76, dpi),
+                 area.right - ScaleByDpi(16, dpi), ScaleByDpi(77, dpi)};
     PaintNotesChrome(dc, dialog);
     // Notes owns its paint rather than the shared dialog's erase path. Draw
     // the search fields' replacement outlines here after native edges are
@@ -20817,7 +21277,7 @@ static INT_PTR CALLBACK ClientNotesDlgProc(HWND dialog, UINT message,
     if (notice && notice->idFrom == IDC_NOTES_TABS) {
       if (notice->code == TCN_SELCHANGING) {
         SetWindowLongPtrW(dialog, DWLP_MSGRESULT,
-                         SaveClientNotesDraft(dialog, *state, true) ? FALSE : TRUE);
+                         SaveNotesBeforeTabSwitch(dialog, *state) ? FALSE : TRUE);
         return TRUE;
       }
       if (notice->code == TCN_SELCHANGE) {
@@ -20861,6 +21321,33 @@ static INT_PTR CALLBACK ClientNotesDlgProc(HWND dialog, UINT message,
     break;
   }
   case WM_COMMAND:
+    if (LOWORD(wParam)==IDC_NOTES_FORMAT_MORE && HIWORD(wParam)==BN_CLICKED) {
+      if(state->formatVisible) {
+        state->formatExpanded=!state->formatExpanded;
+        PositionNotesFormat(dialog,*state,GetDpiForWindow(dialog));
+      }
+      return TRUE;
+    }
+    if (LOWORD(wParam)==IDC_NOTES_TOOLS && HIWORD(wParam)==BN_CLICKED) {
+      HideNotesFormat(dialog,*state);CloseNotesPanel(*state);
+      HMENU menu=BuildNotesToolsMenu(dialog);
+      if(menu) {
+        int ownerToken=0;const auto token=reinterpret_cast<HANDLE>(&ownerToken);
+        constexpr const wchar_t *ownerProperty=L"ctSpaces.notes.toolsOwner";
+        if(!SetPropW(dialog,ownerProperty,token)) {DestroyMenu(menu);return TRUE;}
+        const auto root=state->clientRoot;const auto pageId=state->attachedPageId;
+        RECT anchor{};GetWindowRect(GetDlgItem(dialog,IDC_NOTES_TOOLS),&anchor);
+        const UINT chosen=TrackThemedNotesMenu(menu,TPM_RETURNCMD|TPM_NONOTIFY,anchor.left,anchor.bottom,dialog);
+        DestroyMenu(menu);
+        if(IsWindow(dialog) && GetPropW(dialog,ownerProperty)==token) {
+          RemovePropW(dialog,ownerProperty);
+          if(reinterpret_cast<ClientNotesDialogState *>(GetWindowLongPtrW(dialog,DWLP_USER))==state &&
+              state->clientRoot==root && state->attachedPageId==pageId && chosen)
+            SendMessageW(dialog,WM_COMMAND,chosen,0);
+        }
+      }
+      return TRUE;
+    }
     if (LOWORD(wParam)==IDC_NOTES_FORMAT && HIWORD(wParam)==BN_CLICKED) {
       if (state->formatVisible) HideNotesFormat(dialog,*state);
       else {UpdateNotesToolbar(dialog,*state);ShowNotesFormat(dialog,*state,true);}
@@ -21231,9 +21718,14 @@ static void ShowClientNotes(const std::wstring &clientName) {
 
 static bool PrepareNotesForClientChange(const std::wstring &client) {
   if (!g_hNotesWindow) return true;
-  if (!IsWindowEnabled(g_hNotesWindow)) { SetForegroundWindow(GetLastActivePopup(g_hNotesWindow)); return false; }
   auto *state = reinterpret_cast<ClientNotesDialogState *>(GetWindowLongPtrW(g_hNotesWindow,DWLP_USER));
-  if (!state || (!client.empty() && !client_notes::SamePageName(client,state->clientName))) return true;
+  if (state && !client.empty() && !client_notes::SamePageName(client,state->clientName))
+    return true;
+  if (!IsWindowEnabled(g_hNotesWindow)) {
+    SetForegroundWindow(GetLastActivePopup(g_hNotesWindow));
+    return false;
+  }
+  if (!state) return true;
   SendMessageW(g_hNotesWindow,WM_CLOSE,0,0);
   return !g_hNotesWindow;
 }
@@ -22317,13 +22809,22 @@ static void LayoutGuideDialog(HWND dialog, GuideDialogState &state, UINT dpi,
                          : MonitorFromWindow(g_hGui ? g_hGui : dialog,
                                              MONITOR_DEFAULTTONEAREST);
   MONITORINFO monitorInfo{sizeof(monitorInfo)};
-  GetMonitorInfoW(monitor, &monitorInfo);
-  const RECT work = monitorInfo.rcWork;
+  RECT work{};
+  if (GetMonitorInfoW(monitor, &monitorInfo))
+    work = monitorInfo.rcWork;
+  else if (suggested)
+    work = *suggested;
+  else
+    GetWindowRect(dialog, &work);
   const int workWidth = work.right - work.left;
   const int workHeight = work.bottom - work.top;
   const int edge = ScaleByDpi(12, dpi);
-  const int outerWidth = min(ScaleByDpi(800, dpi), max(1, workWidth - edge * 2));
-  const int outerHeight = min(ScaleByDpi(570, dpi), max(1, workHeight - edge * 2));
+  const int outerWidth = suggested
+      ? min(max(1, suggested->right - suggested->left), max(1, workWidth))
+      : min(ScaleByDpi(800, dpi), max(1, workWidth - edge * 2));
+  const int outerHeight = suggested
+      ? min(max(1, suggested->bottom - suggested->top), max(1, workHeight))
+      : min(ScaleByDpi(570, dpi), max(1, workHeight - edge * 2));
 
   int left = work.left + (workWidth - outerWidth) / 2;
   int top = work.top + (workHeight - outerHeight) / 2;
@@ -23648,35 +24149,40 @@ static void RefreshQuickTourPlacement() {
   }
 
   RECT target{};
-  if (!GetQuickTourTargetRect(
-          kQuickTourSteps[g_quickTourState.position].target, target)) {
-    return;
-  }
   const UINT dpi = GetDpiForWindow(g_hGui);
   const int padding = ScaleByDpi(5, dpi);
   const int thickness = max(2, ScaleByDpi(3, dpi));
-  InflateRect(&target, padding, padding);
+  bool showHighlight = GetQuickTourTargetRect(
+      kQuickTourSteps[g_quickTourState.position].target, target);
+  if (showHighlight)
+    InflateRect(&target, padding, padding);
   const int frameWidth = target.right - target.left;
   const int frameHeight = target.bottom - target.top;
-  if (frameWidth <= thickness * 2 || frameHeight <= thickness * 2)
-    return;
+  showHighlight = showHighlight && frameWidth > thickness * 2 &&
+                  frameHeight > thickness * 2;
 
-  HRGN outer = CreateRectRgn(0, 0, frameWidth, frameHeight);
-  HRGN inner = CreateRectRgn(thickness, thickness, frameWidth - thickness,
-                             frameHeight - thickness);
-  if (outer && inner) {
-    CombineRgn(outer, outer, inner, RGN_DIFF);
-    if (SetWindowRgn(g_hQuickTourFrame, outer, TRUE) != 0)
-      outer = nullptr; // The window owns a successfully assigned region.
+  if (showHighlight) {
+    HRGN outer = CreateRectRgn(0, 0, frameWidth, frameHeight);
+    HRGN inner = CreateRectRgn(thickness, thickness, frameWidth - thickness,
+                              frameHeight - thickness);
+    if (outer && inner) {
+      CombineRgn(outer, outer, inner, RGN_DIFF);
+      if (SetWindowRgn(g_hQuickTourFrame, outer, TRUE) != 0)
+        outer = nullptr; // The window owns a successfully assigned region.
+    }
+    if (outer)
+      DeleteObject(outer);
+    if (inner)
+      DeleteObject(inner);
+    SetWindowPos(g_hQuickTourFrame, nullptr, target.left, target.top,
+                 frameWidth, frameHeight,
+                 SWP_NOACTIVATE | SWP_NOZORDER | SWP_SHOWWINDOW);
+    InvalidateRect(g_hQuickTourFrame, nullptr, TRUE);
+  } else {
+    ShowWindow(g_hQuickTourFrame, SW_HIDE);
+    if (!GetWindowRect(g_hGui, &target))
+      return;
   }
-  if (outer)
-    DeleteObject(outer);
-  if (inner)
-    DeleteObject(inner);
-
-  SetWindowPos(g_hQuickTourFrame, nullptr, target.left, target.top,
-               frameWidth, frameHeight,
-               SWP_NOACTIVATE | SWP_NOZORDER | SWP_SHOWWINDOW);
 
   HMONITOR monitor = MonitorFromRect(&target, MONITOR_DEFAULTTONEAREST);
   MONITORINFO monitorInfo{sizeof(monitorInfo)};
@@ -23695,7 +24201,6 @@ static void RefreshQuickTourPlacement() {
   SetWindowPos(g_hQuickTourDialog, nullptr, card.left, card.top,
                card.right - card.left, card.bottom - card.top,
                SWP_NOACTIVATE | SWP_NOZORDER | SWP_SHOWWINDOW);
-  InvalidateRect(g_hQuickTourFrame, nullptr, TRUE);
 }
 
 static void FinishQuickTourCleanup() {
@@ -24123,8 +24628,12 @@ static INT_PTR CALLBACK ThemeDlgProc(HWND hDlg, UINT msg, WPARAM wParam,
     if (iId == IDC_THEME_APPLY) {
       if (vState) {
         vCancelPreviewTimer();
-        if (!ApplyTheme(vState->iCurrentMode, false))
+        if (!ApplyTheme(vState->iCurrentMode, false)) {
+          if (vState->iPreviewedMode != vState->iCurrentMode &&
+              ApplyTheme(vState->iCurrentMode, true))
+            vState->iPreviewedMode = vState->iCurrentMode;
           return (INT_PTR)TRUE;
+        }
         vState->iPreviewedMode = vState->iCurrentMode;
       }
       EndDialog(hDlg, IDOK);
@@ -25448,8 +25957,10 @@ static void ShowPinnedClientOptionsMenu(HWND hWnd,
                                         POINT screenPoint) {
   // TrackPopupMenuEx pumps messages. Keep the chosen name independently of
   // the pinned vector, which a client refresh can prune while the menu is open.
-  if (!hWnd || !IsExistingClientProfile(clientName))
+  if (!hWnd || !g_bUiEnabled || !IsExistingClientProfile(clientName))
     return;
+  const BrowserKind selectedBrowser = g_selectedBrowser;
+  const bool restoreAvailable = HasExistingBrowserSlot(clientName, selectedBrowser);
 
   client_deletion_safety::BoundTree layoutNamespace;
   fs::path layoutRoot;
@@ -25529,7 +26040,8 @@ static void ShowPinnedClientOptionsMenu(HWND hWnd,
           clipboardUrl.has_value());
   addSeparator();
   addItem(commandRestoreTabs, restoreData,
-          ShouldRestoreTabsForClient(clientName, g_selectedBrowser));
+          restoreAvailable && ShouldRestoreTabsForClient(clientName, selectedBrowser),
+          restoreAvailable);
   HMENU layoutMenu = CreatePopupMenu();
   if (layoutMenu) {
     SetMenuInfo(layoutMenu, &menuInfo);
@@ -25572,17 +26084,26 @@ static void ShowPinnedClientOptionsMenu(HWND hWnd,
   DestroyMenu(menu);
   PostMessageW(hWnd, WM_NULL, 0, 0);
 
+  if (!g_bUiEnabled)
+    return;
+  const bool usesSelectedBrowser =
+      command == commandOpen || command == commandOpenClipboard ||
+      command == commandRestoreTabs || command == commandCreateShortcut;
+  if (usesSelectedBrowser && selectedBrowser != g_selectedBrowser)
+    return;
+
   if (command == commandSelect) {
     SelectPinnedClient(clientName);
   } else if (command == commandOpen) {
-    OpenPinnedClient(clientName);
+    OpenPinnedClient(clientName, selectedBrowser);
   } else if (command == commandOpenClipboard && clipboardUrl) {
-    OpenWebUrlForClient(clientName, *clipboardUrl);
-  } else if (command == commandRestoreTabs &&
+    OpenWebUrlForClient(clientName, *clipboardUrl, selectedBrowser);
+  } else if (command == commandRestoreTabs && restoreAvailable &&
+             HasExistingBrowserSlot(clientName, selectedBrowser) &&
              SelectPinnedClient(clientName)) {
     ToggleRestoreTabsForSelectedClient();
   } else if (command == commandCreateShortcut) {
-    CreateClientDesktopShortcut(clientName, g_selectedBrowser);
+    CreateClientDesktopShortcut(clientName, selectedBrowser);
   } else if (command == commandClientNotes) {
     ShowClientNotes(clientName);
   } else if (command == commandQuickNote) {
@@ -25602,6 +26123,7 @@ static void ShowPinnedOverflowMenu(HWND hWnd, bool selectOnly) {
   if ((int)g_pinnedClients.size() <= MAX_VISIBLE_PINNED_CLIENTS)
     return;
 
+  const BrowserKind selectedBrowser = g_selectedBrowser;
   HMENU menu = CreatePopupMenu();
   if (!menu)
     return;
@@ -25638,8 +26160,8 @@ static void ShowPinnedOverflowMenu(HWND hWnd, bool selectOnly) {
         index < (int)items.size()) {
       if (selectOnly)
         SelectPinnedClient(items[index].text);
-      else
-        OpenPinnedClient(items[index].text);
+      else if (selectedBrowser == g_selectedBrowser)
+        OpenPinnedClient(items[index].text, selectedBrowser);
     }
   }
 }
@@ -25708,6 +26230,20 @@ static void FinishPinnedDragPersistence(bool savePinnedOrder) {
   UpdatePinButtonState();
   if (g_hGui)
     InvalidateRect(g_hGui, &g_rcPinnedArea, TRUE);
+}
+
+static void ClearMainPointerGesture() {
+  g_mainControlPress = MainControlPress::None;
+  g_sessionClosePressIdentity = 0;
+  if (g_mainDragKind == MainDragKind::None)
+    return;
+  const bool savePinnedOrder = g_bPinnedOrderChanged;
+  g_mainDragKind = MainDragKind::None;
+  g_iMainDragIndex = -1;
+  g_mainDragSessionIdentity = 0;
+  g_bMainDragActive = false;
+  g_bPinnedOrderChanged = false;
+  FinishPinnedDragPersistence(savePinnedOrder);
 }
 
 static void MovePinnedClientForDrag(int fromIndex, int toIndex) {
@@ -26204,6 +26740,22 @@ static bool HitTestSessionOverflow(HWND hWnd, POINT pt) {
          PtInRect(&g_rcSessionOverflow, pt);
 }
 
+static MainControlPress HitTestMainControl(HWND hWnd, POINT point) {
+  if (!g_bUiEnabled || HitTestPinnedClient(point) >= 0 ||
+      HitTestSessionClose(hWnd, point) > 0)
+    return MainControlPress::None;
+  if (HitTestSessionOverflow(hWnd, point))
+    return MainControlPress::SessionOverflow;
+  const int tab = HitTestSessionTab(hWnd, point);
+  if (tab >= 0)
+    return tab == 0 ? MainControlPress::NewTab : MainControlPress::None;
+  if (PtInRect(&g_rcBrowserSelector, point))
+    return MainControlPress::BrowserSelector;
+  if (HitTestPinnedOverflow(point))
+    return MainControlPress::PinnedOverflow;
+  return MainControlPress::None;
+}
+
 static void SwitchToLaunchModeForInput() {
   if (g_iSelectedSessionTab <= 0)
     return;
@@ -26377,6 +26929,33 @@ static bool IsStandardClientSession(const Session &session) {
          _wcsicmp(session.clientName.c_str(), L"Default") != 0;
 }
 
+static void SelectLauncherBrowser(BrowserKind browser) {
+  const BrowserKind previousBrowser = g_selectedBrowser;
+  g_selectedBrowser = browser;
+  if (!SaveBrowserPreference()) {
+    g_selectedBrowser = previousBrowser;
+  } else {
+    const bool sessionSelected = g_iSelectedSessionTab > 0 &&
+        g_iSelectedSessionTab <= static_cast<int>(g_sessions.size());
+    if (!sessionSelected || IsStandardClientSession(g_sessions[g_iSelectedSessionTab - 1])) {
+      const auto clientName = GetSelectedClientNameSanitized(false);
+      const auto target = std::ranges::find_if(g_sessions, [&](const Session &session) {
+        return session.browser == browser &&
+               client_name_comparison::EqualIgnoringCase(session.clientName, clientName);
+      });
+      const int tab = target == g_sessions.end()
+                          ? 0
+                          : static_cast<int>(target - g_sessions.begin()) + 1;
+      if (tab != g_iSelectedSessionTab)
+        SelectSessionTab(tab, false);
+    }
+  }
+  UpdateRestoreTabsToggleState();
+  UpdateConfigMenuEnabledState();
+  if (g_hGui)
+    InvalidateRect(g_hGui, &g_rcUtilityBar, TRUE);
+}
+
 static void UpdateCloseAllButtonState() {
   if (!g_hBtnCloseAll)
     return;
@@ -26459,28 +27038,6 @@ static void RequestCloseAllClientsNormally() {
   }
 }
 
-static bool RequestSessionClose(DWORD pid) {
-  const auto process = GetTrackedProfileProcess(pid);
-  if (!process || WaitForSingleObject(process.get(), 0) != WAIT_TIMEOUT)
-    return false;
-  EnumData data{pid};
-  EnumWindows(EnumWindowsCallback, (LPARAM)&data);
-
-  bool bPosted = false;
-  for (HWND ew : data.windows) {
-    if (IsWindowVisible(ew)) {
-      PostMessageW(ew, WM_CLOSE, 0, 0);
-      bPosted = true;
-    }
-  }
-
-  if (bPosted)
-    return true;
-
-  const BOOL bTerminated = TerminateProcess(process.get(), 0);
-  return bTerminated != FALSE;
-}
-
 static bool RequestSessionShutdown(DWORD pid) {
   const auto process = GetTrackedProfileProcess(pid);
   if (!process || WaitForSingleObject(process.get(), 0) != WAIT_TIMEOUT)
@@ -26516,15 +27073,24 @@ static void CloseSessionTab(int iTab) {
   if (iTab <= 0 || iTab > (int)g_sessions.size())
     return;
 
-  const Session &s = g_sessions[iTab - 1];
-  RequestSessionClose(s.pid);
+  const DWORD pid = g_sessions[iTab - 1].pid;
+  if (!RequestSessionCloseNormally(pid)) {
+    const auto process = GetTrackedProfileProcess(pid);
+    if (process && WaitForSingleObject(process.get(), 0) == WAIT_TIMEOUT) {
+      MessageBoxW(g_hGui,
+                  L"The browser window could not receive the close request. "
+                  L"Wait for the window to open, then try Close again.",
+                  L"Close browser", MB_OK | MB_ICONINFORMATION);
+    }
+    return;
+  }
   if (g_iSelectedSessionTab == iTab)
     SelectSessionTab(0, false);
   InvalidateSessionTabs(g_hGui);
 }
 
 static void ShowSessionOverflowMenu(HWND hWnd) {
-  if (g_overflowSessionTabs.empty())
+  if (!g_bUiEnabled || g_overflowSessionTabs.empty())
     return;
 
   std::vector<Session> targets;
@@ -26554,13 +27120,24 @@ static void ShowSessionOverflowMenu(HWND hWnd) {
     item.dwItemData = reinterpret_cast<ULONG_PTR>(&items.back());
     InsertMenuItemW(hMenu, static_cast<UINT>(-1), TRUE, &item);
   };
+  std::vector<std::wstring> labels;
+  labels.reserve(targets.size());
+  for (const auto &target : targets) {
+    const bool hasOtherBrowser = std::ranges::any_of(g_sessions, [&](const Session &session) {
+      return session.browser != target.browser &&
+             client_name_comparison::EqualIgnoringCase(session.clientName, target.clientName);
+    });
+    labels.push_back(hasOtherBrowser
+        ? std::format(L"{} ({})", target.clientName, GetBrowserDisplayName(target.browser))
+        : target.clientName);
+  }
   for (size_t index = 0; index < targets.size(); ++index)
-    append(static_cast<UINT>(index + 1), targets[index].clientName);
+    append(static_cast<UINT>(index + 1), labels[index]);
 
   append(0, L"", true);
   for (size_t index = 0; index < targets.size(); ++index)
     append(static_cast<UINT>(targets.size() + index + 1),
-           L"Close " + targets[index].clientName);
+           L"Close " + labels[index]);
 
   POINT pt{g_rcSessionOverflow.left, g_rcSessionOverflow.bottom};
   ClientToScreen(hWnd, &pt);
@@ -26570,7 +27147,9 @@ static void ShowSessionOverflowMenu(HWND hWnd) {
   DestroyMenu(hMenu);
   PostMessageW(hWnd, WM_NULL, 0, 0);
 
-  if (!cmd || cmd > targets.size() * 2)
+  // The popup pumps messages. Another launcher action may have taken
+  // ownership before the selected command returns.
+  if (!g_bUiEnabled || !cmd || cmd > targets.size() * 2)
     return;
   const bool close = cmd > targets.size();
   const Session &target = targets[(cmd - 1) % targets.size()];
@@ -26654,7 +27233,10 @@ static void OnSessionEnded(DWORD pid) {
   }
 
   BuildSessionTabRects(g_hGui, nullptr);
-  SelectSessionTab(g_iSelectedSessionTab, false);
+  if (removedSelected)
+    SelectSessionTab(0, false);
+  else
+    InvalidateSessionTabs(g_hGui);
 
   const std::wstring currentComboText = GetClientInputText();
   const bool removedSpecialProfile =

@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+ <ItemGroup Label="ProjectConfigurations"><ProjectConfiguration Include="Release|x64"><Configuration>Release</Configuration><Platform>x64</Platform></ProjectConfiguration></ItemGroup>
+ <PropertyGroup Label="Globals"><VCProjectVersion>17.0</VCProjectVersion><Keyword>Win32Proj</Keyword><ProjectGuid>{296728C7-568D-48CC-B23C-15806C47CF54}</ProjectGuid><RootNamespace>RecoveryRestoreAdversarialTests</RootNamespace><WindowsTargetPlatformVersion>10.0</WindowsTargetPlatformVersion></PropertyGroup>
+ <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
+ <PropertyGroup Label="Configuration"><ConfigurationType>Application</ConfigurationType><UseDebugLibraries>false</UseDebugLibraries><PlatformToolset>v145</PlatformToolset><CharacterSet>Unicode</CharacterSet></PropertyGroup>
+ <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+ <PropertyGroup><TargetName>RecoveryRestoreAdversarialTests</TargetName></PropertyGroup>
+ <ItemDefinitionGroup>
+  <ClCompile><WarningLevel>Level4</WarningLevel><SDLCheck>true</SDLCheck><ConformanceMode>true</ConformanceMode><PreprocessorDefinitions>CTSPACES_BACKUP_TEST_HOOKS;NDEBUG;_CONSOLE;%(PreprocessorDefinitions)</PreprocessorDefinitions><AdditionalIncludeDirectories>$(ProjectDir)..;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories><ForcedIncludeFiles>$(RecoveryRestoreSourceHeader);%(ForcedIncludeFiles)</ForcedIncludeFiles><Optimization>MinSpace</Optimization><FunctionLevelLinking>true</FunctionLevelLinking><LanguageStandard>stdcpp20</LanguageStandard><RuntimeLibrary>MultiThreaded</RuntimeLibrary></ClCompile>
+  <ResourceCompile><AdditionalIncludeDirectories>$(ProjectDir)..;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories></ResourceCompile>
+  <Link><SubSystem>Console</SubSystem><GenerateDebugInformation>true</GenerateDebugInformation><OptimizeReferences>true</OptimizeReferences><EnableCOMDATFolding>true</EnableCOMDATFolding><AdditionalLibraryDirectories>$(ProjectDir)..\dist\x64\Release;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories><AdditionalDependencies>7zip.lib;%(AdditionalDependencies)</AdditionalDependencies><AdditionalOptions>/WHOLEARCHIVE:7zip.lib %(AdditionalOptions)</AdditionalOptions></Link>
+ </ItemDefinitionGroup>
+ <ItemGroup>
+  <ClCompile Include="RecoveryRestoreAdversarialTests.cpp" />
+  <ClCompile Include="..\BackupEngine.cpp"><PreprocessorDefinitions>CTSPACES_RECOVERY_RESTORE_BACKEND_BOUNDARY;%(PreprocessorDefinitions)</PreprocessorDefinitions><ForcedIncludeFiles>$(ProjectDir)RecoveryRestoreNativeBoundary.h;$(RecoveryRestoreSourceHeader);%(ForcedIncludeFiles)</ForcedIncludeFiles></ClCompile>
+  <ClCompile Include="..\BrowserPreferencesJson.cpp" /><ClCompile Include="..\ConfigPersistence.cpp" /><ClCompile Include="..\GuidedWalkthrough.cpp" /><ClCompile Include="..\InProc7z.cpp" /><ClCompile Include="..\ProgressUI.cpp" /><ResourceCompile Include="..\ctSpaces.rc" />
+ </ItemGroup>
+ <Target Name="RequireRecoveryRestoreBinding" BeforeTargets="PrepareForBuild"><Error Condition="'$(RecoveryRestoreSourceHeader)' == '' Or !Exists('$(RecoveryRestoreSourceHeader)')" Text="Use Test-RecoveryRestoreAdversarial.ps1 with a complete frozen source tree." /></Target>
+ <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+</Project>

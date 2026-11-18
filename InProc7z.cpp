@@ -131,6 +131,15 @@ static HRESULT ReportArchiveDetail(_7zProgressPhase phase, UInt64 completed,
     catch(...){return E_ABORT;}
 }
 
+// Terminal reports run outside the COM callbacks. Keep callback exceptions in
+// the HRESULT flow so callers still report any temporary data cleanup retains.
+static HRESULT ReportArchiveCompletion(_7zProgressCb callback, void *user,
+    _7zOp operation) noexcept {
+    if (!callback) return S_OK;
+    try { callback(user, operation, 100, nullptr); return S_OK; }
+    catch (...) { return E_ABORT; }
+}
+
 // Capture operation-local callbacks on the caller thread. 7-Zip can later
 // invoke the callback object on codec worker threads whose TLS is unrelated.
 struct COperationProgress {
@@ -346,16 +355,20 @@ struct CDirItem{
     UInt32 VolumeId=0;
 };
 
-struct CSourceDirectoryLease {
-    HANDLE Handle=INVALID_HANDLE_VALUE;
-    ~CSourceDirectoryLease(){if(Handle!=INVALID_HANDLE_VALUE)::CloseHandle(Handle);}
+struct CSourceHandle {
+    HANDLE Handle;
+    explicit CSourceHandle(HANDLE handle=INVALID_HANDLE_VALUE) : Handle(handle) {}
+    CSourceHandle(const CSourceHandle&) = delete;
+    CSourceHandle& operator=(const CSourceHandle&) = delete;
+    ~CSourceHandle() { if (Handle!=INVALID_HANDLE_VALUE) ::CloseHandle(Handle); }
 };
 
-using CSourceDirectoryLeases=std::vector<std::unique_ptr<CSourceDirectoryLease>>;
+using CSourceDirectoryLeases=std::vector<std::unique_ptr<CSourceHandle>>;
 
 static HRESULT PinSourceDirectory(const std::filesystem::path& path,
-                                  CSourceDirectoryLeases& leases){
-    auto lease=std::make_unique<CSourceDirectoryLease>();
+                                  CSourceDirectoryLeases& leases,
+                                  CDirItem* archiveItem=nullptr){
+    auto lease=std::make_unique<CSourceHandle>();
     lease->Handle=::CreateFileW(path.c_str(),GENERIC_READ,
         FILE_SHARE_READ,nullptr,OPEN_EXISTING,
         FILE_FLAG_OPEN_REPARSE_POINT|FILE_FLAG_BACKUP_SEMANTICS,nullptr);
@@ -365,6 +378,13 @@ static HRESULT PinSourceDirectory(const std::filesystem::path& path,
        !(info.dwFileAttributes&FILE_ATTRIBUTE_DIRECTORY) ||
        (info.dwFileAttributes&FILE_ATTRIBUTE_REPARSE_POINT))
         return HRESULT_FROM_WIN32(ERROR_CANT_ACCESS_FILE);
+    if(archiveItem){
+        // Windows directory enumeration may cache metadata for later siblings.
+        archiveItem->Attrib=info.dwFileAttributes;
+        archiveItem->CTime=info.ftCreationTime;
+        archiveItem->ATime=info.ftLastAccessTime;
+        archiveItem->MTime=info.ftLastWriteTime;
+    }
     leases.push_back(std::move(lease));
     return S_OK;
 }
@@ -382,13 +402,13 @@ static HRESULT PinSourceAncestors(const std::filesystem::path& source,
 }
 
 static HRESULT BindSourceFile(CDirItem& item){
-    HANDLE first=::CreateFileW(item.FullPath.Ptr(),GENERIC_READ,FILE_SHARE_READ,
-        nullptr,OPEN_EXISTING,FILE_FLAG_OPEN_REPARSE_POINT,nullptr);
-    if(first==INVALID_HANDLE_VALUE)return HRESULT_FROM_WIN32(::GetLastError());
+    const CSourceHandle first(::CreateFileW(item.FullPath.Ptr(),GENERIC_READ,FILE_SHARE_READ,
+        nullptr,OPEN_EXISTING,FILE_FLAG_OPEN_REPARSE_POINT,nullptr));
+    if(first.Handle==INVALID_HANDLE_VALUE)return HRESULT_FROM_WIN32(::GetLastError());
     BY_HANDLE_FILE_INFORMATION identity{};
-    const bool regular=::GetFileInformationByHandle(first,&identity) &&
+    const bool regular=::GetFileInformationByHandle(first.Handle,&identity) &&
         !(identity.dwFileAttributes&(FILE_ATTRIBUTE_DIRECTORY|FILE_ATTRIBUTE_REPARSE_POINT));
-    if(!regular){::CloseHandle(first);return HRESULT_FROM_WIN32(ERROR_CANT_ACCESS_FILE);}
+    if(!regular)return HRESULT_FROM_WIN32(ERROR_CANT_ACCESS_FILE);
     CInFileStream* stream=new CInFileStream;
     CMyComPtr<IInStream> owned(stream);
     const bool opened=stream->OpenShared(item.FullPath,false);
@@ -398,8 +418,13 @@ static HRESULT BindSourceFile(CDirItem& item){
     const bool same=SUCCEEDED(properties) && props.VolID==identity.dwVolumeSerialNumber &&
         props.FileID_Low==fileId && props.Size==item.Size &&
         !(props.Attrib&(FILE_ATTRIBUTE_DIRECTORY|FILE_ATTRIBUTE_REPARSE_POINT));
-    ::CloseHandle(first);
     if(!same)return FAILED(properties)?properties:HRESULT_FROM_WIN32(ERROR_FILE_INVALID);
+    // 7-Zip uses these properties directly for empty files. Take them from
+    // the bound stream because Windows directory enumeration may cache them.
+    item.Attrib=props.Attrib;
+    item.CTime=props.CTime;
+    item.ATime=props.ATime;
+    item.MTime=props.MTime;
     item.FileId=fileId;
     item.VolumeId=identity.dwVolumeSerialNumber;
     item.SourceStream=owned;
@@ -430,6 +455,14 @@ static FString BasenameOfPath(const FString& p){
     if(pos>=0) return p.Ptr(pos+1);
     return p;
 }
+
+struct CSourceSearch {
+    HANDLE Handle;
+    explicit CSourceSearch(HANDLE handle) : Handle(handle) {}
+    CSourceSearch(const CSourceSearch&) = delete;
+    CSourceSearch& operator=(const CSourceSearch&) = delete;
+    ~CSourceSearch() { if (Handle!=INVALID_HANDLE_VALUE) ::FindClose(Handle); }
+};
 
 static HRESULT EnumDirRecursive(
     const FString& rootDirFull,
@@ -462,13 +495,11 @@ static HRESULT EnumDirRecursive(
     pattern+=FTEXT("*");
 
     WIN32_FIND_DATAW fd;
-    HANDLE h=::FindFirstFileW(pattern.Ptr(),&fd);
-    if(h==INVALID_HANDLE_VALUE){
+    const CSourceSearch search(::FindFirstFileW(pattern.Ptr(),&fd));
+    if(search.Handle==INVALID_HANDLE_VALUE){
         DWORD e=::GetLastError();
         return HRESULT_FROM_WIN32(e);
     }
-
-    const auto CloseFind=[&](){ ::FindClose(h); };
 
     do{
         const wchar_t* name=fd.cFileName;
@@ -479,18 +510,16 @@ static HRESULT EnumDirRecursive(
             for(size_t i=0;i<selectedChildren->size();++i)
                 if(client_name_comparison::EqualIgnoringCase(name,(*selectedChildren)[i])){selected=i;break;}
             if(selected==selectedChildren->size())continue;
-            if(seen[selected]){CloseFind();return HRESULT_FROM_WIN32(ERROR_DUP_NAME);}
-            if(!(fd.dwFileAttributes&FILE_ATTRIBUTE_DIRECTORY)){CloseFind();return HRESULT_FROM_WIN32(ERROR_DIRECTORY);}
+            if(seen[selected])return HRESULT_FROM_WIN32(ERROR_DUP_NAME);
+            if(!(fd.dwFileAttributes&FILE_ATTRIBUTE_DIRECTORY))return HRESULT_FROM_WIN32(ERROR_DIRECTORY);
             seen[selected]=true;
         }
 
         if((fd.dwFileAttributes&FILE_ATTRIBUTE_REPARSE_POINT)!=0){
-            CloseFind();
             return HRESULT_FROM_WIN32(ERROR_CANT_ACCESS_FILE);
         }
         const unsigned childDepth=currentDepth+1;
         if(childDepth>CtArchiveSafety::kMaxDirectoryDepth){
-            CloseFind();
             return HRESULT_FROM_WIN32(ERROR_FILENAME_EXCED_RANGE);
         }
         const bool isDir=(fd.dwFileAttributes&FILE_ATTRIBUTE_DIRECTORY)!=0;
@@ -529,30 +558,25 @@ static HRESULT EnumDirRecursive(
         item.Path_For_Handler=arcPath;
         item.FullPath=childFull;
         item.IsDir=isDir;
-        item.Attrib=fd.dwFileAttributes;
-        item.CTime=fd.ftCreationTime;
-        item.ATime=fd.ftLastAccessTime;
-        item.MTime=fd.ftLastWriteTime;
         item.Size=((UInt64)fd.nFileSizeHigh<<32)|(UInt64)fd.nFileSizeLow;
 
         HRESULT hr=ChargeEnumerationBudget(budget,isDir,item.Size);
-        if(FAILED(hr)){ CloseFind(); return hr; }
-        hr=isDir?PinSourceDirectory(std::filesystem::path(childFull.Ptr()),leases):BindSourceFile(item);
-        if(FAILED(hr)){CloseFind();return hr;}
+        if(FAILED(hr))return hr;
+        hr=isDir?PinSourceDirectory(std::filesystem::path(childFull.Ptr()),leases,&item):BindSourceFile(item);
+        if(FAILED(hr))return hr;
         outItems.Add(item);
         hr=ReportArchiveDetail(g__7zDetailedPhase,budget.SourceBytes,0,budget.ItemCount,0,false,arcPath.Ptr());
-        if(FAILED(hr)){CloseFind();return hr;}
+        if(FAILED(hr))return hr;
 
         if(isDir){
             hr=EnumDirRecursive(rootDirFull,childFull,rootNameInArchive,
                                 childDepth,budget,outItems,leases);
-            if(FAILED(hr)){ CloseFind(); return hr; }
+            if(FAILED(hr))return hr;
         }
 
-    } while(::FindNextFileW(h,&fd));
+    } while(::FindNextFileW(search.Handle,&fd));
 
     const DWORD last=::GetLastError();
-    CloseFind();
     if(selectedChildren && std::find(seen.begin(),seen.end(),false)!=seen.end())return HRESULT_FROM_WIN32(ERROR_PATH_NOT_FOUND);
     if(last!=ERROR_NO_MORE_FILES){
         return HRESULT_FROM_WIN32(last);
@@ -570,10 +594,35 @@ static HRESULT EnumDirRecursive(
 // -------------------------
 static const wchar_t* const kEmptyFileAlias=L"[Content]";
 
+struct CArchiveItemTimes {
+    FILETIME CTime{},ATime{},MTime{};
+    bool CTimeDefined=false,ATimeDefined=false,MTimeDefined=false;
+    HRESULT Apply(HANDLE file) const noexcept {
+        if(!CTimeDefined && !ATimeDefined && !MTimeDefined)return S_OK;
+        return ::SetFileTime(file,CTimeDefined?&CTime:nullptr,ATimeDefined?&ATime:nullptr,
+            MTimeDefined?&MTime:nullptr)?S_OK:LastExtractIoError();
+    }
+};
+
+static HRESULT ReadArchiveItemTimes(IInArchive* archive,UInt32 index,CArchiveItemTimes& times){
+    const auto read=[&](PROPID id,FILETIME& value,bool& defined)->HRESULT{
+        NCOM::CPropVariant prop;
+        const HRESULT result=archive->GetProperty(index,id,&prop);
+        if(result!=S_OK)return FAILED(result)?result:E_FAIL;
+        if(prop.vt==VT_EMPTY){defined=false;return S_OK;}
+        if(prop.vt!=VT_FILETIME)return E_INVALIDARG;
+        value=prop.filetime;defined=true;return S_OK;
+    };
+    RINOK(read(kpidCTime,times.CTime,times.CTimeDefined))
+    RINOK(read(kpidATime,times.ATime,times.ATimeDefined))
+    return read(kpidMTime,times.MTime,times.MTimeDefined);
+}
+
 struct CExtractedObject {
     std::filesystem::path Path;
     HANDLE Handle=INVALID_HANDLE_VALUE;
     BY_HANDLE_FILE_INFORMATION Identity{};
+    CArchiveItemTimes Times;
     bool Directory=false;
     ~CExtractedObject(){if(Handle!=INVALID_HANDLE_VALUE)::CloseHandle(Handle);}
 };
@@ -582,7 +631,7 @@ struct CExtractionOwnership {
     std::filesystem::path Root;
     CSourceDirectoryLeases Ancestors;
     std::vector<std::unique_ptr<CExtractedObject>> Created;
-    std::set<std::wstring,CArchivePathLess> Directories;
+    std::map<std::wstring,CExtractedObject*,CArchivePathLess> Directories;
     bool OwnRoot=false;
     HRESULT VerifyInventory(const std::vector<_7zRestoreObjectIdentity>& sealed) const {
         if(sealed.size()!=Created.size())return HRESULT_FROM_WIN32(ERROR_FILE_INVALID);
@@ -611,7 +660,10 @@ struct CExtractionOwnership {
                  const BY_HANDLE_FILE_INFORMATION* expected=nullptr){
         auto object=std::make_unique<CExtractedObject>();object->Path=path;object->Directory=directory;
         const auto ioPath=CtRestoreIo::Path(path);
-        object->Handle=::CreateFileW(ioPath.c_str(),(directory?DELETE|GENERIC_READ:GENERIC_READ),
+        // The wrapper root has no archived times to restore. Keep its previous
+        // access requirements; only owned payload directories need time writes.
+        const DWORD access=directory?(DELETE|GENERIC_READ|(path==Root?0u:FILE_WRITE_ATTRIBUTES)):GENERIC_READ;
+        object->Handle=::CreateFileW(ioPath.c_str(),access,
             FILE_SHARE_READ,nullptr,OPEN_EXISTING,
             FILE_FLAG_OPEN_REPARSE_POINT|(directory?FILE_FLAG_BACKUP_SEMANTICS:0),nullptr);
         if(object->Handle==INVALID_HANDLE_VALUE)return HRESULT_FROM_WIN32(::GetLastError());
@@ -630,8 +682,9 @@ struct CExtractionOwnership {
                 recorded->Handle=object->Handle;object->Handle=INVALID_HANDLE_VALUE;return S_OK;
             }
         }
-        if(directory)Directories.insert(path.native());
-        Created.push_back(std::move(object));return S_OK;
+        Created.push_back(std::move(object));
+        if(directory)Directories.emplace(path.native(),Created.back().get());
+        return S_OK;
     }
     HRESULT Init(const std::filesystem::path& root,bool ownRoot,HANDLE protectedRoot){
         Root=std::filesystem::absolute(root).lexically_normal();OwnRoot=ownRoot;
@@ -652,8 +705,8 @@ struct CExtractionOwnership {
                 identity.nFileIndexLow==object->Identity.nFileIndexLow;
             if(named!=INVALID_HANDLE_VALUE)::CloseHandle(named);
             if(!same)return HRESULT_FROM_WIN32(ERROR_FILE_INVALID);
-            Directories.insert(Root.native());
             Created.push_back(std::move(object));
+            Directories.emplace(Root.native(),Created.back().get());
         }
         return S_OK;
     }
@@ -670,6 +723,38 @@ struct CExtractionOwnership {
             const auto ioCurrent=CtRestoreIo::Path(current);
             if(!::CreateDirectoryW(ioCurrent.c_str(),nullptr))return HRESULT_FROM_WIN32(::GetLastError());
             RINOK(Bind(current,true))
+        }
+        return S_OK;
+    }
+    HRESULT RecordDirectoryTimes(const std::filesystem::path& path,const CArchiveItemTimes& times){
+        const auto normalize=[](std::filesystem::path value){
+            value=value.lexically_normal();
+            while(value.has_relative_path() && value.filename().empty())value=value.parent_path();
+            return value;
+        };
+        const auto normalized=normalize(path);
+        // The temporary wrapper root is not an archive payload directory. Its
+        // protected duplicate deliberately has no attribute-writing rights.
+        if(normalized==normalize(Root))return S_OK;
+        const auto found=Directories.find(normalized.native());
+        if(found==Directories.end())return HRESULT_FROM_WIN32(ERROR_FILE_INVALID);
+        found->second->Times=times;return S_OK;
+    }
+    HRESULT ApplyDirectoryTimes(std::wstring& failedRelative){
+        // Parent creation/child extraction changes directory write times.
+        // Restore them last, deepest first, through the original owned handles.
+        for(auto item=Created.rbegin();item!=Created.rend();++item){
+            const auto& object=**item;
+            if(!object.Directory || object.Path==Root)continue;
+            BY_HANDLE_FILE_INFORMATION current{};
+            HRESULT result=S_OK;
+            if(object.Handle==INVALID_HANDLE_VALUE || !::GetFileInformationByHandle(object.Handle,&current) ||
+               current.dwVolumeSerialNumber!=object.Identity.dwVolumeSerialNumber ||
+               current.nFileIndexHigh!=object.Identity.nFileIndexHigh || current.nFileIndexLow!=object.Identity.nFileIndexLow ||
+               !(current.dwFileAttributes&FILE_ATTRIBUTE_DIRECTORY) || (current.dwFileAttributes&FILE_ATTRIBUTE_REPARSE_POINT))
+                result=HRESULT_FROM_WIN32(ERROR_FILE_INVALID);
+            else result=object.Times.Apply(object.Handle);
+            if(FAILED(result)){failedRelative=object.Path.lexically_relative(Root).native();return result;}
         }
         return S_OK;
     }
@@ -766,6 +851,7 @@ class CArchiveExtractCallback Z7_final:
         UInt32 Attrib=0;
         bool isDir=false;
         bool Attrib_Defined=false;
+        CArchiveItemTimes Times;
     } _processed{};
 
     COutFileStream* _outFileStreamSpec=nullptr;
@@ -844,6 +930,19 @@ public:
     HRESULT ClosePendingOutput(){
         const HRESULT result=_outFileStreamSpec?_outFileStreamSpec->Close():S_OK;
         _outFileStream.Release();_outFileStreamSpec=nullptr;return result;
+    }
+
+    HRESULT FinalizeDirectoryTimes(){
+        try{
+            if(!_ownership)return S_OK;
+            std::wstring failedRelative;
+            const HRESULT result=_ownership->ApplyDirectoryTimes(failedRelative);
+            if(FAILED(result)){
+                _filePath=failedRelative.c_str();
+                return RecordFailure(result,L"A restore staging directory's timestamps could not be restored through its original handle.");
+            }
+            return S_OK;
+        }catch(...){return ExceptionFailure(L"Restore staging directory timestamps could not be finalized.");}
     }
 
     void EndProgressLine();
@@ -1002,6 +1101,9 @@ Z7_COM7F_IMF(CArchiveExtractCallback::GetStream(UInt32 index,ISequentialOutStrea
             }
     }
 
+    const HRESULT readTimes=ReadArchiveItemTimes(_archiveHandler,index,_processed.Times);
+    if(FAILED(readTimes))return RecordFailure(readTimes,L"The archive entry timestamps could not be read.");
+
 
     // Ensure parent dirs exist
     {
@@ -1102,6 +1204,12 @@ Z7_COM7F_IMF(CArchiveExtractCallback::SetOperationResult(Int32 operationResult))
     }
 
     if(_outFileStream&&_outFileStreamSpec){
+        if(_extractMode && operationResult==NArchive::NExtract::NOperationResult::kOK){
+            // The stream still owns the exact CREATE_NEW object here. Set its
+            // times before close, attributes, and the read-only ownership lease.
+            const HRESULT timed=_processed.Times.Apply(_outFileStreamSpec->File.GetHandle());
+            if(FAILED(timed))RecordFailure(timed,L"A restore staging file's timestamps could not be restored through its output handle.");
+        }
         const HRESULT hrClose=_outFileStreamSpec->Close();
         if(hrClose!=S_OK){
             PrintError("WARNING: cannot close output file",_diskFilePath);
@@ -1111,9 +1219,15 @@ Z7_COM7F_IMF(CArchiveExtractCallback::SetOperationResult(Int32 operationResult))
     _outFileStream.Release();
     _outFileStreamSpec=nullptr;
 
+    if(_ownership && _extractMode && _processed.isDir && operationResult==NArchive::NExtract::NOperationResult::kOK){
+        const HRESULT recorded=_ownership->RecordDirectoryTimes(std::filesystem::path(_diskFilePath.Ptr()),_processed.Times);
+        if(FAILED(recorded))return RecordFailure(recorded,L"A restore staging directory could not retain its archived timestamps safely.");
+    }
+
     if(_extractMode&&_processed.Attrib_Defined){
         const FString ioOutput=_ownership?us2fs(UString(CtRestoreIo::Path(std::filesystem::path(_diskFilePath.Ptr())).c_str())):_diskFilePath;
-        SetFileAttrib_PosixHighDetect(ioOutput,_processed.Attrib);
+        if(!SetFileAttrib_PosixHighDetect(ioOutput,_processed.Attrib))
+            return RecordFailure(LastExtractIoError(),L"A restore staging item's attributes could not be restored.");
     }
     if(_ownership && _extractMode && !_processed.isDir){
         const HRESULT bound=_ownership->Bind(std::filesystem::path(_diskFilePath.Ptr()),false,&_outputIdentity);
@@ -1341,7 +1455,7 @@ static HRESULT Apply7zBackupProps(IOutArchive* outArchive){
     if(!setProps)
         return E_NOINTERFACE;
 
-    const wchar_t* const names[]={L"x",L"0",L"d",L"s",L"mt",L"memuse"};
+    const wchar_t* const names[]={L"x",L"0",L"d",L"s",L"mt",L"memuse",L"tc",L"ta",L"tm"};
     NCOM::CPropVariant vals[Z7_ARRAY_SIZE(names)];
     unsigned n=0;
     vals[n++]=(UInt32)5;
@@ -1350,6 +1464,11 @@ static HRESULT Apply7zBackupProps(IOutArchive* outArchive){
     vals[n++]=L"2g";
     vals[n++]=L"on";
     vals[n++]=L"p50";
+    // 7-Zip stores only modification times by default. Keep all available
+    // source times in new backups; older archives may omit creation/access.
+    vals[n++]=true;
+    vals[n++]=true;
+    vals[n++]=true;
     return setProps->SetProperties(names,vals,Z7_ARRAY_SIZE(names));
 }
 
@@ -1525,8 +1644,9 @@ static HRESULT CompressDirectory7zImpl(
     cbSpec->EndProgressLine();
     if(hr==S_FALSE || cbSpec->NumErrors!=0 || cbSpec->FailedFiles.Size()!=0)
         return E_FAIL;
-    if(SUCCEEDED(hr) && g__7zProgressCb)
-        g__7zProgressCb(g__7zProgressUser,_7zOp::Compress,100,nullptr);
+    if(SUCCEEDED(hr)) {
+        RINOK(ReportArchiveCompletion(g__7zProgressCb,g__7zProgressUser,_7zOp::Compress))
+    }
     if(FAILED(hr))return hr;
     RINOK(ReportArchiveDetail(_7zProgressPhase::Compressing,budget.SourceBytes,budget.SourceBytes,items.Size(),items.Size(),budget.SourceBytes!=0))
     // Directory leases prevent namespace substitutions; file streams deny
@@ -1590,6 +1710,8 @@ static HRESULT ExtractOrTestOpenedArchive7z(IInArchive* inArchive,
     HRESULT hr=inArchive->Extract(NULL,(UInt32)(Int32)(-1),testMode,cb);
     const HRESULT closed=cbSpec->ClosePendingOutput();
     if(FAILED(closed))cbSpec->RecordFailure(closed,L"The pending restore output file could not be closed.");
+    if(hr==S_OK && !cbSpec->ProgressAborted() && SUCCEEDED(cbSpec->FirstFailure()))
+        cbSpec->FinalizeDirectoryTimes();
     cbSpec->EndProgressLine();
     if(hr==E_ABORT || cbSpec->ProgressAborted())return E_ABORT;
     if(FAILED(cbSpec->FirstFailure())){
@@ -1600,6 +1722,8 @@ static HRESULT ExtractOrTestOpenedArchive7z(IInArchive* inArchive,
     if(FAILED(hr) && errorDetails){
         if(hr==E_OUTOFMEMORY)*errorDetails=L"There was not enough memory to extract the archive.";
         else if(hr==E_NOTIMPL)*errorDetails=L"The backup uses an unsupported compression method.";
+        else if(hr==HRESULT_FROM_WIN32(ERROR_LOCK_VIOLATION))
+            *errorDetails=L"The backup or a temporary restore file is in use. Close any program using it and try again.";
         else if(HRESULT_FACILITY(hr)==FACILITY_WIN32)
             *errorDetails=L"A Windows operation failed while reading or writing the archive extraction data.";
         else *errorDetails=L"The archive decoder could not complete extraction.";
@@ -1774,8 +1898,10 @@ HRESULT _7zExtractRestoreSession(_7zRestoreSession *session,
     HRESULT hr=session->Output->Init(std::filesystem::path(outDir),ownsEmptyOutputRoot,protectedRoot);
     if(FAILED(hr) && errorDetails)*errorDetails=L"The restore staging root or its original ancestors could not be protected.";
     if(SUCCEEDED(hr))hr=ExtractOrTestOpenedArchive7z(session->InArchive,out,false,session->Output.get(),errorDetails);
-    if(SUCCEEDED(hr) && progressCb)
-        progressCb(progressUser,_7zOp::Extract,100,nullptr);
+    if(SUCCEEDED(hr)) {
+        const HRESULT reported=ReportArchiveCompletion(progressCb,progressUser,_7zOp::Extract);
+        if(FAILED(reported))hr=reported;
+    }
     return hr;
 }
 
@@ -1815,8 +1941,10 @@ HRESULT _7zTest7z(const wchar_t *archivePath,_7zProgressCb progressCb,
     _7zScopedProgress sp(_7zOp::Extract,progressCb,progressUser);
     if(SUCCEEDED(hr))
         hr=ExtractOrTestOpenedArchive7z(session->InArchive,FString(),true);
-    if(SUCCEEDED(hr) && progressCb)
-        progressCb(progressUser,_7zOp::Extract,100,nullptr);
+    if(SUCCEEDED(hr)) {
+        const HRESULT reported=ReportArchiveCompletion(progressCb,progressUser,_7zOp::Extract);
+        if(FAILED(reported))hr=reported;
+    }
     return hr;
 }
 
@@ -1860,7 +1988,10 @@ HRESULT _7zInspectAndTest7zHandle(HANDLE archive,_7zArchiveInfo *info,
     hr=handler->Open(stream,&scanSize,nullptr);
     if(SUCCEEDED(hr))hr=InspectOpenedArchive7z(handler,*info);
     if(SUCCEEDED(hr))hr=ExtractOrTestOpenedArchive7z(handler,FString(),true);
-    if(SUCCEEDED(hr) && progressCb)progressCb(progressUser,_7zOp::Extract,100,nullptr);
+    if(SUCCEEDED(hr)) {
+        const HRESULT reported=ReportArchiveCompletion(progressCb,progressUser,_7zOp::Extract);
+        if(FAILED(reported))hr=reported;
+    }
     if(SUCCEEDED(hr))hr=ReportArchiveDetail(_7zProgressPhase::Verifying,info->totalUncompressedBytes,info->totalUncompressedBytes,info->itemCount,info->itemCount,info->totalUncompressedBytes!=0);
     handler->Close();return hr;
 }

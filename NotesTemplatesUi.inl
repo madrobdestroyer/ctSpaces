@@ -179,7 +179,13 @@ static void RefreshNotesTemplateEditorTheme(HWND dialog,NotesTemplates &library)
   SendMessageW(edit,EM_SETBKGNDCOLOR,0,g_themeColors.crControl);
   const bool loading=library.loading;library.loading=true;
   const auto modified=SendMessageW(edit,EM_GETMODIFY,0,0);
-  ApplyNotesTextColors(edit);library.loading=loading;
+  IUnknown *ole=nullptr;ITextDocument *document=nullptr;
+  SendMessageW(edit,EM_GETOLEINTERFACE,0,reinterpret_cast<LPARAM>(&ole));
+  if(ole){ole->QueryInterface(__uuidof(ITextDocument),reinterpret_cast<void **>(&document));ole->Release();}
+  if(document)document->Undo(tomSuspend,nullptr);
+  ApplyNotesTextColors(edit);
+  if(document){document->Undo(tomResume,nullptr);document->Release();}
+  library.loading=loading;
   SendMessageW(edit,EM_SETMODIFY,modified,0);
   // Do not reload the saved template over a user's unsaved draft.
 }

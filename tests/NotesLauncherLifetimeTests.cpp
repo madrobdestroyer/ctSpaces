@@ -198,11 +198,59 @@ static void DisabledChooserGuard() {
   }
   Finish(launcher);
 }
+
+static bool RenameNotesLifetime(bool before) {
+  HWND launcher=Launcher(),notes=Notes(L"Rename Notes owner");
+  Fixture(L"Rename other client");
+  Type(notes,L"Private pending rename draft");
+  KillTimer(notes,1);
+  KillTimer(notes,2);
+  const auto editor=Edit(notes);
+  const auto originalRoot=State(notes).clientRoot;
+  const auto intact=[&] {
+    return g_hNotesWindow==notes && IsWindow(notes) && Edit(notes)==editor &&
+           NotesWindowText(editor)==L"Private pending rename draft" &&
+           SendMessageW(editor,EM_CANUNDO,0,0)!=0;
+  };
+  Check(intact(),"The private notebook has a pending edit and native Undo");
+
+  EnableWindow(notes,FALSE);
+  const auto focusBefore=suppressedFocus;
+  const bool otherReady=PrepareNotesForClientChange(L"Rename other client");
+  const bool unwantedFocus=suppressedFocus!=focusBefore;
+  Expect(before ? !otherReady && unwantedFocus : otherReady && !unwantedFocus,
+         "An unrelated modal notebook leaves another client's operation available");
+  Expect(intact() && !IsWindowEnabled(notes),
+         "The unrelated modal notebook keeps its window, draft and Undo");
+  Expect(!PrepareNotesForClientChange(L"Rename Notes owner"),
+         "A modal notebook still blocks a change to its own client");
+  EnableWindow(notes,TRUE);
+
+  constexpr DWORD privatePid=0x70000173;
+  g_activeProfiles.emplace(ClientBrowserKey{L"Rename Notes owner",BrowserKind::Edge},
+      ActiveProfileInfo{privatePid,{},originalRoot/L"Browsers/edge/Profile",ProfileType::Standard,{},{}});
+  std::wstring error;
+  const bool renamed=RenameClientProfile(L"Rename Notes owner",L"Private renamed",error);
+  const bool lostEditor=!IsWindow(notes);
+  Expect(!renamed && error.find(L"Close every browser")!=std::wstring::npos,
+         "An active browser still prevents renaming its client");
+  Expect(before ? lostEditor : intact(),
+         "An active-browser refusal leaves the same notebook draft and Undo available");
+  Expect(fs::is_directory(originalRoot) && !fs::exists(originalRoot.parent_path()/L"Private renamed"),
+         "The refused rename preserves the original private client directory");
+  g_activeProfiles.clear();
+  std::cout<<"NOTES_RENAME_LIFETIME unrelatedBlocked="<<!otherReady
+           <<" unrelatedFocus="<<unwantedFocus<<" refusedRenameClosedEditor="<<lostEditor<<'\n';
+  Finish(launcher);
+  return failures==0;
+}
 #endif
 }
 int wmain(int argc,wchar_t **argv) {
   using namespace notes_launcher_lifetime;
-  if(argc!=2 || wcscmp(argv[1],L"--headless-background")) {std::cerr<<"Only the hidden background entry is permitted; native windows created=0\n";return 2;}
+  const bool renameBefore=argc==3 && !wcscmp(argv[2],L"--rename-notes-before");
+  const bool renameAfter=argc==3 && !wcscmp(argv[2],L"--rename-notes-after");
+  if((argc!=2 && !renameBefore && !renameAfter) || wcscmp(argv[1],L"--headless-background")) {std::cerr<<"Only the hidden background entry is permitted; native windows created=0\n";return 2;}
   try {
     backgroundNotesTests=true;NotesBackgroundEvents events;events.Start();
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
@@ -215,10 +263,17 @@ int wmain(int argc,wchar_t **argv) {
     g_sDataDir=fs::current_path()/L"build"/(L"notes-launcher-lifetime-"+std::to_wstring(GetCurrentProcessId())+L"-"+std::to_wstring(GetTickCount64()));
     fs::create_directories(g_sDataDir);g_sConfigPath=g_sDataDir/L"ctSpaces.ini";
     WritePrivateProfileStringW(L"notes_window",L"help_seen",L"1",g_sConfigPath.c_str());
-    CloseAndAutosave();
 #ifndef CTSPACES_LIFETIME_BASELINE
-    MinimizeAndBusy();TrayFailure();ExplicitExitAndFailure();ExplicitExitDuringLaunch();DefaultCompletionDuringExit();DisabledChooserGuard();
+    if(renameBefore || renameAfter) {
+      RenameNotesLifetime(renameBefore);
+    } else
 #endif
+    {
+      CloseAndAutosave();
+#ifndef CTSPACES_LIFETIME_BASELINE
+      MinimizeAndBusy();TrayFailure();ExplicitExitAndFailure();ExplicitExitDuringLaunch();DefaultCompletionDuringExit();DisabledChooserGuard();
+#endif
+    }
     NotesBackgroundAudit("final independent lifetime audit");NotesBackgroundBanner();
     std::cout<<assertions<<" lifetime checks; "<<scenarios<<" private scenarios; "<<failures<<" failures; helper checks="<<checks<<std::endl;
     FreeLibrary(decoderModule);

@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+ <ItemGroup Label="ProjectConfigurations"><ProjectConfiguration Include="Release|x64"><Configuration>Release</Configuration><Platform>x64</Platform></ProjectConfiguration></ItemGroup>
+ <PropertyGroup Label="Globals"><VCProjectVersion>17.0</VCProjectVersion><Keyword>Win32Proj</Keyword><ProjectGuid>{02AB8786-52B6-4B46-AB08-E3E14A75BF17}</ProjectGuid><RootNamespace>RecoveryFolderPathTests</RootNamespace><WindowsTargetPlatformVersion>10.0</WindowsTargetPlatformVersion></PropertyGroup>
+ <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
+ <PropertyGroup Label="Configuration"><ConfigurationType>Application</ConfigurationType><UseDebugLibraries>false</UseDebugLibraries><PlatformToolset>v145</PlatformToolset><CharacterSet>Unicode</CharacterSet></PropertyGroup>
+ <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+ <PropertyGroup><TargetName>RecoveryFolderPathTests</TargetName></PropertyGroup>
+ <ItemDefinitionGroup>
+  <ClCompile><WarningLevel>Level4</WarningLevel><SDLCheck>true</SDLCheck><ConformanceMode>true</ConformanceMode><PreprocessorDefinitions>CTSPACES_BACKUP_TEST_HOOKS;NDEBUG;_CONSOLE;%(PreprocessorDefinitions)</PreprocessorDefinitions><AdditionalIncludeDirectories>$(ProjectDir)..;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories><ForcedIncludeFiles>$(RecoveryFolderSourceHeader);%(ForcedIncludeFiles)</ForcedIncludeFiles><Optimization>MinSpace</Optimization><FunctionLevelLinking>true</FunctionLevelLinking><LanguageStandard>stdcpp20</LanguageStandard><RuntimeLibrary>MultiThreaded</RuntimeLibrary></ClCompile>
+  <ResourceCompile><AdditionalIncludeDirectories>$(ProjectDir)..;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories></ResourceCompile>
+  <Link><SubSystem>Console</SubSystem><GenerateDebugInformation>true</GenerateDebugInformation><OptimizeReferences>true</OptimizeReferences><EnableCOMDATFolding>true</EnableCOMDATFolding><AdditionalLibraryDirectories>$(ProjectDir)..\dist\x64\Release;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories><AdditionalDependencies>7zip.lib;%(AdditionalDependencies)</AdditionalDependencies><AdditionalOptions>/WHOLEARCHIVE:7zip.lib %(AdditionalOptions)</AdditionalOptions></Link>
+ </ItemDefinitionGroup>
+ <ItemGroup><ClCompile Include="RecoveryFolderPathTests.cpp" /><ClCompile Include="..\BackupEngine.cpp" /><ClCompile Include="..\BrowserPreferencesJson.cpp" /><ClCompile Include="..\ConfigPersistence.cpp" /><ClCompile Include="..\GuidedWalkthrough.cpp" /><ClCompile Include="..\InProc7z.cpp" /><ClCompile Include="..\ProgressUI.cpp" /><ResourceCompile Include="..\ctSpaces.rc" /></ItemGroup>
+ <Target Name="RequireRecoveryFolderBinding" BeforeTargets="PrepareForBuild"><Error Condition="'$(RecoveryFolderSourceHeader)' == '' Or !Exists('$(RecoveryFolderSourceHeader)')" Text="Use Test-RecoveryFolderPath.ps1 with a complete frozen source tree." /></Target>
+ <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+</Project>

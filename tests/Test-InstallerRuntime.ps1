@@ -2,7 +2,8 @@ param(
     [string]$Configuration = 'Release',
     [string]$Platform = 'x64',
     [switch]$HeadlessOnly,
-    [string]$ArtifactDirectory = ''
+    [string]$ArtifactDirectory = '',
+    [ValidateSet('Skip','Before','After')][string]$VersionMetadataProof = 'Skip'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -12,11 +13,26 @@ $sevenZipLibrary = Join-Path $root 'dist\x64\Release\7zip.lib'
 $executable = Join-Path $root `
     "build\tests\InstallerRuntime\$Platform\$Configuration\InstallerRuntimeTests.exe"
 
+if ($VersionMetadataProof -ne 'Skip' -and (!$HeadlessOnly -or !$ArtifactDirectory)) {
+    throw 'Version metadata proof requires HeadlessOnly and an explicit fresh artifact directory.'
+}
+
 if ($HeadlessOnly) {
     $artifacts = if ($ArtifactDirectory) { [IO.Path]::GetFullPath($ArtifactDirectory) }
         else { Join-Path $root 'build\tests\InstallerRuntimeHeadless' }
     if (-not $artifacts.StartsWith($root + '\build\', [StringComparison]::OrdinalIgnoreCase)) {
         throw 'Headless runtime artifacts must stay below workspace build.'
+    }
+    if ($VersionMetadataProof -ne 'Skip') {
+        if (Test-Path -LiteralPath $artifacts) { throw 'Version proof artifact directory must be fresh.' }
+        for ($part = $artifacts; $part; $part = [IO.Path]::GetDirectoryName($part)) {
+            if (Test-Path -LiteralPath $part) {
+                $item = Get-Item -LiteralPath $part -Force
+                if (!$item.PSIsContainer -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -or $item.LinkType) {
+                    throw ('Unsafe version proof artifact path: ' + $part)
+                }
+            }
+        }
     }
     New-Item -ItemType Directory -Path $artifacts -Force | Out-Null
     $sourceFiles = @(Get-ChildItem -LiteralPath $root -File | Where-Object Extension -in '.cpp','.h','.inl','.rc')
@@ -37,6 +53,8 @@ The one native launch-validation child is this same test executable, started
 suspended with CREATE_NO_WINDOW, resumed to its immediate-return probe entry,
 and waited to completion. The foreground installed-child handoff is excluded.
 All non-headless/handoff API forwarding remains unchanged and is not exercised.
+The opt-in version metadata proof runs only its two fixture scenarios. It
+retains its workspace fixture and uses the same native visibility audit.
 Source hashes are checked after building and after the native run. Native/build
 logs and executable hashes are retained even when the safety assertion fails.
 '@ | Set-Content -LiteralPath (Join-Path $artifacts 'README.txt')
@@ -131,13 +149,30 @@ if ($HeadlessOnly) {
         ('/p:IntDir=' + (Join-Path $artifacts 'obj') + '\')) (Join-Path $artifacts 'build.log')
     if ($built.Record.ExitCode -ne 0) { throw 'Headless installer runtime build failed; inspect build.log.' }
     Assert-HeadlessSourceFreeze
-    $native = Invoke-HeadlessRuntimeTool $executable @('--installer-runtime-headless') (Join-Path $artifacts 'native.log')
+    $nativeArguments = @('--installer-runtime-headless')
+    if ($VersionMetadataProof -ne 'Skip') {
+        $nativeArguments += @(('--version-metadata-' + $VersionMetadataProof.ToLowerInvariant()), $artifacts)
+    }
+    $native = Invoke-HeadlessRuntimeTool $executable $nativeArguments (Join-Path $artifacts 'native.log')
     Assert-HeadlessSourceFreeze
     $safe = $native.Record.ExitCode -eq 0 -and
         $native.Text -match 'Installer headless safety: invalid_paint=0 presentation=0 window_requests=0 windows=0 native_show=0 native_focus=0 native_foreground=0 device_input=0' -and
-        $native.Text -match 'Installer runtime tests passed \(20 scenarios\)' -and
         $native.Text -notmatch 'Installed handoff readiness passed'
-    [pscustomobject]@{ Passed = $safe; SourceFreeze = $true; Native = $native.Record; Build = $built.Record } |
+    if ($VersionMetadataProof -eq 'Skip') {
+        $scenarios = 20
+        $safe = $safe -and $native.Text -match 'Installer runtime tests passed \(20 scenarios\)'
+    } else {
+        $scenarios = 2
+        $outcome = if ($VersionMetadataProof -eq 'Before') { 'incorrect-order-observed' } else { 'unknown-reported' }
+        $safe = $safe -and $native.Text -match 'Installer version metadata proof passed \(2 scenarios\)' -and
+            $native.Text -match "(?m)^INSTALLER_VERSION_METADATA_CASE=installed outcome=$outcome\r?$" -and
+            $native.Text -match "(?m)^INSTALLER_VERSION_METADATA_CASE=running outcome=$outcome\r?$"
+    }
+    [pscustomobject]@{
+        Passed = $safe; Status = if (!$safe) { 'Failed' } elseif ($VersionMetadataProof -eq 'Before') { 'ExpectedDefectReproduced' } else { 'Passed' }
+        SourceFreeze = $true; Scenarios = $scenarios; VersionMetadataProof = $VersionMetadataProof
+        Native = $native.Record; Build = $built.Record
+    } |
         ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $artifacts 'result.json')
     Write-Output $native.Text
     if (-not $safe) { throw 'Headless installer runtime/safety check failed; inspect retained native.log.' }

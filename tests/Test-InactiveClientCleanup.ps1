@@ -1,9 +1,10 @@
 param(
-    [string]$ExePath = (Join-Path $PSScriptRoot '..\dist\x64\Release\ctSpaces.exe'),
+    [string]$ExePath = '',
     [ValidateSet('Dark - Gothic', 'Dark - Crimson', 'Marine')]
     [string]$ThemeName = 'Dark - Gothic'
 )
 $ErrorActionPreference = 'Stop'
+$ExePath = & (Join-Path $PSScriptRoot '..\qa\Resolve-Executable.ps1') -ExePath $ExePath
 $projectRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
 $qaParent = Join-Path $projectRoot 'build\cleanup-qa'
 $runId = [Guid]::NewGuid().ToString('N')

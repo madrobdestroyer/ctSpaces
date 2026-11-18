@@ -1,10 +1,11 @@
 param(
-    [string]$ExePath = (Join-Path $PSScriptRoot '..\dist\x64\Release\ctSpaces.exe'),
+    [string]$ExePath = '',
     [string]$ArtifactDirectory = (Join-Path $PSScriptRoot '..\build\quick-tour-ui'),
     [string[]]$ExpectedDpis = @()
 )
 
 $ErrorActionPreference = 'Stop'
+$ExePath = & (Join-Path $PSScriptRoot '..\qa\Resolve-Executable.ps1') -ExePath $ExePath
 . (Join-Path $PSScriptRoot 'QaProcess.ps1')
 $ExpectedDpis = @($ExpectedDpis | ForEach-Object { $_ -split ',' } | Where-Object { $_ -ne '' } | ForEach-Object { [uint32]$_ })
 $root = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))

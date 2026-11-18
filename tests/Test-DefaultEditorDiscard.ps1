@@ -1,10 +1,11 @@
 param(
-    [string]$ExePath = (Join-Path $PSScriptRoot '..\dist\x64\Release\ctSpaces.exe'),
+    [string]$ExePath = '',
     [int]$Cycles = 2,
     [switch]$DiagnosticCloseBeforeLauncherReady
 )
 
 $ErrorActionPreference = 'Stop'
+$ExePath = & (Join-Path $PSScriptRoot '..\qa\Resolve-Executable.ps1') -ExePath $ExePath
 . (Join-Path $PSScriptRoot 'QaProcess.ps1')
 if ($Cycles -lt 1 -or $Cycles -gt 2) { throw 'Cycles must be 1 or 2.' }
 $projectRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))

@@ -17,6 +17,7 @@
 #include <fstream>
 #include <map>
 #include <memory>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <system_error>
@@ -339,6 +340,38 @@ bool IsRealDirectory(const fs::path &path) {
          (attributes & FILE_ATTRIBUTE_REPARSE_POINT) == 0;
 }
 
+Result ResolveBackupPaths(const fs::path &sitesDir, const fs::path &destination,
+                          fs::path &absoluteSites, fs::path &absoluteDestination) {
+  if (!TryNormalizeAbsolute(sitesDir, absoluteSites) ||
+      !IsRealDirectory(absoluteSites))
+    return Failure(HRESULT_FROM_WIN32(ERROR_PATH_NOT_FOUND),
+                   L"The Sites folder does not exist as a real local directory.");
+  if (_wcsicmp(destination.extension().c_str(), L".7z") != 0)
+    return Failure(E_INVALIDARG,
+                   L"New ctSpaces backups must use the .7z extension.");
+
+  const auto managedDataRoot = absoluteSites.parent_path();
+  if (managedDataRoot.empty())
+    return Failure(E_INVALIDARG,
+                   L"The managed ctSpaces data folder could not be validated safely.");
+  bool destinationIsManaged = false;
+  if (!TryIsPathWithin(destination, managedDataRoot, destinationIsManaged))
+    return Failure(E_INVALIDARG,
+                   L"The selected backup destination could not be validated safely.");
+  if (destinationIsManaged)
+    return Failure(E_INVALIDARG,
+                   L"A backup cannot replace or be saved inside the ctSpaces data folder.");
+
+  if (!TryNormalizeAbsolute(destination, absoluteDestination) ||
+      !Detail::IsTargetPathWithinLegacyBudget(absoluteDestination, false) ||
+      !Detail::IsTargetPathWithinLegacyBudget(
+          absoluteDestination.parent_path(), true))
+    return Failure(HRESULT_FROM_WIN32(ERROR_FILENAME_EXCED_RANGE),
+                   L"The selected backup path is too long for this "
+                   L"Windows application. Choose a shorter folder path.");
+  return {};
+}
+
 bool IsRealRegularFile(const fs::path &path) {
   const DWORD attributes = GetFileAttributesW(path.c_str());
   return attributes != INVALID_FILE_ATTRIBUTES &&
@@ -372,7 +405,16 @@ struct BackupArtifact {
   bool leaseCanDelete=false;
   BY_HANDLE_FILE_INFORMATION identity{};
   RestoreHandle lease;
-  ~BackupArtifact(){Remove();}
+  std::optional<bool> cleanupResult;
+  ~BackupArtifact() {
+    if (!cleanupResult.has_value()) Remove();
+  }
+  bool CleanupForReport() {
+    // Finish the bounded cleanup while the caller can still report its result.
+    // Cache the outcome in case assembling the diagnostic itself throws.
+    if (!cleanupResult.has_value()) cleanupResult=Remove() || Remove();
+    return *cleanupResult;
+  }
   Result Bind(bool publication=false) {
     if(!lease){lease.reset(CreateFileW(path.c_str(),GENERIC_READ|(publication?(GENERIC_WRITE|DELETE|FILE_WRITE_ATTRIBUTES):0),
         FILE_SHARE_READ,nullptr,OPEN_EXISTING,FILE_FLAG_OPEN_REPARSE_POINT,nullptr));leaseCanDelete=publication;}
@@ -475,16 +517,47 @@ Result AllowRestoreParentWrites(const fs::path& path,RestoreHandle& original) {
   original.reset(compatible.value);compatible.value=INVALID_HANDLE_VALUE;return {};
 }
 
+Result BackupDestinationBindingFailure(HRESULT code, const fs::path& folder) {
+  const bool missing = code == HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND) ||
+                       code == HRESULT_FROM_WIN32(ERROR_PATH_NOT_FOUND);
+  const std::wstring reason = missing ? L"The backup folder is unavailable: "
+                                     : L"The backup folder could not be opened safely: ";
+  return Failure(code, reason + folder.wstring() + L". Choose an existing folder and try again.");
+}
+
 Result PinBackupOutputAncestors(const fs::path& parent,
     std::vector<std::unique_ptr<RestoreHandle>>& bindings) {
   fs::path current=parent;
   for(;;) {
     auto handle=std::make_unique<RestoreHandle>();BY_HANDLE_FILE_INFORMATION info{};
     const Result opened=OpenRestoreDirectory(current,*handle,info,false,false,false);
-    if(!opened.ok())return opened;
+    if(!opened.ok())return BackupDestinationBindingFailure(opened.code, current);
     bindings.push_back(std::move(handle));
     const auto next=current.parent_path();if(next.empty() || next==current)break;current=next;
   }
+  return {};
+}
+
+Result CheckBackupDestinationFile(const fs::path &destination) {
+  const DWORD attributes = GetFileAttributesW(destination.c_str());
+  if (attributes == INVALID_FILE_ATTRIBUTES)
+    return {};
+  if (attributes & FILE_ATTRIBUTE_DIRECTORY)
+    return Failure(HRESULT_FROM_WIN32(ERROR_DIRECTORY),
+                   L"The selected backup filename is already used by a folder. Choose another filename.");
+  if (attributes & FILE_ATTRIBUTE_READONLY)
+    return Failure(HRESULT_FROM_WIN32(ERROR_ACCESS_DENIED),
+                   L"The selected backup is read-only. Remove the read-only attribute or choose another file.");
+
+  // FileRenameInfo can refuse to replace a file that is open for data access
+  // even if that handle shares deletion. Probe exclusively before saving
+  // Notes or starting the archive. Final publication still checks for races.
+  const RestoreHandle replacementAccess(CreateFileW(
+      destination.c_str(), DELETE, 0, nullptr, OPEN_EXISTING,
+      FILE_FLAG_OPEN_REPARSE_POINT, nullptr));
+  if (!replacementAccess && GetLastError() == ERROR_SHARING_VIOLATION)
+    return Failure(HRESULT_FROM_WIN32(ERROR_SHARING_VIOLATION),
+                   L"The selected backup is open. Close programs using it or choose another file.");
   return {};
 }
 
@@ -512,40 +585,67 @@ Result PublishBoundBackupFile(HANDLE file,const fs::path& destination) {
   return {};
 }
 
-Result HashRestoreFile(HANDLE file, std::array<unsigned char, 32> &digest) {
-  BCRYPT_ALG_HANDLE algorithm = nullptr;
-  BCRYPT_HASH_HANDLE hash = nullptr;
-  struct CloseHash {
-    BCRYPT_ALG_HANDLE &algorithm; BCRYPT_HASH_HANDLE &hash;
-    ~CloseHash() { if (hash) BCryptDestroyHash(hash); if (algorithm) BCryptCloseAlgorithmProvider(algorithm, 0); }
-  } cleanup{algorithm, hash};
-  if (BCryptOpenAlgorithmProvider(&algorithm, BCRYPT_SHA256_ALGORITHM, nullptr, 0) < 0)
-    return Failure(E_FAIL, L"Restore content verification could not initialize SHA-256.");
-  DWORD objectLength = 0, returned = 0;
-  if (BCryptGetProperty(algorithm, BCRYPT_OBJECT_LENGTH, reinterpret_cast<PUCHAR>(&objectLength),
-                        sizeof(objectLength), &returned, 0) < 0)
-    return Failure(E_FAIL, L"Restore content verification could not prepare SHA-256.");
-  std::vector<unsigned char> object(objectLength);
-  if (BCryptCreateHash(algorithm, &hash, object.data(), objectLength, nullptr, 0, 0) < 0)
-    return Failure(E_FAIL, L"Restore content verification could not create SHA-256.");
-  std::array<unsigned char, 64 * 1024> buffer{};
-  for (;;) {
-    DWORD read = 0;
-    if (!ReadFile(file, buffer.data(), static_cast<DWORD>(buffer.size()), &read, nullptr))
-      return Failure(HRESULT_FROM_WIN32(GetLastError()), L"A staged restore file changed or could not be read.");
-    if (read == 0) break;
-    if (BCryptHashData(hash, buffer.data(), read, 0) < 0)
-      return Failure(E_FAIL, L"Restore content verification failed.");
+// One context belongs to one tree scan. Provider and workspace setup are shared
+// across its files; every file still gets a fresh hash, and every verification
+// scan still reads every byte through the same identity-checked file handle.
+class RestoreHashContext {
+  BCRYPT_ALG_HANDLE algorithm_ = nullptr;
+  std::vector<unsigned char> object_;
+  // Larger bounded reads reduce per-call overhead for multi-gigabyte files.
+  // This fixed workspace is shared by the scan, not allocated per item.
+  std::vector<unsigned char> buffer_;
+public:
+  RestoreHashContext() = default;
+  RestoreHashContext(const RestoreHashContext &) = delete;
+  RestoreHashContext &operator=(const RestoreHashContext &) = delete;
+  ~RestoreHashContext() {
+    if (algorithm_) BCryptCloseAlgorithmProvider(algorithm_, 0);
   }
-  if (BCryptFinishHash(hash, digest.data(), static_cast<ULONG>(digest.size()), 0) < 0)
-    return Failure(E_FAIL, L"Restore content verification could not finish SHA-256.");
-  return {};
-}
+  Result HashFile(HANDLE file, std::array<unsigned char, 32> &digest) {
+    if (!algorithm_) {
+      struct PendingAlgorithm {
+        BCRYPT_ALG_HANDLE value = nullptr;
+        ~PendingAlgorithm() { if (value) BCryptCloseAlgorithmProvider(value, 0); }
+      } pending;
+      if (BCryptOpenAlgorithmProvider(&pending.value, BCRYPT_SHA256_ALGORITHM, nullptr, 0) < 0)
+        return Failure(E_FAIL, L"Restore content verification could not initialize SHA-256.");
+      DWORD objectLength = 0, returned = 0;
+      if (BCryptGetProperty(pending.value, BCRYPT_OBJECT_LENGTH, reinterpret_cast<PUCHAR>(&objectLength),
+                            sizeof(objectLength), &returned, 0) < 0)
+        return Failure(E_FAIL, L"Restore content verification could not prepare SHA-256.");
+      object_.resize(objectLength);
+      buffer_.resize(256 * 1024);
+      // Publish readiness only after both allocations succeed. A throwing
+      // allocation closes the pending provider and leaves retries unprepared.
+      algorithm_ = pending.value; pending.value = nullptr;
+    }
+    BCRYPT_HASH_HANDLE hash = nullptr;
+    struct CloseHash {
+      BCRYPT_HASH_HANDLE &hash;
+      ~CloseHash() { if (hash) BCryptDestroyHash(hash); }
+    } cleanup{hash};
+    if (BCryptCreateHash(algorithm_, &hash, object_.data(), static_cast<ULONG>(object_.size()), nullptr, 0, 0) < 0)
+      return Failure(E_FAIL, L"Restore content verification could not create SHA-256.");
+    for (;;) {
+      DWORD read = 0;
+      if (!ReadFile(file, buffer_.data(), static_cast<DWORD>(buffer_.size()), &read, nullptr))
+        return Failure(HRESULT_FROM_WIN32(GetLastError()), L"A staged restore file changed or could not be read.");
+      if (read == 0) break;
+      if (BCryptHashData(hash, buffer_.data(), read, 0) < 0)
+        return Failure(E_FAIL, L"Restore content verification failed.");
+    }
+    if (BCryptFinishHash(hash, digest.data(), static_cast<ULONG>(digest.size()), 0) < 0)
+      return Failure(E_FAIL, L"Restore content verification could not finish SHA-256.");
+    return {};
+  }
+};
 
 Result CaptureRestoreNode(const fs::path &path, const fs::path &relative,
-                           std::vector<RestoreValidationEntry> &entries, unsigned depth = 0,
+                           std::vector<RestoreValidationEntry> &entries, RestoreHashContext &hashContext, unsigned depth = 0,
                            bool boundRoots = false, bool protectedExtraction = false) {
-  if (depth > CtArchiveSafety::kMaxDirectoryDepth || entries.size() >= CtArchiveSafety::kMaxItems)
+  // The seal includes its physical root in addition to the archive entries.
+  // Keep the archive limit unchanged while allowing that one wrapper object.
+  if (depth > CtArchiveSafety::kMaxDirectoryDepth || entries.size() > CtArchiveSafety::kMaxItems)
     return Failure(HRESULT_FROM_WIN32(ERROR_FILE_TOO_LARGE), L"The staged restore tree exceeds its validation limits.");
   const fs::path ioPath = CtRestoreIo::Path(path);
   const DWORD attributes = GetFileAttributesW(ioPath.c_str());
@@ -563,7 +663,7 @@ Result CaptureRestoreNode(const fs::path &path, const fs::path &relative,
       GetFileType(file.value) != FILE_TYPE_DISK || (!directory && entry.information.nNumberOfLinks != 1))
     return Failure(E_INVALIDARG, L"A staged restore item is a replaced object, reparse point or hard link.");
   if (!directory) {
-    const Result hashed = HashRestoreFile(file.value, entry.digest);
+    const Result hashed = hashContext.HashFile(file.value, entry.digest);
     if (!hashed.ok()) return hashed;
   }
   entries.push_back(entry);
@@ -574,7 +674,7 @@ Result CaptureRestoreNode(const fs::path &path, const fs::path &relative,
         return Failure(E_INVALIDARG, L"The staged restore produced an invalid child name.");
       // The extended spelling is an I/O detail. Keep ordinary names in the
       // seal so relative paths, identity comparisons and final budgets agree.
-      const Result captured = CaptureRestoreNode(path / name, relative / name, entries, depth + 1, boundRoots, protectedExtraction);
+      const Result captured = CaptureRestoreNode(path / name, relative / name, entries, hashContext, depth + 1, boundRoots, protectedExtraction);
       if (!captured.ok()) return captured;
     }
   }
@@ -587,7 +687,8 @@ Result CaptureRestoreNode(const fs::path &path, const fs::path &relative,
 Result CaptureRestoreTree(const fs::path &root, std::vector<RestoreValidationEntry> &entries,
                            bool boundRoots = false, bool protectedExtraction = false) {
   entries.clear();
-  const Result result = CaptureRestoreNode(root, {}, entries, 0, boundRoots, protectedExtraction);
+  RestoreHashContext hashContext;
+  const Result result = CaptureRestoreNode(root, {}, entries, hashContext, 0, boundRoots, protectedExtraction);
   if (!result.ok()) return result;
   std::sort(entries.begin(), entries.end(), [](const auto &a, const auto &b) { return a.relative.native() < b.relative.native(); });
   return {};
@@ -1017,6 +1118,26 @@ Result CaptureStagedRestoreIdentity(StagedRestore &stagedRestore,bool protectedE
   }
 }
 
+Result ValidateBackupDestination(const fs::path &sitesDir,
+                                 const fs::path &destination) {
+  try {
+    fs::path absoluteSites, absoluteDestination;
+    const Result paths = ResolveBackupPaths(sitesDir, destination,
+                                            absoluteSites, absoluteDestination);
+    if (!paths.ok())
+      return paths;
+
+    std::vector<std::unique_ptr<RestoreHandle>> outputParents;
+    const Result boundParent = PinBackupOutputAncestors(absoluteDestination.parent_path(),
+                                                        outputParents);
+    if (!boundParent.ok())
+      return boundParent;
+    return CheckBackupDestinationFile(absoluteDestination);
+  } catch (const std::exception &error) {
+    return Failure(E_FAIL, Widen(error.what()));
+  }
+}
+
 Result CreateValidated7zBackup(const fs::path &sitesDir,
                                const fs::path &destination,
                                const char *appVersion,
@@ -1038,42 +1159,11 @@ Result CreateValidated7zBackup(const fs::path &sitesDir,
     };
     Result reported=report(_7zProgressPhase::Preparing);
     if(!reported.ok())return reported;
-    if (!IsRealDirectory(sitesDir))
-      return Failure(HRESULT_FROM_WIN32(ERROR_PATH_NOT_FOUND),
-                     L"The Sites folder does not exist as a real local "
-                     L"directory.");
-    if (_wcsicmp(destination.extension().c_str(), L".7z") != 0)
-      return Failure(E_INVALIDARG,
-                     L"New ctSpaces backups must use the .7z extension.");
-
-    fs::path absoluteSites;
-    if (!TryNormalizeAbsolute(sitesDir, absoluteSites) ||
-        absoluteSites.parent_path().empty()) {
-      return Failure(E_INVALIDARG,
-                     L"The managed ctSpaces data folder could not be "
-                     L"validated safely.");
-    }
-    const fs::path managedDataRoot = absoluteSites.parent_path();
-    bool destinationIsManaged = false;
-    if (!TryIsPathWithin(destination, managedDataRoot,
-                         destinationIsManaged)) {
-      return Failure(E_INVALIDARG,
-                     L"The selected backup destination could not be "
-                     L"validated safely.");
-    }
-    if (destinationIsManaged)
-      return Failure(E_INVALIDARG,
-                     L"A backup cannot replace or be saved inside the "
-                     L"ctSpaces data folder.");
-
-    fs::path absoluteDestination;
-    if (!TryNormalizeAbsolute(destination, absoluteDestination) ||
-        !Detail::IsTargetPathWithinLegacyBudget(absoluteDestination, false) ||
-        !Detail::IsTargetPathWithinLegacyBudget(
-            absoluteDestination.parent_path(), true))
-      return Failure(HRESULT_FROM_WIN32(ERROR_FILENAME_EXCED_RANGE),
-                     L"The selected backup path is too long for this "
-                     L"Windows application. Choose a shorter folder path.");
+    fs::path absoluteSites, absoluteDestination;
+    const Result paths = ResolveBackupPaths(sitesDir, destination,
+                                           absoluteSites, absoluteDestination);
+    if (!paths.ok())
+      return paths;
 
     unsigned long long profileCount = 0;
     Result countResult;
@@ -1085,11 +1175,11 @@ Result CreateValidated7zBackup(const fs::path &sitesDir,
         if(!Detail::IsValidClientDirectoryName(names[index]) ||
             (index && client_name_comparison::EqualIgnoringCase(names[index-1],names[index])))
           return Failure(E_INVALIDARG,L"The backup selection contains an invalid or duplicate client name.");
-        if(!IsRealDirectory(sitesDir/names[index]))
+        if(!IsRealDirectory(absoluteSites/names[index]))
           return Failure(HRESULT_FROM_WIN32(ERROR_PATH_NOT_FOUND),L"A selected client is unavailable or is not a real directory: "+names[index]+L". No partial backup was created.");
       }
       profileCount=names.size();
-    } else countResult=CountProfiles(sitesDir, profileCount);
+    } else countResult=CountProfiles(absoluteSites, profileCount);
     if (!countResult.ok())
       return countResult;
     if (profileCount == 0)
@@ -1099,12 +1189,19 @@ Result CreateValidated7zBackup(const fs::path &sitesDir,
     std::vector<std::unique_ptr<RestoreHandle>> outputParents;
     Result boundParent=PinBackupOutputAncestors(absoluteDestination.parent_path(),outputParents);
     if(!boundParent.ok())return boundParent;
+    const Result writableDestination = CheckBackupDestinationFile(absoluteDestination);
+    if (!writableDestination.ok())
+      return writableDestination;
     BackupArtifact manifestCleanup,archiveCleanup;
     const auto finish=[&](Result result) {
-      if(!archiveCleanup.Remove())result.details+=L" Temporary archive data was retained at "+archiveCleanup.path.wstring()+L".";
-      if(!manifestCleanup.Remove())result.details+=L" Temporary manifest data was retained at "+manifestCleanup.path.wstring()+L".";
+      if(!archiveCleanup.CleanupForReport())result.details+=L" Temporary archive data was retained at "+archiveCleanup.path.wstring()+L".";
+      if(!manifestCleanup.CleanupForReport())result.details+=L" Temporary manifest data was retained at "+manifestCleanup.path.wstring()+L".";
       return result;
     };
+    // Keep ownership and parent leases alive while converting allocation or
+    // filesystem exceptions into the same cleanup/retention report as HRESULT
+    // failures. Unwinding them first would lose any retained archive's path.
+    try {
     Result manifestResult;
     std::string expectedManifest;
     for (unsigned attempt = 0; attempt < 64; ++attempt) {
@@ -1137,7 +1234,8 @@ Result CreateValidated7zBackup(const fs::path &sitesDir,
     // The original protected manifest keeps this parent nonempty. Allow native
     // rename metadata access only after binding its real identity and child.
     boundParent=AllowRestoreParentWrites(absoluteDestination.parent_path(),*outputParents.front());
-    if(!boundParent.ok())return finish(boundParent);
+    if(!boundParent.ok())
+      return finish(BackupDestinationBindingFailure(boundParent.code, absoluteDestination.parent_path()));
 
     HRESULT hr = E_FAIL;
     archiveCleanup.leaseCanDelete=true;
@@ -1147,7 +1245,7 @@ Result CreateValidated7zBackup(const fs::path &sitesDir,
       if (!stagingName.ok())
         return finish(stagingName);
       hr = _7zCompress7zWithExtraFile(
-          archiveCleanup.path.c_str(), sitesDir.c_str(), true,
+          archiveCleanup.path.c_str(), absoluteSites.c_str(), true,
           manifestCleanup.path.c_str(), kManifestName, progressCb,
           progressUser, &archiveCleanup.enabled,&archiveCleanup.identity,&archiveCleanup.lease.value,
           operationOptions.detailedProgress,operationOptions.detailedProgressUser,selected?&*selected:nullptr);
@@ -1194,10 +1292,21 @@ Result CreateValidated7zBackup(const fs::path &sitesDir,
 #endif
     reported=report(_7zProgressPhase::Publishing);
     if(!reported.ok())return finish(reported);
+    // Prepare the warning before replacing the destination. Reporting optional
+    // cleanup afterward must leave the completed backup's result successful.
+    std::wstring retainedManifest =
+        L"Temporary manifest data was retained at " + manifestCleanup.path.wstring() + L".";
     const Result published=PublishBoundBackupFile(archiveCleanup.lease.value,absoluteDestination);
     if(!published.ok())return finish(published);
     archiveCleanup.enabled = false;
-    return finish({});
+    archiveCleanup.lease.reset();
+    Result result{};
+    if (!manifestCleanup.CleanupForReport())
+      result.details = std::move(retainedManifest);
+    return result;
+    } catch (const std::exception &error) {
+      return finish(Failure(E_FAIL, Widen(error.what())));
+    }
   } catch (const std::exception &error) {
     return Failure(E_FAIL, Widen(error.what()));
   }
@@ -1243,6 +1352,12 @@ Result StageValidated7zRestore(const fs::path &archivePath,
         SetFileInformationByHandle(root,FileDispositionInfo,&disposition,sizeof(disposition));
       }
     } stagingCleanup{session.get(),protectedRoot.value};
+    if (hr == HRESULT_FROM_WIN32(ERROR_SHARING_VIOLATION) ||
+        hr == HRESULT_FROM_WIN32(ERROR_LOCK_VIOLATION))
+      return Failure(hr, L"The selected backup file is in use. Close any program using it and try again.");
+    if (hr == HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND) ||
+        hr == HRESULT_FROM_WIN32(ERROR_PATH_NOT_FOUND))
+      return Failure(hr, L"The selected backup file is no longer available. If it was moved, select it at its new location.");
     if (FAILED(hr))
       return Failure(hr,
                      L"The backup is damaged or contains an unsafe path.");
@@ -1287,12 +1402,20 @@ Result CommitStagedRestore(const StagedRestore &stagedRestore,
                            const fs::path &currentSitesDir,
                            const fs::path &recoveryDir,
                            RestoreCommitGuard precommitGuard,
-                           void *precommitGuardUser) {
+                           void *precommitGuardUser,
+                           bool *previousCollectionInRecovery) {
   bool previousMoved = false;
   bool payloadMoved = false;
   RestoreHandle stage, payload, current, currentParent, recoveryParent,currentParentSentinel,recoveryParentSentinel;
   std::vector<std::unique_ptr<RestoreHandle>> ancestry;
   fs::path live, recovery;
+  struct ReportRecoveryOutcome {
+    const bool &moved;
+    bool *output;
+    ~ReportRecoveryOutcome() {
+      if (output) *output = moved;
+    }
+  } recoveryOutcome{previousMoved, previousCollectionInRecovery};
   auto rejectWithRollback = [&](Result failure) {
     if (payloadMoved) {
       if (RestorePathMissing(stagedRestore.payloadDir)) {
@@ -1448,6 +1571,9 @@ Result CommitStagedRestore(const StagedRestore &stagedRestore,
     if (!verified.ok()) return verified;
     if (!RestorePathMissing(recovery) || (!currentSitesExists && !RestorePathMissing(live)))
       return Failure(HRESULT_FROM_WIN32(ERROR_ALREADY_EXISTS), L"A restore destination changed during the final safety check.");
+    std::wstring retainedStage =
+        L"Restore completed, but its temporary folder could not be removed. "
+        L"Temporary restore data was retained at " + stagedRestore.stagingRoot.wstring() + L".";
     if (currentSitesExists) {
       verified = RenameRestoreDirectory(current.value, recovery);
       if (!verified.ok()) return verified;
@@ -1458,11 +1584,14 @@ Result CommitStagedRestore(const StagedRestore &stagedRestore,
     payloadMoved = true;
     verified = VerifyInstalledRestore(stagedRestore, live);
     if (!verified.ok()) return rejectWithRollback(verified);
-    Result result{};
-    if (!CleanupBoundRestoreStage(stagedRestore, stage.value))
-      result.details =
-          L"Restore completed, but its temporary folder could not be removed.";
-    return result;
+    // Only the staged wrapper remains after verification. Cleanup is optional
+    // at this point, including if constructing an individual cleanup path fails.
+    try {
+      if (CleanupBoundRestoreStage(stagedRestore, stage.value))
+        return {};
+    } catch (const std::exception &) {
+    }
+    return {S_OK, std::move(retainedStage)};
   } catch (const std::exception &error) {
     return rejectWithRollback(Failure(E_FAIL, Widen(error.what())));
   }

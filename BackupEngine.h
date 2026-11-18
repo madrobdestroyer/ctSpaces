@@ -97,6 +97,14 @@ struct BackupOptions {
   void *detailedProgressUser = nullptr;
 };
 
+// Check the selected path, its parent folders, and existing archive sharing
+// without creating or changing files.
+// Backup creation repeats these checks and keeps the folders bound for
+// staging and publication.
+[[nodiscard]] Result ValidateBackupDestination(
+    const std::filesystem::path &sitesDir,
+    const std::filesystem::path &destination);
+
 Result CreateValidated7zBackup(const std::filesystem::path &sitesDir,
                                const std::filesystem::path &destination,
                                const char *appVersion,
@@ -110,10 +118,15 @@ Result StageValidated7zRestore(const std::filesystem::path &archivePath,
                                void *progressUser,
                                StagedRestore &stagedRestore);
 
+// Reports whether this transaction moved the original collection to recovery
+// and left it there, including when installing the replacement fails.
+// The optional outcome is written on return and identifies a recovery owned
+// by this commit after any attempted rollback.
 Result CommitStagedRestore(const StagedRestore &stagedRestore,
                            const std::filesystem::path &currentSitesDir,
                            const std::filesystem::path &recoveryDir,
                            RestoreCommitGuard precommitGuard = nullptr,
-                           void *precommitGuardUser = nullptr);
+                           void *precommitGuardUser = nullptr,
+                           bool *previousCollectionInRecovery = nullptr);
 
 } // namespace CtBackup

@@ -23,15 +23,16 @@
   </PropertyGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
   <PropertyGroup>
-    <OutDir>$(ProjectDir)..\build\tests\ClientIconFailure\$(Platform)\$(Configuration)\</OutDir>
-    <IntDir>$(ProjectDir)..\build\tests\obj\ClientIconFailure\$(Platform)\$(Configuration)\</IntDir>
+    <OutDir>$(ProjectDir)..\build\tests\ArchiveUiLifetime\bin\</OutDir>
+    <IntDir>$(ProjectDir)..\build\tests\ArchiveUiLifetime\obj\</IntDir>
   </PropertyGroup>
   <ItemDefinitionGroup>
     <ClCompile>
       <WarningLevel>Level4</WarningLevel>
+      <ForcedIncludeFiles>$(ArchiveUiSourceHeader);%(ForcedIncludeFiles)</ForcedIncludeFiles>
       <SDLCheck>true</SDLCheck>
       <AdditionalIncludeDirectories>$(ProjectDir)..;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
-      <PreprocessorDefinitions>$(ArchiveUiTestDefines);NDEBUG;_CONSOLE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>CTSPACES_BACKUP_TEST_HOOKS;$(ArchiveUiTestDefines);NDEBUG;_CONSOLE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <ConformanceMode>true</ConformanceMode>
       <FunctionLevelLinking>true</FunctionLevelLinking>
       <Optimization>MinSpace</Optimization>

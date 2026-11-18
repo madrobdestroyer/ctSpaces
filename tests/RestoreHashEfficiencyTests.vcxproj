@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup Label="ProjectConfigurations"><ProjectConfiguration Include="Release|x64"><Configuration>Release</Configuration><Platform>x64</Platform></ProjectConfiguration></ItemGroup>
+  <PropertyGroup Label="Globals"><VCProjectVersion>17.0</VCProjectVersion><Keyword>Win32Proj</Keyword><ProjectGuid>{DB65A0AB-9005-40B1-A807-8DF160A6D355}</ProjectGuid><RootNamespace>RestoreHashEfficiencyTests</RootNamespace><WindowsTargetPlatformVersion>10.0</WindowsTargetPlatformVersion></PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'" Label="Configuration"><ConfigurationType>Application</ConfigurationType><UseDebugLibraries>false</UseDebugLibraries><PlatformToolset>v145</PlatformToolset><CharacterSet>Unicode</CharacterSet></PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+  <PropertyGroup><OutDir>$(ProjectDir)..\build\tests\RestoreHashEfficiency\bin\</OutDir><IntDir>$(ProjectDir)..\build\tests\RestoreHashEfficiency\obj\</IntDir><TargetName>RestoreHashEfficiencyTests</TargetName></PropertyGroup>
+  <ItemDefinitionGroup>
+    <ClCompile><WarningLevel>Level4</WarningLevel><SDLCheck>true</SDLCheck><ConformanceMode>true</ConformanceMode><PreprocessorDefinitions>NDEBUG;_CONSOLE;%(PreprocessorDefinitions)</PreprocessorDefinitions><ForcedIncludeFiles>$(HashFixtureRootHeader);%(ForcedIncludeFiles)</ForcedIncludeFiles><Optimization>MaxSpeed</Optimization><LanguageStandard>stdcpp20</LanguageStandard><RuntimeLibrary>MultiThreaded</RuntimeLibrary></ClCompile>
+    <Link><SubSystem>Console</SubSystem><GenerateDebugInformation>true</GenerateDebugInformation><AdditionalLibraryDirectories>$(ProjectDir)..\dist\x64\Release;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories><AdditionalDependencies>7zip.lib;ole32.lib;%(AdditionalDependencies)</AdditionalDependencies><AdditionalOptions>/WHOLEARCHIVE:7zip.lib %(AdditionalOptions)</AdditionalOptions></Link>
+  </ItemDefinitionGroup>
+  <ItemGroup><ClCompile Include="RestoreHashEfficiencyTests.cpp" /><ClCompile Include="..\InProc7z.cpp" /></ItemGroup>
+  <ItemGroup><ClInclude Include="..\BackupEngine.h" /><ClInclude Include="..\InProc7z.h" /></ItemGroup>
+  <Target Name="RequireBoundHashFixtureRoot" BeforeTargets="PrepareForBuild"><Error Condition="'$(HashFixtureRootHeader)' == ''" Text="Use Test-RestoreHashEfficiency.ps1 or supply its generated header through HashFixtureRootHeader." /><Error Condition="!Exists('$(HashFixtureRootHeader)')" Text="The explicit hash-efficiency fixture-root header does not exist." /></Target>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+</Project>

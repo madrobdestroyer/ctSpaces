@@ -1,7 +1,87 @@
 // Included in NotesWorkspaceUi.inl in place of its old NotesFind function.
 #include "NotesFindModel.h"
 #include "NotesUndo.h"
+#include <tuple>
 static constexpr UINT_PTR kNotesFindTimer=19;
+// Local to the temporary search surface; the persisted Find option commands
+// retain their existing IDs and semantics.
+static constexpr int kNotesFindOptionsId=45068;
+static constexpr wchar_t kNotesFindOptionsOwner[]=L"ctSpaces.notes.findOptionsOwner";
+static bool NotesFindCommand(HWND,ClientNotesDialogState &,UINT);
+static HWND NotesFindEnsureOptions(HWND dialog){
+ auto control=GetDlgItem(dialog,kNotesFindOptionsId);
+ if(!control){
+  control=CreateWindowExW(0,L"Button",L"Options",WS_CHILD|WS_TABSTOP|BS_OWNERDRAW,
+      0,0,0,0,dialog,reinterpret_cast<HMENU>(static_cast<INT_PTR>(kNotesFindOptionsId)),g_hInst,nullptr);
+  if(control){
+   SetWindowSubclass(control,ButtonHotSubclassProc,1,0);
+   // Keep native dialog-key traversal in visual order, before Close search.
+   SetWindowPos(control,GetDlgItem(dialog,IDC_NOTES_REPLACE),0,0,0,0,
+       SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE);
+  }
+ }
+ if(control)SendMessageW(control,WM_SETFONT,
+     SendDlgItemMessageW(dialog,IDC_NOTES_FIND,WM_GETFONT,0,0),FALSE);
+ return control;
+}
+struct NotesFindInfoTip {HWND tooltip=nullptr;std::wstring text;};
+static LRESULT CALLBACK NotesFindInfoSubclass(HWND control,UINT message,WPARAM w,LPARAM l,UINT_PTR id,DWORD_PTR data){
+ auto *tip=reinterpret_cast<NotesFindInfoTip *>(data);
+ const auto result=DefSubclassProc(control,message,w,l);
+ if(message==WM_SETTEXT && tip && tip->tooltip){
+  tip->text=NotesWindowText(control);
+  TOOLINFOW tool{sizeof(tool)};tool.hwnd=control;tool.uFlags=TTF_IDISHWND|TTF_SUBCLASS;
+  tool.uId=reinterpret_cast<UINT_PTR>(control);tool.lpszText=tip->text.data();
+  SendMessageW(tip->tooltip,TTM_UPDATETIPTEXTW,0,reinterpret_cast<LPARAM>(&tool));
+ }
+ if(message==WM_NCDESTROY){
+  RemoveWindowSubclass(control,NotesFindInfoSubclass,id);
+  if(tip){if(tip->tooltip)DestroyWindow(tip->tooltip);delete tip;}
+ }
+ return result;
+}
+static void NotesFindInitializeInfo(HWND dialog){
+ const auto info=GetDlgItem(dialog,IDC_NOTES_FIND_INFO);DWORD_PTR existing=0;
+ if(!info || GetWindowSubclass(info,NotesFindInfoSubclass,0x4e464954,&existing))return;
+ auto tip=std::make_unique<NotesFindInfoTip>();tip->text=NotesWindowText(info);
+ tip->tooltip=CreateWindowExW(WS_EX_NOACTIVATE,TOOLTIPS_CLASSW,nullptr,WS_POPUP|TTS_ALWAYSTIP|TTS_NOPREFIX,
+     CW_USEDEFAULT,CW_USEDEFAULT,CW_USEDEFAULT,CW_USEDEFAULT,info,nullptr,g_hInst,nullptr);
+ if(!tip->tooltip)return;
+ TOOLINFOW tool{sizeof(tool)};tool.hwnd=info;tool.uFlags=TTF_IDISHWND|TTF_SUBCLASS;
+ tool.uId=reinterpret_cast<UINT_PTR>(info);tool.lpszText=tip->text.data();
+ const bool installed=SetWindowSubclass(info,NotesFindInfoSubclass,0x4e464954,reinterpret_cast<DWORD_PTR>(tip.get()))!=FALSE;
+ if(!installed){DestroyWindow(tip->tooltip);return;}
+ SendMessageW(tip->tooltip,TTM_SETMAXTIPWIDTH,0,ScaleByDpi(480,GetDpiForWindow(dialog)));
+ SendMessageW(tip->tooltip,TTM_ADDTOOLW,0,reinterpret_cast<LPARAM>(&tool));tip.release();
+ // Keep the complete message as the native accessible text. The tooltip also
+ // exposes a long wrap/replacement notice when a narrow row must elide it.
+ SetWindowLongPtrW(info,GWL_STYLE,GetWindowLongPtrW(info,GWL_STYLE)|SS_ENDELLIPSIS|SS_NOTIFY|SS_CENTERIMAGE);
+}
+static HMENU NotesFindOptionsMenu(const ClientNotesDialogState &state){
+ const auto menu=CreatePopupMenu();if(!menu)return nullptr;
+ for(const auto [id,checked,label]:{std::tuple{IDC_NOTES_FIND_MATCH_CASE,state.findMatchCase,L"Match case"},
+     {IDC_NOTES_FIND_WHOLE_WORD,state.findWholeWord,L"Whole word"},{IDC_NOTES_FIND_WRAP,state.findWrap,L"Wrap around"}})
+  AppendMenuW(menu,MF_STRING|(checked?MF_CHECKED:MF_UNCHECKED),id,label);
+ return menu;
+}
+static void NotesFindShowOptions(HWND dialog,ClientNotesDialogState &state){
+ const auto anchor=GetDlgItem(dialog,kNotesFindOptionsId);if(!state.findVisible||!anchor)return;
+ const auto menu=NotesFindOptionsMenu(state);if(!menu)return;
+ const auto pageId=state.attachedPageId;const auto root=state.clientRoot;
+ int ownerToken=0;const auto token=reinterpret_cast<HANDLE>(&ownerToken);
+ if(!SetPropW(dialog,kNotesFindOptionsOwner,token)){DestroyMenu(menu);return;}
+ RECT rect{};GetWindowRect(anchor,&rect);
+ const auto choice=TrackThemedNotesMenu(menu,TPM_RETURNCMD|TPM_NONOTIFY,rect.left,rect.bottom,dialog);
+ DestroyMenu(menu);
+ // A popup pumps messages. Refuse a stale result after close/reopen or a
+ // client/note switch; never dereference a destroyed dialog's old state.
+ if(!IsWindow(dialog)||GetPropW(dialog,kNotesFindOptionsOwner)!=token)return;
+ RemovePropW(dialog,kNotesFindOptionsOwner);
+ if(reinterpret_cast<ClientNotesDialogState *>(GetWindowLongPtrW(dialog,DWLP_USER))!=&state)return;
+ if(!state.findVisible||state.clientRoot!=root||state.attachedPageId!=pageId)return;
+ if(choice)NotesFindCommand(dialog,state,choice);
+ SetFocus(anchor);
+}
 static void NotesFindPaintOption(HWND control,HDC dc){
  RECT area{};GetClientRect(control,&area);FillRect(dc,&area,g_hbrThemeWindow);const auto dpi=GetDpiForWindow(control);const int size=ScaleByDpi(16,dpi),inset=ScaleByDpi(1,dpi);
  RECT box{inset,(area.bottom-size)/2,inset+size,(area.bottom+size)/2};const bool enabled=IsWindowEnabled(control)!=FALSE,checked=SendMessageW(control,BM_GETCHECK,0,0)==BST_CHECKED;
@@ -45,6 +125,9 @@ static void NotesFindChanged(HWND dialog,ClientNotesDialogState &state){
  SetDlgItemTextW(dialog,IDC_NOTES_FIND_INFO,L"Searching...");SetTimer(dialog,kNotesFindTimer,200,nullptr);
 }
 static void NotesFindInitialize(HWND dialog,const ClientNotesDialogState &state){
+ NotesFindEnsureOptions(dialog);NotesFindInitializeInfo(dialog);
+ if(NotesWindowText(GetDlgItem(dialog,IDC_NOTES_FIND_CLOSE))!=L"Close")SetDlgItemTextW(dialog,IDC_NOTES_FIND_CLOSE,L"Close");
+ if(NotesWindowText(GetDlgItem(dialog,IDC_NOTES_REPLACE))!=L"Replace")SetDlgItemTextW(dialog,IDC_NOTES_REPLACE,L"Replace");
  for(const auto [id,enabled]:{std::pair{IDC_NOTES_FIND_MATCH_CASE,state.findMatchCase},{IDC_NOTES_FIND_WHOLE_WORD,state.findWholeWord},{IDC_NOTES_FIND_WRAP,state.findWrap}}){
   const auto control=GetDlgItem(dialog,id);if(control){SetWindowSubclass(control,NotesFindOptionPaint,0x4e464f50,0);SetWindowSubclass(control,ButtonHotSubclassProc,1,0);SendMessageW(control,BM_SETCHECK,enabled?BST_CHECKED:BST_UNCHECKED,0);}
  }
@@ -277,6 +360,7 @@ static void NotesFindReplace(HWND dialog,ClientNotesDialogState &state,bool all)
 }
 static bool NotesFindCommand(HWND dialog,ClientNotesDialogState &state,UINT command){
  const auto edit=GetDlgItem(dialog,IDC_CLIENT_NOTES_TEXT);
+ if(command==kNotesFindOptionsId){NotesFindShowOptions(dialog,state);return true;}
  if(command==IDC_NOTES_FIND_TOGGLE||command==IDC_NOTES_FIND_CLOSE||command==IDC_NOTES_REPLACE){
   state.findVisible=command!=IDC_NOTES_FIND_CLOSE;state.replaceVisible=command==IDC_NOTES_REPLACE;state.findNotice.clear();
   if(!state.findVisible)KillTimer(dialog,kNotesFindTimer);
@@ -292,4 +376,43 @@ static bool NotesFindCommand(HWND dialog,ClientNotesDialogState &state,UINT comm
  }
  return false;
 }
-static int NotesFindHeight(const ClientNotesDialogState &state){return state.findVisible?(state.replaceVisible?108:72):0;}
+static int NotesFindHeight(const ClientNotesDialogState &state){return state.findVisible?(state.replaceVisible?76:40):0;}
+static void LayoutNotesFindPanel(HWND dialog,ClientNotesDialogState &state,int left,int top,int available,UINT dpi){
+ NotesFindEnsureOptions(dialog);
+ const auto visible=[](HWND control){return control && (GetWindowLongPtrW(control,GWL_STYLE)&WS_VISIBLE)!=0;};
+ // Native option controls still hold checked state and accept their original
+ // commands. Their labeled checked menu replaces the former permanent row.
+ for(const int id:{IDC_NOTES_FIND_MATCH_CASE,IDC_NOTES_FIND_WHOLE_WORD,IDC_NOTES_FIND_WRAP})
+  if(const auto control=GetDlgItem(dialog,id);visible(control))ShowWindow(control,SW_HIDE);
+ if(!state.findVisible){
+  for(const int id:{IDC_NOTES_FIND,IDC_NOTES_FIND_INFO,IDC_NOTES_FIND_PREV,IDC_NOTES_FIND_NEXT,
+      IDC_NOTES_REPLACE,kNotesFindOptionsId,IDC_NOTES_FIND_CLOSE,IDC_NOTES_REPLACE_TEXT,
+      IDC_NOTES_REPLACE_NEXT,IDC_NOTES_REPLACE_ALL})
+   if(const auto control=GetDlgItem(dialog,id);visible(control))ShowWindow(control,SW_HIDE);
+  return;
+ }
+ const int gap=ScaleByDpi(6,dpi),height=ScaleByDpi(28,dpi);
+ const int fixed=ScaleByDpi(64+48+72+74+54,dpi)+6*gap;
+ const int flexible=(std::max)(2,available-fixed);
+ const int infoWidth=(std::min)(ScaleByDpi(240,dpi),flexible/2),queryWidth=flexible-infoWidth;
+ NotesLayoutBatch layout;
+ const auto place=[&](int id,int x,int y,int width,bool show=true){
+  const auto control=GetDlgItem(dialog,id);if(!control)return;
+  RECT old{};GetWindowRect(control,&old);MapWindowPoints(nullptr,dialog,reinterpret_cast<POINT *>(&old),2);
+  if(old.left==x&&old.top==y&&old.right-old.left==width&&old.bottom-old.top==height&&visible(control)==show)return;
+  layout.Place(control,x,y,(std::max)(1,width),height,
+      SWP_NOZORDER|SWP_NOACTIVATE|(show?SWP_SHOWWINDOW:SWP_HIDEWINDOW));
+ };
+ int x=left;
+ for(const auto [id,width]:{std::pair{IDC_NOTES_FIND,queryWidth},{IDC_NOTES_FIND_INFO,infoWidth},
+     {IDC_NOTES_FIND_PREV,ScaleByDpi(64,dpi)},{IDC_NOTES_FIND_NEXT,ScaleByDpi(48,dpi)},
+     {IDC_NOTES_REPLACE,ScaleByDpi(72,dpi)},{kNotesFindOptionsId,ScaleByDpi(74,dpi)},
+     {IDC_NOTES_FIND_CLOSE,ScaleByDpi(54,dpi)}}){place(id,x,top,width);x+=width+gap;}
+ const int replaceWidth=ScaleByDpi(96,dpi),replaceAllWidth=ScaleByDpi(100,dpi);
+ x=left;
+ for(const auto [id,width]:{std::pair{IDC_NOTES_REPLACE_TEXT,available-replaceWidth-replaceAllWidth-2*gap},
+     {IDC_NOTES_REPLACE_NEXT,replaceWidth},{IDC_NOTES_REPLACE_ALL,replaceAllWidth}}){
+  place(id,x,top+ScaleByDpi(36,dpi),width,state.replaceVisible);x+=width+gap;
+ }
+ layout.Commit();
+}

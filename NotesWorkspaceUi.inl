@@ -287,6 +287,7 @@ static bool NotesOpenSavedPage(HWND dialog,ClientNotesDialogState &state,size_t 
     for (size_t i=0;i<state.pages.size();++i) if(state.pages[i].id==previousActive) {state.activePage=i;break;}
     state.metadataChanged=wasChanged;RefreshNotesTabs(dialog,state);return false;
   }
+  std::erase(state.closedPages,target);
   return SaveClientNotesDraft(dialog,state,true);
 }
 static bool NotesAddPage(HWND dialog,ClientNotesDialogState &state,client_notes::NotePage page,bool preserveMembership=false) {
@@ -309,9 +310,8 @@ static bool NotesAddPage(HWND dialog,ClientNotesDialogState &state,client_notes:
   }
   return SaveClientNotesDraft(dialog,state,true);
 }
-static void NotesErasePage(HWND dialog,ClientNotesDialogState &state,size_t index) {
-  const uint64_t id=state.pages[index].id;
-  state.detailsDrafts.erase(id);state.editorViews.erase(id);state.editorUse.erase(id);state.editorLinks.erase(id);
+static void NotesReleasePageEditor(ClientNotesDialogState &state, uint64_t id) {
+  state.editorViews.erase(id);state.editorUse.erase(id);state.editorLinks.erase(id);
   auto edit=state.editors.find(id);
   if (edit!=state.editors.end()) {
     // The active editor remains visible until LoadNotesPage swaps in the next
@@ -319,6 +319,10 @@ static void NotesErasePage(HWND dialog,ClientNotesDialogState &state,size_t inde
     if (state.attachedEditor!=edit->second) DestroyWindow(edit->second);
     state.editors.erase(edit);
   }
+}
+static void NotesErasePage(HWND dialog,ClientNotesDialogState &state,size_t index) {
+  state.detailsDrafts.erase(state.pages[index].id);
+  NotesReleasePageEditor(state, state.pages[index].id);
   state.pages.erase(state.pages.begin()+index); state.baselines.erase(state.baselines.begin()+index);
   if (state.activePage>index) --state.activePage;
   else if (state.activePage==index) state.activePage=state.pages.size();
@@ -331,6 +335,84 @@ static bool NotesIsUnusedBlankDraft(const client_notes::NotePage &page) {
       page.ticketUrl.empty() && page.links.empty() && page.tags.empty() && page.status==0 && page.history.empty() &&
       NotesPlain(page).find_first_not_of(L" \r\n\t")==std::wstring::npos;
 }
+static bool NotesChangeMembership(HWND dialog, ClientNotesDialogState &state,
+                                  std::vector<size_t> indices, UINT command) {
+  const uint64_t preferred = std::exchange(state.preferredNextPage, 0);
+  if (indices.empty() || !SaveClientNotesDraft(dialog, state, true)) return false;
+  const bool closing = command == IDC_NOTES_CLOSE_TAB;
+  struct Change {
+    size_t index;
+    uint64_t id;
+    bool open, archived, deleted;
+    std::optional<client_notes::NotePage> removed;
+    std::string baseline;
+  };
+  std::vector<Change> changes;
+  changes.reserve(indices.size());
+  std::sort(indices.rbegin(), indices.rend());
+  const size_t previousActive = state.activePage;
+  const uint64_t previousId = state.attachedPageId;
+  for (const size_t index : indices) {
+    auto &page = state.pages[index];
+    changes.push_back({index, page.id, page.open, page.archived, page.deleted});
+    const bool unused = closing && !state.detailsDrafts.contains(page.id) && NotesIsUnusedBlankDraft(page);
+    if ((command == IDC_NOTES_DELETE && page.deleted) || unused) {
+      changes.back().removed.emplace(std::move(page));
+      changes.back().baseline = std::move(state.baselines[index]);
+      state.pages.erase(state.pages.begin() + index);
+      state.baselines.erase(state.baselines.begin() + index);
+      continue;
+    }
+    page.open = false;
+    if (command == IDC_NOTES_ARCHIVE) page.archived = true;
+    else if (command == IDC_NOTES_DELETE) page.deleted = true;
+    else if (command == IDC_NOTES_RESTORE) page.archived = page.deleted = false;
+  }
+  const auto available = [&](uint64_t id) {
+    return std::ranges::find_if(state.pages, [id](const auto &page) {
+      return (!id || page.id == id) && page.open && !page.archived && !page.deleted;
+    });
+  };
+  auto next = previousId ? available(previousId) : state.pages.end();
+  if (next == state.pages.end() && preferred) next = available(preferred);
+  if (next == state.pages.end()) next = available(0);
+  state.activePage = static_cast<size_t>(next - state.pages.begin());
+  for (auto &page : state.pages) page.active = next != state.pages.end() && page.id == next->id;
+
+  // Keep editors and UI selection alive until the notebook change commits.
+  // A failed action must not turn into a pending change on autosave.
+  if (!CommitClientNotesDraft(dialog, state)) {
+    for (auto change = changes.rbegin(); change != changes.rend(); ++change) {
+      const size_t index = change->index;
+      if (change->removed) {
+        state.pages.insert(state.pages.begin() + index, std::move(*change->removed));
+        state.baselines.insert(state.baselines.begin() + index, std::move(change->baseline));
+      } else {
+        auto &page = state.pages[index];
+        page.open = change->open;
+        page.archived = change->archived;
+        page.deleted = change->deleted;
+      }
+    }
+    state.activePage = previousActive;
+    for (size_t index = 0; index < state.pages.size(); ++index)
+      state.pages[index].active = state.original.pages[index].active;
+    MessageBoxW(dialog, client_notes::PersistenceFailure(
+        closing ? L"The tab close could not be saved. The tabs are still open. Try closing them again." :
+                  L"The note action could not be saved and was canceled. Try the action again.").c_str(),
+        L"Client Notes", MB_OK | MB_ICONWARNING);
+    return false;
+  }
+  for (const auto &change : changes) {
+    if (change.removed) state.detailsDrafts.erase(change.id);
+    else if (closing) state.closedPages.push_back(change.id);
+    if (change.removed || closing) NotesReleasePageEditor(state, change.id);
+  }
+  if (closing && HasActiveNote(state) && state.attachedPageId == state.pages[state.activePage].id)
+    RefreshNotesTabs(dialog, state);
+  else NotesSelectAvailable(dialog, state);
+  return true;
+}
 static void NotesDiscardEmptyDrafts(HWND dialog,ClientNotesDialogState &state) {
   bool removed=false;
   for (size_t i=state.pages.size();i>0;--i) if (NotesIsUnusedBlankDraft(state.pages[i-1])) {
@@ -338,18 +420,12 @@ static void NotesDiscardEmptyDrafts(HWND dialog,ClientNotesDialogState &state) {
   }
   if (removed) NotesSelectAvailable(dialog,state);
 }
-static void NotesClosePage(HWND dialog,ClientNotesDialogState &state,size_t index) {
-  auto &page=state.pages[index];
-  if (NotesIsUnusedBlankDraft(page)) {
-    NotesErasePage(dialog,state,index); return;
-  }
-  page.open=false; page.active=false; state.closedPages.push_back(page.id); state.metadataChanged=true;
-  auto cached=state.editors.find(page.id);
-  if (cached!=state.editors.end()) {
-    if (cached->second!=state.attachedEditor) DestroyWindow(cached->second);
-    state.editors.erase(cached);
-  }
-  state.editorUse.erase(page.id);state.editorViews.erase(page.id);state.editorLinks.erase(page.id);
+static void NotesCloseTabAt(HWND dialog,ClientNotesDialogState &state,size_t index) {
+  // The tab's native close button can run before the Details panel's queued
+  // dismissal. Apply its pending fields while the panel's note is still active.
+  CloseNotesPanel(state);
+  if (index==state.activePage) NotesPreferAdjacentTab(state);
+  NotesChangeMembership(dialog,state,{index},IDC_NOTES_CLOSE_TAB);
 }
 static bool NotesRestoreText(HWND dialog,ClientNotesDialogState &state,const client_notes::Revision &revision) {
   // A revision can alias the active page's history. Keep its source independent
@@ -391,7 +467,6 @@ struct NotesLibrary {
   std::map<uint64_t,std::wstring> plain;
   HWND plainEditor=nullptr;
   bool selecting=false;
-  bool navigating=false;
   std::vector<uint64_t> selected;
   int initialFilter=0;
   uint64_t initialNote=0;
@@ -445,17 +520,25 @@ static std::vector<size_t> NotesLibrarySelection(HWND dialog,const NotesLibrary 
   else {const auto row=SendDlgItemMessageW(dialog,IDC_NOTES_RESULTS,LB_GETCURSEL,0,0);if (row>=0 && static_cast<size_t>(row)<lib.results.size()) indices.push_back(lib.results[row]);}
   return indices;
 }
+static void NotesToggleLibrarySelection(HWND,NotesLibrary &,LRESULT);
 static LRESULT CALLBACK NotesSelectionListSubclass(HWND list,UINT message,WPARAM w,LPARAM l,UINT_PTR id,DWORD_PTR data) {
   auto *lib=reinterpret_cast<NotesLibrary *>(data);
   if (message==WM_NCDESTROY) RemoveWindowSubclass(list,NotesSelectionListSubclass,id);
   if (lib && lib->selecting && !lib->readOnly && !lib->history) {
-    if (message==WM_KEYDOWN && w==VK_SPACE) {SendMessageW(GetParent(list),WM_COMMAND,MAKEWPARAM(IDC_NOTES_RESULTS,LBN_SELCHANGE),reinterpret_cast<LPARAM>(list));return 0;}
-    if (message==WM_KEYDOWN && (w==VK_UP || w==VK_DOWN || w==VK_HOME || w==VK_END || w==VK_PRIOR || w==VK_NEXT)) {
-      lib->navigating=true;const auto result=DefSubclassProc(list,message,w,l);lib->navigating=false;return result;
+    if (message==WM_KEYDOWN && w==VK_SPACE) {
+      NotesToggleLibrarySelection(GetParent(list),*lib,SendMessageW(list,LB_GETCURSEL,0,0));return 0;
     }
-    if (message==WM_LBUTTONDOWN) {
-      const auto hit=SendMessageW(list,LB_ITEMFROMPOINT,0,l),row=SendMessageW(list,LB_GETCURSEL,0,0);
-      if (!HIWORD(hit) && LOWORD(hit)==row) {const auto result=DefSubclassProc(list,message,w,l);SendMessageW(GetParent(list),WM_COMMAND,MAKEWPARAM(IDC_NOTES_RESULTS,LBN_SELCHANGE),reinterpret_cast<LPARAM>(list));return result;}
+    if (message==WM_CHAR && w==VK_SPACE) return 0;
+    if (message==WM_LBUTTONDOWN || message==WM_LBUTTONDBLCLK) {
+      const auto hit=SendMessageW(list,LB_ITEMFROMPOINT,0,l);
+      RECT item{};const POINT point{GET_X_LPARAM(l),GET_Y_LPARAM(l)};
+      const bool onItem=!HIWORD(hit) && SendMessageW(list,LB_GETITEMRECT,LOWORD(hit),reinterpret_cast<LPARAM>(&item))!=LB_ERR && PtInRect(&item,point);
+      // Native ListBox notifications vary with focus and can also arrive for
+      // its current row. Toggle only this explicit hit, once; notifications
+      // refresh the preview and cannot tick/untick the same click again.
+      const auto result=DefSubclassProc(list,message,w,l);
+      if(onItem && IsWindow(list)) NotesToggleLibrarySelection(GetParent(list),*lib,LOWORD(hit));
+      return result;
     }
   }
   return DefSubclassProc(list,message,w,l);
@@ -526,6 +609,7 @@ static void RefreshNotesLibraryForTheme(HWND window) {
 }
 static void LayoutNotesLibrary(HWND);
 static void NotesLibraryFill(HWND dialog,NotesLibrary &library) {
+  KillTimer(dialog,1);
   if (library.selecting && !library.history) SetPropW(GetDlgItem(dialog,IDC_NOTES_RESULTS),L"ctSpaces.notes.selection",reinterpret_cast<HANDLE>(1));
   else RemovePropW(GetDlgItem(dialog,IDC_NOTES_RESULTS),L"ctSpaces.notes.selection");
   const auto query=NotesLower(NotesWindowText(GetDlgItem(dialog,IDC_NOTES_QUERY)));
@@ -607,6 +691,20 @@ static void NotesLibraryFill(HWND dialog,NotesLibrary &library) {
   NotesLibraryPreview(dialog,library);
   if (library.results.empty() && !library.history) SetDlgItemTextW(dialog,IDC_NOTES_INFO,query.empty() ? L"No notes in this view. Choose another filter or create a new note." : L"No matches. Try a title, ticket number or phrase, or change the filter.");
   LayoutNotesLibrary(dialog);
+}
+static void NotesToggleLibrarySelection(HWND dialog,NotesLibrary &library,LRESULT row) {
+  if(!library.selecting || library.readOnly || library.history || row<0 || static_cast<size_t>(row)>=library.results.size()) return;
+  const auto index=library.results[row];
+  if(index>=library.state->pages.size()) return;
+  const auto noteId=library.state->pages[index].id;
+  const auto found=std::find(library.selected.begin(),library.selected.end(),noteId);
+  if(found==library.selected.end())library.selected.push_back(noteId);else library.selected.erase(found);
+  const auto top=SendDlgItemMessageW(dialog,IDC_NOTES_RESULTS,LB_GETTOPINDEX,0,0);
+  NotesLibraryFill(dialog,library);
+  const auto current=std::find_if(library.results.begin(),library.results.end(),[&](size_t i){return library.state->pages[i].id==noteId;});
+  if(current!=library.results.end())SendDlgItemMessageW(dialog,IDC_NOTES_RESULTS,LB_SETCURSEL,current-library.results.begin(),0);
+  if(top>=0)SendDlgItemMessageW(dialog,IDC_NOTES_RESULTS,LB_SETTOPINDEX,top,0);
+  NotesLibraryPreview(dialog,library);
 }
 static void LayoutNotesLibrary(HWND dialog) {
   RECT area{}; GetClientRect(dialog,&area); const UINT dpi=GetDpiForWindow(dialog);
@@ -722,7 +820,7 @@ static INT_PTR CALLBACK NotesLibraryProc(HWND dialog,UINT message,WPARAM wParam,
   }
   if (const auto themed=HandleCleanupDialogTheme(dialog,message,wParam,lParam)) return *themed;
   if (!lib) return FALSE;
-  if (message==WM_TIMER) { KillTimer(dialog,1); NotesLibraryFill(dialog,*lib); return TRUE; }
+  if (message==WM_TIMER && wParam==1) { NotesLibraryFill(dialog,*lib); return TRUE; }
   if (message==WM_CLOSE || (message==WM_COMMAND && LOWORD(wParam)==IDCANCEL)) { EndDialog(dialog,IDCANCEL); return TRUE; }
   if (message!=WM_COMMAND) return FALSE;
   const int id=LOWORD(wParam);
@@ -742,18 +840,16 @@ static INT_PTR CALLBACK NotesLibraryProc(HWND dialog,UINT message,WPARAM wParam,
     return TRUE;
   }
   if (((id==IDC_NOTES_QUERY || id==IDC_NOTES_TAG_FILTER) && HIWORD(wParam)==EN_CHANGE) || ((id==IDC_NOTES_FILTER || id==IDC_NOTES_SORT || id==IDC_NOTES_STATUS_FILTER) && HIWORD(wParam)==CBN_SELCHANGE)) {
+    // A queued command must not resolve through rows from the previous filter.
     lib->selected.clear();
-    SetTimer(dialog,1,200,nullptr); return TRUE;
+    lib->results.clear();
+    SendDlgItemMessageW(dialog,IDC_NOTES_RESULTS,LB_RESETCONTENT,0,0);
+    NotesLibraryPreview(dialog,*lib);
+    SetDlgItemTextW(dialog,IDC_NOTES_INFO,L"Updating results...");
+    if (!SetTimer(dialog,1,200,nullptr)) NotesLibraryFill(dialog,*lib);
+    return TRUE;
   }
   if (id==IDC_NOTES_RESULTS && HIWORD(wParam)==LBN_SELCHANGE) {
-    if (lib->selecting && !lib->navigating) {
-      const auto row=SendDlgItemMessageW(dialog,IDC_NOTES_RESULTS,LB_GETCURSEL,0,0);
-      if (row>=0 && static_cast<size_t>(row)<lib->results.size()) {
-        const auto index=lib->results[row],noteId=lib->state->pages[index].id;auto found=std::find(lib->selected.begin(),lib->selected.end(),noteId);
-        if (found==lib->selected.end()) lib->selected.push_back(noteId);else lib->selected.erase(found);
-        NotesLibraryFill(dialog,*lib);const auto newRow=std::find(lib->results.begin(),lib->results.end(),index)-lib->results.begin();SendDlgItemMessageW(dialog,IDC_NOTES_RESULTS,LB_SETCURSEL,newRow,0);
-      }
-    }
     NotesLibraryPreview(dialog,*lib); return TRUE;
   }
   if (lib->readOnly) return TRUE;
@@ -769,16 +865,18 @@ static INT_PTR CALLBACK NotesLibraryProc(HWND dialog,UINT message,WPARAM wParam,
   if (lib->selecting && !lib->history && (id==IDOK || id==IDC_NOTES_OPEN_TICKET || (id==IDC_NOTES_RESULTS && HIWORD(wParam)==LBN_DBLCLK))) return TRUE;
   if (lib->selecting && !lib->history && (id==IDC_NOTES_ARCHIVE || id==IDC_NOTES_RESTORE || id==IDC_NOTES_DELETE)) {
     auto indices=NotesLibrarySelection(dialog,*lib);if (indices.empty()) return TRUE;auto &state=*lib->state;
+    if (id==IDC_NOTES_ARCHIVE)
+      std::erase_if(indices,[&](size_t i){return state.pages[i].deleted || state.pages[i].archived;});
+    else if (id==IDC_NOTES_RESTORE)
+      std::erase_if(indices,[&](size_t i){return !state.pages[i].archived && !state.pages[i].deleted;});
+    if (indices.empty()) return TRUE;
     const bool permanent=id==IDC_NOTES_DELETE && std::any_of(indices.begin(),indices.end(),[&](size_t i){return state.pages[i].deleted;});
     if (permanent && MessageBoxW(dialog,(L"Permanently delete "+std::to_wstring(indices.size())+L" selected notes and their histories for client \""+state.clientName+L"\"? This cannot be undone.").c_str(),L"Delete selected notes forever",MB_YESNO|MB_DEFBUTTON2|MB_ICONWARNING)!=IDYES) return TRUE;
-    if (!SaveClientNotesDraft(lib->owner,state,true)) return TRUE;
-    std::sort(indices.rbegin(),indices.rend());
-    for (const auto i:indices) {auto &p=state.pages[i];
-      if (id==IDC_NOTES_ARCHIVE && !p.deleted) {p.archived=true;p.open=false;}
-      else if (id==IDC_NOTES_RESTORE && (p.archived || p.deleted)) {p.archived=p.deleted=false;p.open=false;}
-      else if (id==IDC_NOTES_DELETE) {if (p.deleted) NotesErasePage(lib->owner,state,i);else {p.deleted=true;p.open=false;}}
+    if (NotesChangeMembership(lib->owner,state,std::move(indices),id)) {
+      lib->selected.clear();
+      NotesLibraryFill(dialog,*lib);
     }
-    lib->selected.clear();state.metadataChanged=true;NotesSelectAvailable(lib->owner,state);SaveClientNotesDraft(lib->owner,state,true);NotesLibraryFill(dialog,*lib);return TRUE;
+    return TRUE;
   }
   if (id==IDC_NOTES_EMPTY_TRASH) {
     if (lib->history || SendDlgItemMessageW(dialog,IDC_NOTES_FILTER,CB_GETCURSEL,0,0)!=3) return TRUE;
@@ -788,9 +886,11 @@ static INT_PTR CALLBACK NotesLibraryProc(HWND dialog,UINT message,WPARAM wParam,
     const auto warning=L"Permanently delete all "+std::to_wstring(count)+L" notes in Trash for client \""+state.clientName+
         L"\"?\n\nThis includes deleted notes hidden by the current search and removes their history. Current and archived notes are kept. This cannot be undone.";
     if (MessageBoxW(dialog,warning.c_str(),L"Empty this client's trash",MB_YESNO|MB_DEFBUTTON2|MB_ICONWARNING)!=IDYES) return TRUE;
-    if (!SaveClientNotesDraft(lib->owner,state,true)) return TRUE;
-    for (size_t i=state.pages.size();i>0;--i) if (state.pages[i-1].deleted) NotesErasePage(lib->owner,state,i-1);
-    NotesSelectAvailable(lib->owner,state); SaveClientNotesDraft(lib->owner,state,true); NotesLibraryFill(dialog,*lib); return TRUE;
+    std::vector<size_t> indices;
+    for (size_t i=0;i<state.pages.size();++i) if (state.pages[i].deleted) indices.push_back(i);
+    if (NotesChangeMembership(lib->owner,state,std::move(indices),IDC_NOTES_DELETE))
+      NotesLibraryFill(dialog,*lib);
+    return TRUE;
   }
   const LRESULT row=SendDlgItemMessageW(dialog,IDC_NOTES_RESULTS,LB_GETCURSEL,0,0);
   if (row<0 || static_cast<size_t>(row)>=lib->results.size()) return TRUE;
@@ -818,15 +918,13 @@ static INT_PTR CALLBACK NotesLibraryProc(HWND dialog,UINT message,WPARAM wParam,
     else NotesLibraryFill(dialog,*lib);
     return TRUE;
   }
-  if (id==IDC_NOTES_ARCHIVE) { page.archived=true; page.open=false; }
-  else if (id==IDC_NOTES_RESTORE) { page.archived=false; page.deleted=false; page.open=false; }
-  else if (id==IDC_NOTES_DELETE) {
-    if (page.deleted) {
-      if (MessageBoxW(dialog,(L"Permanently delete \""+page.name+L"\" and its history for client \""+state.clientName+L"\"? This cannot be undone.").c_str(),L"Delete note forever",MB_YESNO|MB_DEFBUTTON2|MB_ICONWARNING)!=IDYES) return TRUE;
-      NotesErasePage(lib->owner,state,index);
-    } else { page.deleted=true; page.open=false; }
-  } else return FALSE;
-  state.metadataChanged=true; NotesSelectAvailable(lib->owner,state); SaveClientNotesDraft(lib->owner,state,true); NotesLibraryFill(dialog,*lib); return TRUE;
+  if (id==IDC_NOTES_ARCHIVE && (page.archived || page.deleted)) return TRUE;
+  if (id==IDC_NOTES_RESTORE && !page.archived && !page.deleted) return TRUE;
+  if (id==IDC_NOTES_DELETE && page.deleted &&
+      MessageBoxW(dialog,(L"Permanently delete \""+page.name+L"\" and its history for client \""+state.clientName+L"\"? This cannot be undone.").c_str(),L"Delete note forever",MB_YESNO|MB_DEFBUTTON2|MB_ICONWARNING)!=IDYES) return TRUE;
+  if (id!=IDC_NOTES_ARCHIVE && id!=IDC_NOTES_RESTORE && id!=IDC_NOTES_DELETE) return FALSE;
+  if (NotesChangeMembership(lib->owner,state,{index},id)) NotesLibraryFill(dialog,*lib);
+  return TRUE;
 }
 static void NotesShowLibrary(HWND dialog,ClientNotesDialogState &state,bool history=false,int initialFilter=0,uint64_t initialNote=0) {
   if (!SaveClientNotesDraft(dialog,state,true) || (history && !HasActiveNote(state))) return;
@@ -1518,10 +1616,15 @@ static bool NotesWorkspaceCommand(HWND dialog,ClientNotesDialogState &state,UINT
   if (command==IDC_NOTES_REOPEN) {
     if (!SaveClientNotesDraft(dialog,state,true)) return true;
     while (!state.closedPages.empty()) {
-      const auto id=state.closedPages.back(); state.closedPages.pop_back();
-      for (size_t i=0;i<state.pages.size();++i) if (state.pages[i].id==id && !state.pages[i].deleted && !state.pages[i].archived) {
-        NotesOpenSavedPage(dialog,state,i); return true;
+      const auto id=state.closedPages.back();
+      const auto closed=std::find_if(state.pages.begin(),state.pages.end(),[id](const auto &page){
+        return page.id==id && !page.open && !page.deleted && !page.archived;
+      });
+      if (closed!=state.pages.end()) {
+        NotesOpenSavedPage(dialog,state,static_cast<size_t>(closed-state.pages.begin()));
+        return true;
       }
+      state.closedPages.pop_back();
     }
     NotesShowLibrary(dialog,state); return true;
   }
@@ -1531,7 +1634,14 @@ static bool NotesWorkspaceCommand(HWND dialog,ClientNotesDialogState &state,UINT
     templates.snippets=command==IDC_NOTES_SNIPPETS || command==IDC_NOTES_SAVE_SNIPPET;
     if (!NotesLoadTemplates(templates)) { MessageBoxW(dialog,client_notes::PersistenceFailure(L"The template library could not be opened safely. Existing templates were kept.").c_str(),L"Templates",MB_OK|MB_ICONWARNING); return true; }
     templates.startFromNote=command==IDC_NOTES_SAVE_TEMPLATE || command==IDC_NOTES_SAVE_SNIPPET;
-    DialogBoxParamW(g_hInst,MAKEINTRESOURCEW(IDD_NOTES_TEMPLATE_EDITOR),dialog,NotesTemplateEditorProc,reinterpret_cast<LPARAM>(&templates));
+    const auto result=DialogBoxParamW(g_hInst,MAKEINTRESOURCEW(IDD_NOTES_TEMPLATE_EDITOR),dialog,NotesTemplateEditorProc,reinterpret_cast<LPARAM>(&templates));
+    // Modal teardown otherwise restores the invoking library button, after
+    // insertion/new-note loading has already tried to focus the disabled owner.
+    if(result==IDOK && IsWindow(dialog) && IsWindowEnabled(dialog) &&
+        reinterpret_cast<ClientNotesDialogState *>(GetWindowLongPtrW(dialog,DWLP_USER))==&state && HasActiveNote(state)) {
+      const auto edit=GetDlgItem(dialog,IDC_CLIENT_NOTES_TEXT);
+      if(edit && IsWindowEnabled(edit))SetFocus(edit);
+    }
     return true;
   }
   if (command>=IDC_NOTES_TEMPLATE && command<=IDC_NOTES_TEMPLATE+4) {
@@ -1699,25 +1809,22 @@ static bool NotesWorkspaceCommand(HWND dialog,ClientNotesDialogState &state,UINT
     }
     CaptureNotesPage(dialog,state,false);MarkNotesChanged(dialog,state);UpdateNotesToolbar(dialog,state);SetFocus(edit);return true;
   }
-  case IDC_NOTES_CLOSE_TAB: case IDC_NOTES_CLOSE_ALL: case IDC_NOTES_CLOSE_OTHERS: {
-    if (!SaveClientNotesDraft(dialog,state,true)) return true;
-    NotesPreferAdjacentTab(state);
-    const auto keep=page.id;
-    for (size_t i=state.pages.size();i>0;--i) {
-      const auto &p=state.pages[i-1];
+  case IDC_NOTES_CLOSE_TAB:
+    NotesCloseTabAt(dialog,state,state.activePage); return true;
+  case IDC_NOTES_CLOSE_ALL: case IDC_NOTES_CLOSE_OTHERS: {
+    std::vector<size_t> closing;
+    for (size_t index=0;index<state.pages.size();++index) {
+      const auto &p=state.pages[index];
       if (!p.open || p.archived || p.deleted) continue;
-      if (command==IDC_NOTES_CLOSE_TAB && p.id!=keep) continue;
-      if (command==IDC_NOTES_CLOSE_OTHERS && p.id==keep) continue;
-      NotesClosePage(dialog,state,i-1);
+      if (command==IDC_NOTES_CLOSE_OTHERS && p.id==page.id) continue;
+      closing.push_back(index);
     }
-    NotesSelectAvailable(dialog,state); SaveClientNotesDraft(dialog,state,true); return true;
+    NotesChangeMembership(dialog,state,std::move(closing),IDC_NOTES_CLOSE_TAB); return true;
   }
   case IDC_NOTES_ARCHIVE: case IDC_NOTES_DELETE:
-    if (!SaveClientNotesDraft(dialog,state,true)) return true;
     NotesPreferAdjacentTab(state);
-    page.open=false; page.active=false;
-    if (command==IDC_NOTES_ARCHIVE) page.archived=true; else page.deleted=true;
-    state.metadataChanged=true; NotesSelectAvailable(dialog,state); SaveClientNotesDraft(dialog,state,true); return true;
+    NotesChangeMembership(dialog,state,{state.activePage},command);
+    return true;
   case IDC_NOTES_PIN:
     page.pinned=!page.pinned; state.metadataChanged=true; RefreshNotesTabs(dialog,state); SaveClientNotesDraft(dialog,state,true); return true;
   case IDC_NOTES_DUPLICATE: {
@@ -1775,7 +1882,28 @@ static bool NotesWorkspaceCommand(HWND dialog,ClientNotesDialogState &state,UINT
       MessageBoxW(dialog,client_notes::PersistenceFailure(L"The destination could not be saved. The source note has been kept.").c_str(),L"Transfer note",MB_OK|MB_ICONWARNING); return true;
     }
     if (command==IDC_NOTES_MOVE) {
-      page.deleted=true; page.open=false; state.metadataChanged=true; NotesSelectAvailable(dialog,state); SaveClientNotesDraft(dialog,state,true);
+      // Keep the pre-saved source editor attached until Trash commits, so a
+      // failed move cannot close its tab or lose Undo.
+      const bool sourceWasActive = page.active;
+      page.deleted = true;
+      page.open = page.active = false;
+      const auto next = std::ranges::find_if(state.pages, [](const auto &candidate) {
+        return candidate.open && !candidate.archived && !candidate.deleted;
+      });
+      const bool nextWasActive = next != state.pages.end() && next->active;
+      if (next != state.pages.end()) next->active = true;
+      if (!CommitClientNotesDraft(dialog, state)) {
+        page.deleted = false;
+        page.open = true;
+        page.active = sourceWasActive;
+        if (next != state.pages.end()) next->active = nextWasActive;
+        MessageBoxW(dialog, client_notes::PersistenceFailure(
+            L"The destination copy was saved, but the source note is still open because it could not be moved to Trash. "
+            L"You can move the source note to Trash separately.").c_str(),
+            L"Move note", MB_OK | MB_ICONWARNING);
+        return true;
+      }
+      NotesSelectAvailable(dialog,state);
     }
     return true;
   }
@@ -1819,9 +1947,11 @@ static bool NotesTranslateKey(MSG &message) {
     case VK_OEM_MINUS: case VK_SUBTRACT: command=IDC_NOTES_ZOOM_OUT; break;
     case '0': command=IDC_NOTES_ZOOM_RESET; break;
     case VK_TAB:
-      if (!state->visiblePages.empty() && SaveClientNotesDraft(g_hNotesWindow,*state,true)) {
+      if (!state->visiblePages.empty()) {
         int selected=TabCtrl_GetCurSel(GetDlgItem(g_hNotesWindow,IDC_NOTES_TABS));
         selected=(selected+(shift ? static_cast<int>(state->visiblePages.size())-1 : 1))%static_cast<int>(state->visiblePages.size());
+        if (!SaveNotesBeforeTabSwitch(g_hNotesWindow, *state,
+                                      state->visiblePages[selected] != state->activePage)) return true;
         state->activePage=state->visiblePages[selected];
         if (!LoadNotesPage(g_hNotesWindow,*state)) MessageBoxW(g_hNotesWindow,L"This note's editor could not be opened. Its saved content has been kept.",L"Client Notes",MB_OK|MB_ICONWARNING);
         RefreshNotesTabs(g_hNotesWindow,*state);

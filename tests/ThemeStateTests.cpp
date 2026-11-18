@@ -9,6 +9,8 @@
 #include <vector>
 static unsigned themeSuppressed=0,themeForbidden=0,themeShows=0,themeFocus=0,themeForeground=0;
 static unsigned themeNotices=0,themeEnds=0;
+static bool themeModelSystemSetting=false;
+static DWORD themeModeledLight=0;
 static void ThemeOwned(HWND window){DWORD pid=0;if(!window||!IsWindow(window)||!GetWindowThreadProcessId(window,&pid)||pid!=GetCurrentProcessId()){++themeForbidden;throw std::runtime_error("Non-owned theme window refused");}}
 static HWND WINAPI ThemeCreate(DWORD ex,LPCWSTR kind,LPCWSTR text,DWORD style,int x,int y,int width,int height,HWND owner,HMENU menu,HINSTANCE instance,LPVOID data){if(style&WS_VISIBLE)++themeSuppressed;return ::CreateWindowExW(ex|WS_EX_NOACTIVATE,kind,text,style&~WS_VISIBLE,x,y,width,height,owner,menu,instance,data);}
 static BOOL WINAPI ThemeNoShow(HWND,int){++themeSuppressed;return FALSE;}
@@ -24,7 +26,18 @@ static BOOL WINAPI ThemeClipboard(HWND){++themeForbidden;return FALSE;}
 static HINSTANCE WINAPI ThemeNoShell(HWND,LPCWSTR,LPCWSTR,LPCWSTR,LPCWSTR,INT){++themeForbidden;return reinterpret_cast<HINSTANCE>(ERROR_ACCESS_DENIED);}
 static BOOL WINAPI ThemeNoShellEx(SHELLEXECUTEINFOW*){++themeForbidden;return FALSE;}
 static BOOL WINAPI ThemeNoProcess(LPCWSTR,LPWSTR,LPSECURITY_ATTRIBUTES,LPSECURITY_ATTRIBUTES,BOOL,DWORD,LPVOID,LPCWSTR,LPSTARTUPINFOW,LPPROCESS_INFORMATION){++themeForbidden;return FALSE;}
-static LSTATUS WINAPI ThemeNoSystemValue(HKEY,LPCWSTR,LPCWSTR,LPDWORD,LPVOID,LPDWORD){++themeForbidden;return ERROR_ACCESS_DENIED;}
+static LSTATUS WINAPI ThemeNoSystemValue(HKEY key,LPCWSTR path,LPCWSTR value,LPDWORD,LPVOID data,LPDWORD bytes){
+  if(themeModelSystemSetting && key==HKEY_CURRENT_USER && path && value && data && bytes &&
+     *bytes>=sizeof(DWORD) &&
+     wcscmp(path,L"Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize")==0 &&
+     wcscmp(value,L"AppsUseLightTheme")==0) {
+    *static_cast<DWORD *>(data)=themeModeledLight;
+    *bytes=sizeof(DWORD);
+    return ERROR_SUCCESS;
+  }
+  ++themeForbidden;
+  return ERROR_ACCESS_DENIED;
+}
 #define CreateWindowExW ThemeCreate
 #define ShowWindow ThemeNoShow
 #define SetFocus ThemeNoFocus
@@ -65,13 +78,25 @@ static HWND ThemeOpen(){struct {DLGTEMPLATE dialog;WORD menu=0,kind=0,title=0;} 
 static void ThemeSelect(HWND dialog,int mode,bool preview=true){HWND combo=GetDlgItem(dialog,IDC_THEME_COMBO);SendMessageW(combo,CB_SETCURSEL,ThemeComboIndexFromMode(mode),0);SendMessageW(dialog,WM_COMMAND,MAKEWPARAM(IDC_THEME_COMBO,CBN_SELCHANGE),reinterpret_cast<LPARAM>(combo));if(preview)SendMessageW(dialog,WM_TIMER,THEME_PREVIEW_TIMER_ID,0);ThemeAudit();}
 static bool ThemeMatches(int mode){const auto &expected=g_aCustomThemes.at(mode-3);return g_themeColors.crWindow==expected.colors.crWindow&&g_themeColors.crControl==expected.colors.crControl&&g_themeColors.crAccent==expected.colors.crAccent&&g_bThemeIsDark==expected.dark;}
 static void ThemeSeed(const fs::path &root,int mode){++themeCases;g_sDataDir=root/std::to_wstring(themeCases);fs::create_directory(g_sDataDir);g_sConfigPath=g_sDataDir/L"config.ini";g_bThemeMenuRefreshPending=false;ApplyTheme(mode,false);ThemeCheck(ThemeDiskMode()==mode&&g_iThemeMode==mode&&ThemeMatches(mode),"Private theme baseline commits and renders correctly");}
-int wmain(int argc,wchar_t**){std::vector<HWINEVENTHOOK> hooks;try{
-  if(argc!=1)throw std::runtime_error("Unknown theme-state argument refused before initialization");
+#include "ThemeRoundCases.inl"
+#include "ThemeRoundCasesU.inl"
+int wmain(int argc,wchar_t** argv){std::vector<HWINEVENTHOOK> hooks;try{
+  int round=0;
+  const bool roundU=argc==3 && !wcscmp(argv[1],L"--theme-round-u-background");
+  if (roundU || (argc==3 && !wcscmp(argv[1],L"--theme-round-background"))) {
+    for (int i=1;i<=10;++i) if (std::to_wstring(i)==argv[2]) round=i;
+  }
+  if(argc!=1 && !round)throw std::runtime_error("Unknown theme-state argument refused before initialization");
   for(const DWORD event:{EVENT_OBJECT_SHOW,EVENT_OBJECT_FOCUS,EVENT_SYSTEM_FOREGROUND}){auto hook=SetWinEventHook(event,event,nullptr,ThemeEvent,GetCurrentProcessId(),0,WINEVENT_OUTOFCONTEXT);if(!hook)throw std::runtime_error("Native theme observer unavailable");hooks.push_back(hook);}
   g_hInst=GetModuleHandleW(nullptr);g_bQaInstance=true;g_sExeDir=GetCurrentExecutablePath().parent_path();INITCOMMONCONTROLSEX controls{sizeof(controls),ICC_STANDARD_CLASSES};if(!InitCommonControlsEx(&controls))throw std::runtime_error("Control initialization failed");
   Gdiplus::GdiplusStartupInput graphics;Gdiplus::GdiplusStartup(&g_gdiplusToken,&graphics,nullptr);LoadBakedThemesFromHeader();if(g_aCustomThemes.size()<3)throw std::runtime_error("Need three custom theme fixtures");
   GUID id{};wchar_t identity[40]{};if(FAILED(CoCreateGuid(&id))||!StringFromGUID2(id,identity,40))throw std::runtime_error("Unique theme fixture identity failed");const auto root=fs::current_path()/L"build"/L"app-audit-round8-2026-10-15"/L"theme-state"/identity;fs::create_directories(root.parent_path());if(!fs::create_directory(root))throw std::runtime_error("Unique private theme fixture could not be created");
   g_hGui=ThemeCreate(WS_EX_NOACTIVATE,L"STATIC",L"Hidden theme state fixture",WS_OVERLAPPED,0,0,600,240,nullptr,nullptr,g_hInst,nullptr);ThemeOwned(g_hGui);
+  if (round) {
+    themeModelSystemSetting=true;
+    if (roundU) RunThemeRoundU(root,round);
+    else RunThemeRound(root,round);
+  } else {
   const int initial=3,selected=4,external=5;
   ThemeSeed(root,initial);HWND dialog=ThemeOpen();const auto original=ThemeBytes();ThemeSelect(dialog,selected);
   ThemeCheck(g_iThemeMode==initial&&ThemeDiskMode()==initial&&ThemeBytes()==original&&ThemeMatches(selected),"Custom preview changes only rendered colors and does not persist a preference");SendMessageW(dialog,WM_COMMAND,IDC_THEME_CANCEL,0);
@@ -85,6 +110,21 @@ int wmain(int argc,wchar_t**){std::vector<HWINEVENTHOOK> hooks;try{
   ThemeSeed(root,initial);dialog=ThemeOpen();ThemeSelect(dialog,selected);std::wstring details;const auto number=std::to_wstring(external),name=GetThemePreferenceName(external);if(!config_persistence::ApplyIniMutationsAtomically(g_sConfigPath,{{L"user",L"theme",number},{L"user",L"theme_name",name}},&details))throw std::runtime_error("Independent private preference write failed");const auto externallySaved=ThemeBytes();SendMessageW(dialog,WM_COMMAND,IDC_THEME_CANCEL,0);
   std::cout<<"CONCURRENT CANCEL: saved newer="<<external<<", after Cancel="<<ThemeDiskMode()<<'\n';ThemeCheck(ThemeBytes()==externallySaved&&ThemeDiskMode()==external,"Cancel cannot overwrite a newer independently saved theme preference");LoadThemePreference();ThemeCheck(g_iThemeMode==external,"Reload observes the independently saved choice after canceled preview");ThemeAudit();
   ThemeSeed(root,initial);dialog=ThemeOpen();ThemeSelect(dialog,selected,false);SendMessageW(dialog,WM_COMMAND,IDC_THEME_APPLY,0);ThemeCheck(!IsWindow(dialog)&&g_iThemeMode==selected&&ThemeDiskMode()==selected&&ThemeMatches(selected),"Apply before the preview timer commits the selected custom theme");g_iThemeMode=initial;LoadThemePreference();ThemeCheck(g_iThemeMode==selected,"A successful Apply survives a private preference reload");ThemeAudit();
+  ThemeSeed(root,initial);dialog=ThemeOpen();ThemeSelect(dialog,selected,false);
+  const auto quickApplyBytes=ThemeBytes();
+  const auto quickApplyNotices=themeNotices;
+  lock=::CreateFileW(g_sConfigPath.c_str(),GENERIC_READ,FILE_SHARE_READ,nullptr,OPEN_EXISTING,0,nullptr);
+  if(lock==INVALID_HANDLE_VALUE)throw std::runtime_error("Private fast-apply settings lock failed");
+  SendMessageW(dialog,WM_COMMAND,IDC_THEME_APPLY,0);
+  const bool previewAfterRefusal=ThemeMatches(selected);
+  std::cout<<"THEME_FAST_APPLY_REFUSAL preview="<<previewAfterRefusal<<'\n';
+  ThemeCheck(IsWindow(dialog)&&g_iThemeMode==initial&&ThemeBytes()==quickApplyBytes&&themeNotices==quickApplyNotices+1,
+             "Immediate failed Apply leaves the choice open and the saved theme intact");
+  ThemeCheck(previewAfterRefusal,"Immediate failed Apply still previews the selected theme");
+  CloseHandle(lock);SendMessageW(dialog,WM_COMMAND,IDC_THEME_CANCEL,0);
+  ThemeCheck(!IsWindow(dialog)&&ThemeMatches(initial)&&ThemeBytes()==quickApplyBytes,
+             "Cancel restores the saved theme after refused immediate Apply");
+  ThemeAudit();
   ThemeSeed(root,initial);dialog=ThemeOpen();ThemeSelect(dialog,selected);const auto closeBytes=ThemeBytes();lock=::CreateFileW(g_sConfigPath.c_str(),GENERIC_READ,FILE_SHARE_READ,nullptr,OPEN_EXISTING,0,nullptr);if(lock==INVALID_HANDLE_VALUE)throw std::runtime_error("Native WM_CLOSE settings lock failed");const auto closeNotices=themeNotices;SendMessageW(dialog,WM_CLOSE,0,0);CloseHandle(lock);
   ThemeCheck(!IsWindow(dialog)&&g_iThemeMode==initial&&ThemeMatches(initial)&&ThemeBytes()==closeBytes&&themeNotices==closeNotices,"WM_CLOSE restores the preview under a settings lock without saving or showing a warning");ThemeAudit();
   ThemeSeed(root,initial);ApplyTheme(selected,true);LoadThemePreference();const auto loadedBytes=ThemeBytes();lock=::CreateFileW(g_sConfigPath.c_str(),GENERIC_READ,FILE_SHARE_READ,nullptr,OPEN_EXISTING,0,nullptr);if(lock==INVALID_HANDLE_VALUE)throw std::runtime_error("Native loaded-theme settings lock failed");const auto loadedNotices=themeNotices;
@@ -102,6 +142,7 @@ int wmain(int argc,wchar_t**){std::vector<HWINEVENTHOOK> hooks;try{
   ThemeCheck(normalized&&g_iThemeMode==1&&!g_bThemeIsDark&&g_themeColors.crWindow==fallback.crWindow&&g_themeColors.crAccent==fallback.crAccent&&ThemeBytes()==obsoleteBytes&&themeNotices==obsoleteNotices,"Non-persisting startup rendering normalizes an obsolete index to the rendered fallback without writing locked settings");
   dialog=ThemeOpen();ThemeCheck(SendDlgItemMessageW(dialog,IDC_THEME_COMBO,CB_GETCURSEL,0,0)==ThemeComboIndexFromMode(1),"Reopening Themes selects the actual normalized fallback rather than an unrelated Auto choice");SendMessageW(dialog,WM_CLOSE,0,0);CloseHandle(lock);ThemeAudit();
 #endif
+  }
   DestroyWindow(g_hGui);g_hGui=nullptr;ThemeAudit();for(const auto hook:hooks)UnhookWinEvent(hook);hooks.clear();Gdiplus::GdiplusShutdown(g_gdiplusToken);
   std::cout<<"Theme state: "<<themeChecks<<" checks, "<<themeCases<<" scenarios, "<<themeFailures<<" failures; suppressed presentation="<<themeSuppressed<<"; native show/focus/foreground="<<themeShows<<'/'<<themeFocus<<'/'<<themeForeground<<"; forbidden="<<themeForbidden<<".\n";std::wcout<<L"FIXTURE="<<root<<L'\n';return themeFailures?1:0;
 }catch(const std::exception &error){std::cerr<<"Theme-state safety/setup failure: "<<error.what()<<'\n';for(const auto hook:hooks)UnhookWinEvent(hook);return 2;}}

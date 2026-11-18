@@ -24,7 +24,9 @@ static void TestRestoreTabsDelta(const fs::path &base) {
   unsigned cases=0;
   const auto prepare=[&]() {
     g_sDataDir=base/std::to_wstring(++cases);g_sConfigPath=g_sDataDir/L"config.ini";
-    for(const auto &name:{alpha,std::wstring(L"Beta"),std::wstring(L"Gamma")})fs::create_directories(g_sDataDir/L"Sites"/name);
+    CreateRestorePreferenceClient(g_sDataDir/L"Sites"/alpha);
+    for (const auto &name : {L"Beta", L"Gamma"})
+      fs::create_directories(g_sDataDir/L"Sites"/name);
     g_sessions={{alpha,BrowserKind::Edge,0x7ffff651}};g_iSelectedSessionTab=1;g_selectedBrowser=BrowserKind::Edge;
   };
   for(BrowserKind browser:{BrowserKind::Edge,BrowserKind::Chrome,BrowserKind::Brave,BrowserKind::Firefox})for(bool disabled:{false,true}) {

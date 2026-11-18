@@ -9,6 +9,8 @@
 #include <vector>
 static unsigned guideSuppressed=0,guideForbidden=0,guideShows=0,guideFocus=0,guideForeground=0;
 static unsigned guideNotices=0,guideEnds=0;
+static HWND observedTourFrame=nullptr;
+static unsigned tourFrameShows=0,tourFrameHides=0;
 static HWND inputWindow=nullptr;
 static HWND unrelatedInputWindow=nullptr;
 static unsigned unrelatedKeys=0;
@@ -18,11 +20,11 @@ static void GuideOwned(HWND window){DWORD pid=0;if(!window||!IsWindow(window)||!
 static HWND WINAPI GuideCreate(DWORD ex,LPCWSTR kind,LPCWSTR text,DWORD style,int x,int y,int width,int height,HWND owner,HMENU menu,HINSTANCE instance,LPVOID data){if(style&WS_VISIBLE)++guideSuppressed;HWND window=::CreateWindowExW((ex&~WS_EX_TOPMOST)|WS_EX_NOACTIVATE,kind,text,style&~WS_VISIBLE,x,y,width,height,owner,menu,instance,data);if(HIWORD(reinterpret_cast<ULONG_PTR>(kind))&&wcscmp(kind,L"InputBoxWndClass")==0)inputWindow=window;return window;}
 static BOOL WINAPI GuideGetMessage(LPMSG message,HWND window,UINT first,UINT last){if(inputExit!=InputExit::None){const auto exit=inputExit;inputExit=InputExit::None;if(exit==InputExit::Quit){::PostQuitMessage(73);return ::GetMessageW(message,window,first,last);}if(exit==InputExit::MessageError){SetLastError(ERROR_NOT_ENOUGH_MEMORY);return -1;}if(exit==InputExit::OtherReturn||exit==InputExit::OtherEscape){GuideOwned(unrelatedInputWindow);if(!::PostMessageW(unrelatedInputWindow,WM_KEYDOWN,exit==InputExit::OtherReturn?VK_RETURN:VK_ESCAPE,0))throw std::runtime_error("Private synthetic recipient key could not queue");inputExit=InputExit::Cancel;const BOOL read=::GetMessageW(message,unrelatedInputWindow,WM_KEYDOWN,WM_KEYDOWN);if(read!=TRUE||message->hwnd!=unrelatedInputWindow||message->message!=WM_KEYDOWN)throw std::runtime_error("Synthetic private key retrieval mismatch");std::cout<<"SYNTHETIC GETMESSAGE status="<<read<<" message="<<message->message<<" key="<<message->wParam<<" expected_recipient="<<(message->hwnd==unrelatedInputWindow)<<std::endl;return read;}GuideOwned(inputWindow);if(exit==InputExit::Accept)::SetWindowTextW(::GetDlgItem(inputWindow,102),L"confirmed.example");::SendMessageW(inputWindow,WM_COMMAND,exit==InputExit::Accept?IDOK:IDCANCEL,0);*message={};message->message=WM_NULL;return TRUE;}return ::GetMessageW(message,window,first,last);}
 static BOOL WINAPI GuideTranslate(const MSG *message){if(message->hwnd==unrelatedInputWindow&&message->message==WM_KEYDOWN)return FALSE;return ::TranslateMessage(message);}
-static BOOL WINAPI GuideNoShow(HWND,int){++guideSuppressed;return FALSE;}
+static BOOL WINAPI GuideNoShow(HWND window,int action){++guideSuppressed;if(window&&window==observedTourFrame&&action==SW_HIDE)++tourFrameHides;return FALSE;}
 static HWND WINAPI GuideNoFocus(HWND){++guideSuppressed;return nullptr;}
 static BOOL WINAPI GuideNoForeground(HWND){++guideSuppressed;return FALSE;}
 static BOOL WINAPI GuideNoRaise(HWND){++guideSuppressed;return FALSE;}
-static BOOL WINAPI GuidePosition(HWND w,HWND after,int x,int y,int width,int height,UINT flags){GuideOwned(w);if((flags&SWP_SHOWWINDOW)||!(flags&SWP_NOACTIVATE))++guideSuppressed;return ::SetWindowPos(w,after,x,y,width,height,(flags&~SWP_SHOWWINDOW)|SWP_NOACTIVATE); }
+static BOOL WINAPI GuidePosition(HWND w,HWND after,int x,int y,int width,int height,UINT flags){GuideOwned(w);if((flags&SWP_SHOWWINDOW)||!(flags&SWP_NOACTIVATE))++guideSuppressed;if(w==observedTourFrame&&(flags&SWP_SHOWWINDOW))++tourFrameShows;return ::SetWindowPos(w,after,x,y,width,height,(flags&~SWP_SHOWWINDOW)|SWP_NOACTIVATE); }
 static BOOL WINAPI GuideRedraw(HWND w,const RECT *area,HRGN region,UINT flags){GuideOwned(w);return ::RedrawWindow(w,area,region,flags);}
 static BOOL WINAPI GuideInvalidate(HWND w,const RECT *area,BOOL erase){GuideOwned(w);return ::InvalidateRect(w,area,erase);}
 static BOOL WINAPI GuidePost(HWND w,UINT,WPARAM,LPARAM){GuideOwned(w);return TRUE;}
@@ -84,6 +86,72 @@ static bool PendingOnDisk(){auto saved=guided_walkthrough::LoadState(g_sConfigPa
 static LRESULT CALLBACK OtherInputProc(HWND window,UINT message,WPARAM w,LPARAM l){return DefWindowProcW(window,message,w,l);}
 static LRESULT CALLBACK OtherEditProc(HWND window,UINT message,WPARAM w,LPARAM l,UINT_PTR,DWORD_PTR){if(message==WM_KEYDOWN)++unrelatedKeys;if(message==WM_NCDESTROY)RemoveWindowSubclass(window,OtherEditProc,1);return DefSubclassProc(window,message,w,l);}
 
+static void TestTourMissingHighlight(const fs::path &root) {
+  Seed(root,true);
+  const auto saved=Bytes();
+  g_rcBrowserSelector={30,25,140,50};
+  ShowQuickTour();
+  const HWND tour=g_hQuickTourDialog;
+  Check(tour&&IsWindow(tour)&&g_hQuickTourFrame,
+        "Quick tour can start when its first highlight target is unavailable");
+  RECT initial{};
+  Check(GetWindowRect(tour,&initial)&&initial.bottom>initial.top,
+        "The card remains usable without a first highlight target");
+  observedTourFrame=g_hQuickTourFrame;
+  Command(tour,IDOK);
+  Command(tour,IDOK);
+  RECT withDemo{};
+  Check(g_quickTourState.position==2&&tourFrameShows==1&&GetWindowRect(tour,&withDemo),
+        "A later available target displays the highlight and demo card");
+  tourFrameHides=0;
+  Command(tour,IDOK);
+  RECT withoutDemo{};
+  const bool resized=GetWindowRect(tour,&withoutDemo)&&
+      withoutDemo.bottom-withoutDemo.top<withDemo.bottom-withDemo.top;
+  Check(g_quickTourState.position==3&&tourFrameHides==1,
+        "Moving to an unavailable target hides the previous target highlight");
+  Check(resized,"The new card resizes for its own content even without a highlight");
+  std::cout<<"TOUR_MISSING_TARGET hidden="<<tourFrameHides<<" resized="<<resized<<'\n';
+  Command(tour,IDC_QUICK_TOUR_BACK);
+  Check(g_quickTourState.position==2&&tourFrameShows==2,
+        "Back restores the available target highlight");
+  observedTourFrame=nullptr;
+  DismissQuickTour(false);
+  Audit();
+  Check(!g_hQuickTourDialog&&!g_hQuickTourFrame&&IsWindowEnabled(g_hGui)&&Bytes()==saved,
+        "The missing-target workflow leaves the launcher and settings intact");
+  g_rcBrowserSelector={};
+}
+
+static void TestGuideKeepsSuggestedSize(const fs::path &root) {
+  Seed(root,true);
+  GuideDialogState state{};
+  state.visibleTopics=guided_walkthrough::AllTopicIndices();
+  const HWND dialog=OpenGuide(state);
+  const auto before=Bytes();
+  SendDlgItemMessageW(dialog,IDC_GUIDE_TOPICS,LB_SETCURSEL,3,0);
+  SendMessageW(dialog,WM_COMMAND,MAKEWPARAM(IDC_GUIDE_TOPICS,LBN_SELCHANGE),0);
+  const UINT dpi=GetDpiForWindow(dialog);
+  const auto monitor=MonitorFromWindow(dialog,MONITOR_DEFAULTTONEAREST);
+  MONITORINFO info{sizeof(info)};
+  if (!dpi || !GetMonitorInfoW(monitor,&info))
+    throw std::runtime_error("Private Guide DPI placement fixture unavailable");
+  const auto &work=info.rcWork;
+  const int width=min(ScaleByDpi(700,dpi),(work.right-work.left)*3/4);
+  const int height=min(ScaleByDpi(490,dpi),(work.bottom-work.top)*3/4);
+  RECT suggested{work.left+10,work.top+10,work.left+10+width,work.top+10+height};
+  SendMessageW(dialog,WM_DPICHANGED,MAKEWPARAM(dpi,dpi),reinterpret_cast<LPARAM>(&suggested));
+  Audit();
+  RECT actual{};
+  const bool keptSize=GetWindowRect(dialog,&actual)&&EqualRect(&actual,&suggested);
+  std::cout<<"GUIDE_DPI_SUGGESTED_SIZE kept="<<keptSize<<'\n';
+  Check(keptSize,"A DPI placement change preserves the user-sized suggested Guide bounds");
+  Check(state.position==3&&IsWindow(dialog)&&Bytes()==before,
+        "DPI placement preserves the selected topic without writing settings");
+  Command(dialog,IDCANCEL);
+  Check(!IsWindow(dialog),"The Guide stays dismissible after DPI placement changes");
+}
+
 int wmain(int argc,wchar_t**){std::vector<HWINEVENTHOOK> hooks;try{
   if(argc!=1)throw std::runtime_error("Unknown guide-state argument refused before initialization");
   for(const DWORD event:{EVENT_OBJECT_SHOW,EVENT_OBJECT_FOCUS,EVENT_SYSTEM_FOREGROUND}){auto hook=SetWinEventHook(event,event,nullptr,GuideEvent,GetCurrentProcessId(),0,WINEVENT_OUTOFCONTEXT);if(!hook)throw std::runtime_error("Native guide observer unavailable");hooks.push_back(hook);}
@@ -134,6 +202,8 @@ int wmain(int argc,wchar_t**){std::vector<HWINEVENTHOOK> hooks;try{
     Check(!text,"A key addressed to another private window never confirms the shared input dialog");Check(unrelatedKeys==1,"A separate window receives its own Return or Escape instead of the modal input consuming it");Check(inputWindow&&!IsWindow(inputWindow),"Unrelated input routing and subsequent owned Cancel release the input window");inputExit=InputExit::None;DestroyWindow(otherOwner);unrelatedInputWindow=nullptr;inputWindow=nullptr;Audit();
   }
   UnregisterClassW(otherClass.lpszClassName,g_hInst);
+  TestTourMissingHighlight(root);
+  TestGuideKeepsSuggestedSize(root);
   DestroyWindow(g_hGui);g_hGui=nullptr;Audit();for(const auto hook:hooks)UnhookWinEvent(hook);hooks.clear();Gdiplus::GdiplusShutdown(g_gdiplusToken);
   std::cout<<"Guide dialog state: "<<guideChecks<<" checks, "<<guideCases<<" scenarios, "<<guideFailures<<" failures; suppressed presentation="<<guideSuppressed<<"; native show/focus/foreground="<<guideShows<<'/'<<guideFocus<<'/'<<guideForeground<<"; forbidden="<<guideForbidden<<".\n";std::wcout<<L"FIXTURE="<<root<<L'\n';return guideFailures?1:0;
 }catch(const std::exception &error){std::cerr<<"Guide-state safety/setup failure: "<<error.what()<<'\n';for(const auto hook:hooks)UnhookWinEvent(hook);return 2;}}

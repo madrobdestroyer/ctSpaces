@@ -122,7 +122,12 @@ int wmain(int argc,wchar_t**argv){
     g_sessions={{L"Alpha",BrowserKind::Edge,stalePid}};
     Check(WaitForSingleObject(originalToken,0)==WAIT_OBJECT_0,"Original process lifetime is signaled while its UI session remains tracked");
     Check(WaitForSingleObject(unrelated.process,0)==WAIT_TIMEOUT,"Unrelated owned child is alive before modeled stale lookup");
-    virtualWindow=false;RequestSessionClose(stalePid);
+    virtualWindow=false;
+#if defined(CTSPACES_PROCESS_LIFETIME_BEFORE) || defined(CTSPACES_PROCESS_LIFETIME_AFTER)
+    RequestSessionClose(stalePid);
+#else
+    RequestSessionCloseNormally(stalePid);
+#endif
     Check(terminationRequests==0,"Individual close never targets the replacement PID lookup object");
     virtualWindow=true;RequestSessionCloseNormally(stalePid);
     Check(closePosts==0,"Normal close never posts WM_CLOSE through stale process identity");
@@ -134,17 +139,20 @@ int wmain(int argc,wchar_t**argv){
 #ifndef CTSPACES_PROCESS_LIFETIME_BEFORE
     const auto noAction=[&](const char*message){
       const unsigned opens=openedByPid,terms=terminationRequests,posts=closePosts,ends=endSessionPosts,queries=queryRequests;
-      RequestSessionClose(stalePid);RequestSessionCloseNormally(stalePid);RequestSessionShutdown(stalePid);
+#ifdef CTSPACES_PROCESS_LIFETIME_AFTER
+      RequestSessionClose(stalePid);
+#endif
+      RequestSessionCloseNormally(stalePid);RequestSessionShutdown(stalePid);
       Check(openedByPid==opens&&terminationRequests==terms&&closePosts==posts&&endSessionPosts==ends&&queryRequests==queries,message);
     };
     g_activeProfiles.clear();stalePid=unrelated.pid;
     ActiveProfileInfo live{stalePid,L"owned-fixture.exe",L"private-fixture",ProfileType::Standard};
     g_activeProfiles[{L"Alpha",BrowserKind::Edge}]=live;virtualWindow=true;
-    noAction("Missing lifetime token fails closed for all three close paths without reopening a PID");
+    noAction("Missing lifetime token fails closed without reopening a PID");
     live.process=lifetime;g_activeProfiles[{L"Alpha",BrowserKind::Edge}]=live;
-    noAction("Wrong-process lifetime token fails closed for all three close paths");
+    noAction("Wrong-process lifetime token fails closed");
     live.process=std::shared_ptr<void>(INVALID_HANDLE_VALUE,[](void*){});g_activeProfiles[{L"Alpha",BrowserKind::Edge}]=live;
-    noAction("Invalid lifetime token fails closed for all three close paths");
+    noAction("Invalid lifetime token fails closed");
     Check(!RetainLaunchedProcess(nullptr,stalePid)&&!RetainLaunchedProcess(INVALID_HANDLE_VALUE,stalePid)&&!RetainLaunchedProcess(unrelated.process,original.pid),"Launch retention rejects null, invalid and mismatched known handles");
     failDuplicate=true;Check(!RetainLaunchedProcess(unrelated.process,stalePid),"Launch retention cleanly rejects native DuplicateHandle failure");failDuplicate=false;
     Check(WaitForSingleObject(unrelated.process,0)==WAIT_TIMEOUT,"A failed retention attempt does not close or stop the source process");
@@ -153,7 +161,11 @@ int wmain(int argc,wchar_t**argv){
     Check(RequestSessionCloseNormally(stalePid)&&closePosts==posts+1,"Live original normal close posts only to its modeled authorized window");
     Check(RequestSessionShutdown(stalePid)&&queryRequests==queries+1&&endSessionPosts==ends+1,"Live original shutdown reaches query/end-session through the retained lifetime");
     virtualWindow=false;const size_t requested=terminatedActualPids.size();
+#ifdef CTSPACES_PROCESS_LIFETIME_AFTER
     Check(RequestSessionClose(stalePid)&&terminatedActualPids.size()==requested+1&&terminatedActualPids.back()==unrelated.pid,"Windowless live original close uses its exact retained object for termination");
+#else
+    Check(!RequestSessionCloseNormally(stalePid)&&terminatedActualPids.size()==requested,"Windowless live original close reports that no window received WM_CLOSE");
+#endif
     Check(openedByPid==opens&&WaitForSingleObject(unrelated.process,0)==WAIT_TIMEOUT,"Authorized close requests never reopen PID or actually terminate the owned child");
     auto failedShutdown=std::make_shared<CoordinatedShutdownState>();failedShutdown->retryProcessIds.push_back(stalePid);
     const size_t beforeMissing=terminatedActualPids.size();

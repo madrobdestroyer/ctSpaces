@@ -62,15 +62,34 @@ inline Replacement Replace(HWND edit,const std::wstring &query,const std::wstrin
  std::wstring replacement;try{replacement=NativeLines(input);}catch(const std::bad_alloc &){result.status=ReplaceStatus::TooLarge;return result;}
  const LONG originalLength=Length(edit);CHARRANGE selected{};SendMessageW(edit,EM_EXGETSEL,0,reinterpret_cast<LPARAM>(&selected));
  std::vector<CHARRANGE> matches;
+ bool foundMatch=false;
  try{
-  CHARRANGE next{};
-  if(all){LONG start=0;while(Search(edit,query,options,start,originalLength,true,next)){matches.push_back(next);start=next.cpMax;}}
-  else if(Search(edit,query,options,selected.cpMin,selected.cpMax,true,next)&&next.cpMin==selected.cpMin&&next.cpMax==selected.cpMax)matches.push_back(next);
-  else{const auto found=Navigate(edit,query,options,selected,false);result.wrapped=found.wrapped;if(found.found)matches.push_back(found.range);}
-  if(matches.empty())return result;
-  matches.erase(std::remove_if(matches.begin(),matches.end(),[&](const auto &range){return RangeText(edit,range)==replacement;}),matches.end());
+  const auto keepChanged=[&](const CHARRANGE &range){
+   foundMatch=true;
+   if(RangeText(edit,range)!=replacement)matches.push_back(range);
+  };
+  const auto scan=[&](LONG first,LONG last){
+   CHARRANGE next{};
+   while(first<last&&Search(edit,query,options,first,last,true,next)){
+    keepChanged(next);
+    if(!all&&!matches.empty())break;
+    first=next.cpMax;
+   }
+  };
+  if(all)scan(0,originalLength);
+  else {
+   CHARRANGE next{};
+   if(selected.cpMin<selected.cpMax&&Search(edit,query,options,selected.cpMin,selected.cpMax,true,next)&&
+       next.cpMin==selected.cpMin&&next.cpMax==selected.cpMax)keepChanged(next);
+   const LONG start=(std::clamp)(selected.cpMax,0L,originalLength);
+   if(matches.empty())scan(start,originalLength);
+   if(matches.empty()&&options.wrap&&start>0){
+    scan(0,start);
+    result.wrapped=!matches.empty();
+   }
+  }
  }catch(const std::bad_alloc &){result.status=ReplaceStatus::TooLarge;return result;}
- if(matches.empty()){result.status=ReplaceStatus::NoChange;return result;}
+ if(matches.empty()){if(foundMatch)result.status=ReplaceStatus::NoChange;return result;}
  int64_t finalLength=originalLength;for(const auto &range:matches)finalLength+=static_cast<int64_t>(replacement.size())-(range.cpMax-range.cpMin);
  const LRESULT nativeLimit=SendMessageW(edit,EM_GETLIMITTEXT,0,0);
  if(finalLength<0||finalLength>(std::numeric_limits<LONG>::max)()||(nativeLimit>0&&finalLength>nativeLimit)){result.status=ReplaceStatus::TooLarge;return result;}

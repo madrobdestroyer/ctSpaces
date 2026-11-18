@@ -101,6 +101,24 @@ static void PreferenceFixtureAllocationCases(const fs::path &fixture,const fs::p
 }
 static std::vector<std::wstring> Preferences(){std::lock_guard<std::mutex> lock(g_restoreTabsPreferenceMutex);return g_clientsWithoutTabRestore;}
 static void Seed(const std::vector<std::wstring> &values){std::lock_guard<std::mutex> lock(g_restoreTabsPreferenceMutex);g_clientsWithoutTabRestore=values;}
+static void CreateRestorePreferenceClient(const fs::path &clientRoot) {
+  fs::create_directories(clientRoot);
+  if (!WriteDurableMarker(clientRoot / kClientSchemaMarkerName, kClientSchemaMarkerText))
+    throw std::runtime_error("Cannot mark the private restore-preference client");
+  for (BrowserKind browser : {BrowserKind::Edge, BrowserKind::Chrome,
+                              BrowserKind::Brave, BrowserKind::Firefox}) {
+    const auto slot = clientRoot / L"Browsers" / GetBrowserId(browser);
+    const auto profile = slot / L"Profile";
+    fs::create_directories(profile);
+    if (!WriteDurableMarker(slot / kBrowserSchemaMarkerName, GetBrowserMarkerText(browser)))
+      throw std::runtime_error("Cannot mark the private browser slot");
+    if (IsChromiumBrowser(browser)) {
+      fs::create_directory(profile / L"Default");
+      if (!WriteDurableMarker(profile / L"ctSpaces", "ctSpaces-profile=2\r\n"))
+        throw std::runtime_error("Cannot mark the private Chromium profile");
+    }
+  }
+}
 #include "RestoreTabsDeltaTests.inl"
 int wmain(){
   fs::path fixture;
@@ -108,7 +126,8 @@ int wmain(){
     const auto parent=fs::current_path()/L"build"/L"app-audit-round6-2026-10-15"/L"browser-launch"/L"fixtures";
     fixture=retained_fixture::CreateRoot(parent,L"preferences");
     PreferenceFixtureAllocationCases(fixture,parent);
-    fs::create_directories(fixture/L"Sites"/L"Alpha");fs::create_directory(fixture/L"Sites"/L"Beta");
+    CreateRestorePreferenceClient(fixture/L"Sites"/L"Alpha");
+    CreateRestorePreferenceClient(fixture/L"Sites"/L"Beta");
     g_sDataDir=fixture;g_sConfigPath=fixture/L"config.ini";g_selectedBrowser=BrowserKind::Edge;
     unsigned scenarios=0;
     for(const std::wstring client:{L"Alpha",L"Beta"})for(BrowserKind browser:{BrowserKind::Edge,BrowserKind::Chrome,BrowserKind::Brave,BrowserKind::Firefox})for(bool initiallyDisabled:{false,true}){

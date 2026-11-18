@@ -59,6 +59,40 @@ static void ReplaceFiniteAndEmpty(){
  auto &state=State(owner);state.findWrap=false;Select(Edit(owner),3,3);SetDlgItemTextW(owner,IDC_NOTES_REPLACE_TEXT,L"b");Command(owner,IDC_NOTES_REPLACE_NEXT);Check(NotesWindowText(Edit(owner))==L"a a","Replace next respects a disabled Wrap option at the end of the note");
  state.findWrap=true;Select(Edit(owner),0,1);Command(owner,IDC_NOTES_REPLACE_NEXT);Check(NotesWindowText(Edit(owner))==L"b a","Replace next updates an already selected matching range before advancing");DestroyWindow(owner);NotesBackgroundAudit("finite and empty replacements");
 }
+static void ReplaceNextSkipsIdenticalMatches(){
+ const auto owner=FindFixture(L"Replace next letter case",L"alpha ALPHA alpha Alpha");const auto edit=Edit(owner);
+ const auto original=NotesWindowText(edit);FindQuery(owner,L"alpha");Command(owner,IDC_NOTES_REPLACE);
+ SetDlgItemTextW(owner,IDC_NOTES_REPLACE_TEXT,L"alpha");
+ Select(edit,0,0);Command(owner,IDC_NOTES_REPLACE_NEXT);
+ const auto fromCaret=NotesWindowText(edit);
+ Select(edit,12,17);Command(owner,IDC_NOTES_REPLACE_NEXT);
+ const auto fromSelection=NotesWindowText(edit);
+ Command(owner,IDC_NOTES_UNDO);const auto undoOne=NotesWindowText(edit);
+ Command(owner,IDC_NOTES_UNDO);const auto undoTwo=NotesWindowText(edit);
+
+ Select(edit,notes_find::Length(edit),notes_find::Length(edit));Command(owner,IDC_NOTES_REPLACE_NEXT);
+ const auto fromEnd=NotesWindowText(edit);const bool wrapped=FindInfo(owner).find(L"wrapped to start")!=std::wstring::npos;
+ Command(owner,IDC_NOTES_UNDO);
+ Command(owner,IDC_NOTES_FIND_WRAP);
+ Select(edit,12,17);SetDlgItemTextW(owner,IDC_NOTES_FIND,L"ALPHA");Command(owner,IDC_NOTES_FIND_MATCH_CASE);
+ SetDlgItemTextW(owner,IDC_NOTES_REPLACE_TEXT,L"ALPHA");
+ const auto noOpView=FindSelection(owner);const auto noOpUndo=SendMessageW(edit,EM_CANUNDO,0,0);
+ Command(owner,IDC_NOTES_REPLACE_NEXT);const auto unchangedView=FindSelection(owner);
+ const bool noOp=NotesWindowText(edit)==original&&noOpView.cpMin==unchangedView.cpMin&&noOpView.cpMax==unchangedView.cpMax&&
+     SendMessageW(edit,EM_CANUNDO,0,0)==noOpUndo;
+ DestroyWindow(owner);NotesBackgroundAudit("Replace Next same-text matches");
+
+ std::cout<<"REPLACE_NEXT_CASE caret="<<(fromCaret==L"alpha alpha alpha Alpha")
+          <<" selected="<<(fromSelection==L"alpha alpha alpha alpha")
+          <<" undo="<<(undoOne==L"alpha alpha alpha Alpha"&&undoTwo==original)
+          <<" wrapped="<<(wrapped&&fromEnd==L"alpha alpha alpha Alpha")
+          <<" noOp="<<noOp<<'\n';
+ Check(fromCaret==L"alpha alpha alpha Alpha","Replace Next passes an identical match and normalizes the next match's case");
+ Check(fromSelection==L"alpha alpha alpha alpha","An identical selected match does not block the next case correction");
+ Check(undoOne==L"alpha alpha alpha Alpha"&&undoTwo==original,"Each real case correction has exactly one Undo step");
+ Check(wrapped&&fromEnd==L"alpha alpha alpha Alpha","Wrapped Replace Next passes identical matches and reports the wrap");
+ Check(noOp,"An unsuccessful case-sensitive Replace Next preserves the original text, selection and Undo");
+}
 static void BulkReplaceUndo(){
  std::wstring original;for(unsigned i=0;i<10000;++i)original+=L"alpha ";const auto owner=FindFixture(L"Ten thousand replacements",original.c_str());
  SendMessageW(Edit(owner),EM_EMPTYUNDOBUFFER,0,0);Select(Edit(owner),0,0);Type(owner,L"Prior user edit ");SendMessageW(Edit(owner),EM_STOPGROUPTYPING,0,0);const auto before=NotesWindowText(Edit(owner));
@@ -194,22 +228,24 @@ static void ReplaceRefusalAndRollback(){
 #include "NotesFindRecoveryTests.inl"
 int wmain(int argc,wchar_t **argv){
  const bool captures=argc==3&&!wcscmp(argv[1],L"--capture-search-background");
+ const bool caseProgressProof=argc==2&&!wcscmp(argv[1],L"--replace-next-case-background");
  const bool redoProof=argc==2&&!wcscmp(argv[1],L"--rollback-redo-background"),budgetProof=argc==2&&!wcscmp(argv[1],L"--linked-label-budget-background"),cleanupProbe=argc==2&&!wcscmp(argv[1],L"--rollback-cleanup-probe-background"),edgeProbe=argc==2&&!wcscmp(argv[1],L"--rollback-cleanup-edges-background"),propertyProbe=argc==2&&!wcscmp(argv[1],L"--rollback-tom2-property-edges-background"),endProbe=argc==2&&!wcscmp(argv[1],L"--rollback-end-neutral-edges-background"),prospectiveProof=argc==2&&!wcscmp(argv[1],L"--prospective-budget-background"),repairedEndProbe=argc==2&&!wcscmp(argv[1],L"--rollback-repaired-end-edges-background"),autoOffProbe=argc==2&&!wcscmp(argv[1],L"--rollback-auto-off-end-edges-background"),typingProbe=argc==2&&!wcscmp(argv[1],L"--rollback-explicit-typing-end-edges-background"),typingControlProbe=argc==2&&!wcscmp(argv[1],L"--rollback-typing-control-end-edges-background"),charFormatProbe=argc==2&&!wcscmp(argv[1],L"--rollback-charformat-only-end-edges-background"),finalFormatProbe=argc==2&&!wcscmp(argv[1],L"--rollback-final-format-end-edges-background"),resumedFormatProbe=argc==2&&!wcscmp(argv[1],L"--rollback-final-format-resumed-end-edges-background"),selectionFontProbe=argc==2&&!wcscmp(argv[1],L"--rollback-selection-font-end-edges-background"),inheritedFontProbe=argc==2&&!wcscmp(argv[1],L"--rollback-inherited-font-end-edges-background"),contextProbe=argc==2&&!wcscmp(argv[1],L"--rollback-context-end-edges-background"),productionRecoveryProbe=argc==2&&!wcscmp(argv[1],L"--production-recovery-background");
- if(!captures&&!redoProof&&!budgetProof&&!cleanupProbe&&!edgeProbe&&!propertyProbe&&!endProbe&&!prospectiveProof&&!repairedEndProbe&&!autoOffProbe&&!typingProbe&&!typingControlProbe&&!charFormatProbe&&!finalFormatProbe&&!resumedFormatProbe&&!selectionFontProbe&&!inheritedFontProbe&&!contextProbe&&!productionRecoveryProbe&&(argc!=2||wcscmp(argv[1],L"--headless-background"))){std::cerr<<"Hidden background selector required\n";return 2;}
+ if(!captures&&!caseProgressProof&&!redoProof&&!budgetProof&&!cleanupProbe&&!edgeProbe&&!propertyProbe&&!endProbe&&!prospectiveProof&&!repairedEndProbe&&!autoOffProbe&&!typingProbe&&!typingControlProbe&&!charFormatProbe&&!finalFormatProbe&&!resumedFormatProbe&&!selectionFontProbe&&!inheritedFontProbe&&!contextProbe&&!productionRecoveryProbe&&(argc!=2||wcscmp(argv[1],L"--headless-background"))){std::cerr<<"Hidden background selector required\n";return 2;}
  try{std::cout<<std::unitbuf;backgroundNotesTests=true;NotesBackgroundEvents events;events.Start();SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);CoInitializeEx(nullptr,COINIT_APARTMENTTHREADED);INITCOMMONCONTROLSEX controls{sizeof(controls),ICC_WIN95_CLASSES};InitCommonControlsEx(&controls);Gdiplus::GdiplusStartupInput graphics;Gdiplus::GdiplusStartup(&g_gdiplusToken,&graphics,nullptr);g_hInst=GetModuleHandleW(nullptr);g_bThemeIsDark=true;BuildThemeColors(true,g_themeColors);UpdateThemeBrushes();
  g_sDataDir=fs::current_path()/L"build"/(L"notes-find-"+std::to_wstring(GetCurrentProcessId())+L"-"+std::to_wstring(GetTickCount64()));fs::create_directories(g_sDataDir);g_sConfigPath=g_sDataDir/L"config.ini";WritePrivateProfileStringW(L"notes_window",L"help_seen",L"1",g_sConfigPath.c_str());g_hGui=CreateWindowExW(0,L"STATIC",L"Private search parent",WS_OVERLAPPED,0,0,100,100,nullptr,nullptr,g_hInst,nullptr);
  const auto decoder=LoadLibraryW(L"Msftedit.dll");Check(decoder!=nullptr,"Fixture independently retains the native rich-text decoder");
  if(captures){
   const auto output=fs::weakly_canonical(fs::absolute(argv[2]));const auto allowed=fs::weakly_canonical(fs::current_path()/L"build").wstring()+L"\\";
   Check(output.wstring().size()>allowed.size()&&!_wcsnicmp(output.c_str(),allowed.c_str(),allowed.size()),"Native captures remain inside the project's build evidence directory");CaptureFindVisuals(output);
- }else if(productionRecoveryProbe)FindProductionRecoveryCases();
+ }else if(caseProgressProof)ReplaceNextSkipsIdenticalMatches();
+ else if(productionRecoveryProbe)FindProductionRecoveryCases();
  else if(contextProbe)FindRollbackCleanupEdges(false,true,true,true,true,true,true,true,false,false,false,true);
  else if(selectionFontProbe||inheritedFontProbe)FindRollbackCleanupEdges(false,true,true,true,true,true,true,true,false,selectionFontProbe,inheritedFontProbe);
  else if(edgeProbe||propertyProbe||endProbe||repairedEndProbe||autoOffProbe||typingProbe||typingControlProbe||charFormatProbe||finalFormatProbe||resumedFormatProbe)FindRollbackCleanupEdges(propertyProbe,endProbe||repairedEndProbe||autoOffProbe||typingProbe||typingControlProbe||charFormatProbe||finalFormatProbe||resumedFormatProbe,repairedEndProbe||autoOffProbe||typingProbe||typingControlProbe||charFormatProbe||finalFormatProbe||resumedFormatProbe,autoOffProbe||typingProbe||typingControlProbe||charFormatProbe||finalFormatProbe||resumedFormatProbe,typingProbe||typingControlProbe||charFormatProbe||finalFormatProbe||resumedFormatProbe,typingControlProbe||charFormatProbe||finalFormatProbe||resumedFormatProbe,charFormatProbe||finalFormatProbe||resumedFormatProbe,finalFormatProbe||resumedFormatProbe,resumedFormatProbe);
  else if(prospectiveProof){const auto owner=FindFixture(L"Prospective replacement native proof",L"Private native proof");FindProspectiveBudgetCases(owner);DestroyWindow(owner);NotesBackgroundAudit("independent prospective replacement proof");}
  else if(cleanupProbe)FindRollbackCleanupProbe();
  else if(redoProof||budgetProof){const auto owner=FindFixture(redoProof?L"Aborted replacement Redo proof":L"Linked label budget proof",L"Private native proof");if(redoProof)FindFailedRollbackRedo(owner);else FindLinkedLabelBudget(owner);DestroyWindow(owner);NotesBackgroundAudit("independent adversarial Find proof");}
- else{FindOptionsAndNavigation();ReplaceOptionsAndHistory();UnicodeFindAndReplace();ReplaceFiniteAndEmpty();BulkReplaceUndo();ReplaceLinksAndFormatting();ReplaceRefusalAndRollback();FindEditChromeRegression();}
+ else{FindOptionsAndNavigation();ReplaceOptionsAndHistory();UnicodeFindAndReplace();ReplaceFiniteAndEmpty();ReplaceNextSkipsIdenticalMatches();BulkReplaceUndo();ReplaceLinksAndFormatting();ReplaceRefusalAndRollback();FindEditChromeRegression();}
  DestroyWindow(g_hGui);g_hGui=nullptr;NotesBackgroundAudit("final Find and Replace audit");NotesBackgroundBanner();FreeLibrary(decoder);
  if(captures)std::cout<<"Notes Find visual capture: "<<checks<<" checks; 6 native surfaces; 0 failures\n";
  else std::cout<<"Notes Find and Replace: "<<checks<<" checks; "<<findScenarios<<" scenarios; 0 failures\n";return 0;
